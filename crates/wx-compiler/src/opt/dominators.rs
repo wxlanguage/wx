@@ -21,6 +21,15 @@ pub struct Dominators<'a> {
 	points: Vec<Location>,
 	parents: Vec<Option<PointId>>,
 	depths: Vec<u32>,
+	/// Per point, its dominator subtree's run of preorder numbers: it
+	/// dominates exactly the points numbered within it.
+	subtrees: Vec<Subtree>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Subtree {
+	first: u32,
+	last: u32,
 }
 
 impl<'a> Dominators<'a> {
@@ -48,6 +57,7 @@ impl<'a> Dominators<'a> {
 			region_starts,
 			parents: vec![None; points.len()],
 			depths: vec![0; points.len()],
+			subtrees: vec![Subtree::default(); points.len()],
 			points,
 		};
 		let mut edges = Vec::new();
@@ -172,6 +182,29 @@ impl<'a> Dominators<'a> {
 			dominators.depths[usize::from(point)] =
 				dominators.depths[usize::from(parent)] + 1;
 		}
+		let tree: Vec<_> = order
+			.iter()
+			.skip(1)
+			.map(|&point| {
+				(dominators.parents[usize::from(point)].unwrap(), point)
+			})
+			.collect();
+		let children = Adjacency::build(dominators.points.len(), &tree, false);
+		drop(tree);
+		let mut next = 0;
+		let mut pending = vec![(root, false)];
+		while let Some((point, leaving)) = pending.pop() {
+			let subtree = &mut dominators.subtrees[usize::from(point)];
+			if leaving {
+				subtree.last = next - 1;
+				continue;
+			}
+			subtree.first = next;
+			next += 1;
+			pending.push((point, true));
+			pending
+				.extend(children.of(point).iter().map(|&child| (child, false)));
+		}
 		dominators
 	}
 
@@ -220,7 +253,15 @@ impl<'a> Dominators<'a> {
 
 	/// False for unreachable gaps. A reachable point dominates itself.
 	pub fn dominates(&self, definition: Location, reader: Location) -> bool {
-		self.common_dominator(definition, reader) == Some(definition)
+		let definition = self.point(definition);
+		let reader = self.point(reader);
+		if self.parents[usize::from(definition)].is_none()
+			|| self.parents[usize::from(reader)].is_none()
+		{
+			return false;
+		}
+		let Subtree { first, last } = self.subtrees[usize::from(definition)];
+		(first..=last).contains(&self.subtrees[usize::from(reader)].first)
 	}
 }
 

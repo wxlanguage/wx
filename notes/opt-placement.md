@@ -719,3 +719,49 @@ Follow-up (2026-11-10): the full linearizer now uses one iterative task stack,
 including structured control and both switch lowerings. The earlier arithmetic
 wrapper and recursive structured traversal have been replaced. See the
 implemented traversal update in `notes/mir-pipeline.md` for the model and checks.
+
+## Join values travel with their edges — 2026-11-16
+
+Rows no longer assign locals before a branch. Every demanded column of a join
+is a value its edges carry on the stack, which supersedes the per-branch
+`SetLocals` of "Structured emission and simultaneous join updates":
+
+- A loop header's columns are the emitted loop's parameters. MIR's `Loop`
+  names the consecutive locals each iteration sets them into (its header phis'
+  locals); the entry and each `Continue` give the values.
+- An exit's columns are its construct's results: each `Break` and each
+  falling-through arm gives them, and one `SetLocals` after the construct
+  takes them into the phis' locals.
+
+A row is plain values, so no row can write a local one of its own sources
+still reads.
+
+`ValuePlacement::Stack(location)` removes that `SetLocals` when the construct's
+value is consumed at once. A construct's exit phi stays on the stack when it is
+its join's only demanded column, it has one read, and that read is in the
+statement right after the construct: a stored computation, an effect, or a
+branch's row, through nested computations. The construct is then built where it
+is read, as an operand. The statement evaluates some values before the read;
+they are pure, so they may run before the construct's effects, provided none is
+defined inside it (its definition dominates the construct), nor are the stored
+computations emitted between the two. A statement that evaluates the read
+inside a block of its own is excluded, as a Wasm block does not see the stack
+outside it: a loop's entry, a switch's selector. "Right after" looks past the
+ends of blocks that emit nothing there (no label, one edge, no value), such as
+an inlined call's wrapper. Sibling regions are built in sequence order, so the
+construct exists when its reader is built.
+
+Not yet: an exit with several demanded columns (MIR `Values` holds scalars), a
+value read twice (`local.tee`), and moving effects past each other, which needs
+effect summaries (reads and writes per memory and global).
+
+Cost. Placement owns the gap schedule: the stored computations grouped by gap
+(`computations_at`), which emission reads instead of rebuilding it. Dominance is
+answered from the dominator tree's preorder numbering (a point dominates the
+points numbered within its subtree's run), so `dominates` is O(1); only
+`common_dominator` still walks parents. The stack pass looks forward from each
+construct, at the computations and the statement right after it, so each
+statement is walked for at most one construct. On a generated function with
+16,000 shared computations and `if`s, a release build fell from 7.6 s (before
+loop parameters) to 4.2 s, with placement under 1% of the samples; the remaining
+time is the checker's local lookup.

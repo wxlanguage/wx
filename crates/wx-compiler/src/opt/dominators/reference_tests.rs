@@ -239,7 +239,8 @@ fn check(graph: &Function) {
 				ValuePlacement::Direct => {}
 				ValuePlacement::Fixed(definition)
 				| ValuePlacement::Stored(definition)
-				| ValuePlacement::Nested(definition) => {
+				| ValuePlacement::Nested(definition)
+				| ValuePlacement::Stack(definition) => {
 					let definition = reference
 						.points
 						.iter()

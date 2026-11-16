@@ -942,7 +942,8 @@ fn untargeted_blocks_fall_through_without_labels_or_transfers() {
 }
 
 #[test]
-fn falling_through_if_and_switch_arms_keep_computations_and_join_updates() {
+fn falling_through_if_and_switch_arms_keep_computations_and_carry_their_values()
+{
 	for body in [
 		"if n == 0 { block { x + 1 } } else { block { x * 2 } }",
 		"match n { 0 => block { x + 1 }, 1 => block { x * 2 }, 2 => block { x * 2 }, _ => block { x * 2 } }",
@@ -961,8 +962,14 @@ fn falling_through_if_and_switch_arms_keep_computations_and_join_updates() {
 				.iter()
 				.any(|kind| matches!(kind, E::Block { .. } | E::Break { .. }))
 		);
-		assert!(code.body.kinds().iter().any(|kind| matches!(kind,
-			E::SetLocals { targets, .. } if !code.body.targets(*targets).is_empty())));
+		// The arms' values reach the return on the stack.
+		assert!(
+			!code
+				.body
+				.kinds()
+				.iter()
+				.any(|kind| matches!(kind, E::SetLocals { .. }))
+		);
 		let (mut store, instance) = run_mode(mir, &strings, false);
 		let run = instance
 			.get_typed_func::<(i32, i32), i32>(&mut store, "run")
@@ -1074,6 +1081,152 @@ fn a_loop_header_s_columns_are_its_emitted_parameters() {
 			"n={n}"
 		);
 		(a, b, total) = (b, total.wrapping_add(b), a.wrapping_add(b));
+	}
+}
+
+/// A construct's exit values travel with its edges: each `break` and each
+/// falling-through arm carries them. The loop's, read three times, is set
+/// into its local once, after it; the `if`'s, read once right after it, is
+/// not.
+#[test]
+fn exit_values_are_carried_by_their_edges() {
+	let source = r#"
+		func run(n: i32, target: i32) -> i32 {
+			local found: i32 = loop (i: i32 = 0) {
+				if i == n { break -1 };
+				if i * i == target { break i };
+				i + 1
+			};
+			local doubled = if found < 0 { 0 } else { found * 2 };
+			doubled + found
+		}
+		export { run as "run" }
+	"#;
+	let (strings, mut mir) = lower_source(source);
+	opt::emit_for_tests(&mut mir);
+	let body = &mir.code(mir::FunctionId::new(0)).body;
+	let mut stores = 0;
+	for kind in body.kinds() {
+		match *kind {
+			E::Break { value, .. } => assert!(value.is_some()),
+			E::SetLocals { value, .. } => {
+				assert!(matches!(body.kind(value), E::Loop { .. }));
+				stores += 1;
+			}
+			_ => {}
+		}
+	}
+	assert_eq!(stores, 1, "one store after the loop");
+	let (mut store, instance) = run_mode(mir, &strings, false);
+	let run = instance
+		.get_typed_func::<(i32, i32), i32>(&mut store, "run")
+		.unwrap();
+	for (n, target, expected) in [(5, 9, 9), (5, 30, -1), (0, 0, -1), (4, 0, 0)]
+	{
+		assert_eq!(
+			run.call(&mut store, (n, target)).unwrap(),
+			expected,
+			"n={n}, target={target}"
+		);
+	}
+}
+
+/// A construct's one exit value, read once by the statement right after
+/// it, stays on the stack: the construct is built where it is read. Values
+/// that statement evaluates before it are pure, so they may be read first.
+#[test]
+fn an_exit_value_read_once_right_after_its_construct_stays_on_the_stack() {
+	let value = "(if c == 0 { a } else { a * 3 })";
+	for (body, stays) in [
+		(format!("{value} * 2"), true),
+		(format!("b - {value}"), true),
+		(format!("local v = {value}; v * v"), false),
+		(
+			format!(
+				"loop (i = {value}) {{ if i > 100 {{ break i }}; i * 2 + b }}"
+			),
+			false,
+		),
+	] {
+		let source = format!(
+			"func run(c: i32, a: i32, b: i32) -> i32 {{ {body} }} \
+			 export {{ run as \"run\" }}"
+		);
+		let (strings, mut mir) = lower_source(&source);
+		opt::emit_for_tests(&mut mir);
+		let code = mir.code(mir::FunctionId::new(0));
+		let set = code.body.kinds().iter().any(|kind| {
+			matches!(kind, E::SetLocals { value, .. }
+				if matches!(code.body.kind(*value), E::IfElse { .. }))
+		});
+		assert_eq!(set, !stays, "{body}");
+		let (mut store, instance) = run_mode(mir, &strings, false);
+		let run = instance
+			.get_typed_func::<(i32, i32, i32), i32>(&mut store, "run")
+			.unwrap();
+		for c in [0, 1] {
+			let v = if c == 0 { 5 } else { 15 };
+			let expected = match body.as_str() {
+				_ if body.ends_with("* 2") => v * 2,
+				_ if body.starts_with("b -") => 7 - v,
+				_ if body.starts_with("local") => v * v,
+				_ => {
+					let mut i = v;
+					while i <= 100 {
+						i = i * 2 + 7;
+					}
+					i
+				}
+			};
+			assert_eq!(
+				run.call(&mut store, (c, 5, 7)).unwrap(),
+				expected,
+				"{body}"
+			);
+		}
+	}
+}
+
+/// An inlined call's wrapper, ended by its body's last value with nothing
+/// else to do, emits nothing at its end: a value its body leaves on the
+/// stack reaches the statement after the wrapper.
+#[test]
+fn an_exit_value_crosses_the_end_of_an_inlined_call() {
+	let source = r#"
+		#[inline]
+		func root(n: i32) -> (Bool, i32) {
+			loop (i: i32 = 0) {
+				if i * i == n { break (True, i) };
+				if i * i > n { break (False, i) };
+				i + 1
+			}
+		}
+		func run(n: i32) -> Bool {
+			local (exact, _) = root(n);
+			exact
+		}
+		export { run as "run" }
+	"#;
+	let (strings, mut mir) = lower_source(source);
+	mir::inline::run(&mut mir, mir::inline::Policy::DEFAULT);
+	opt::emit_for_tests(&mut mir);
+	for index in 0..mir.functions.len() {
+		let Some(code) =
+			mir.function(mir::FunctionId::new(index as u32)).code()
+		else {
+			continue;
+		};
+		assert!(!code.body.kinds().iter().any(|kind| matches!(
+			kind,
+			E::SetLocals { value, .. } if matches!(code.body.kind(*value), E::Loop { .. })
+		)));
+	}
+	let (mut store, instance) = run_mode(mir, &strings, false);
+	let run = instance
+		.get_typed_func::<i32, i32>(&mut store, "run")
+		.unwrap();
+	for (n, expected) in [(0, 1), (1, 1), (10, 0), (16, 1)] {
+		assert_eq!(run.call(&mut store, n).unwrap(), expected, "n={n}");
 	}
 }
 

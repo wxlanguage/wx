@@ -3,8 +3,8 @@
 //! See `notes/opt-placement.md` for the algorithm and constraints.
 
 use super::{
-	Dominators, Function, JoinLocation, Location, Locations, NodeId, NodeKind,
-	UseSite, Uses,
+	Dominators, Effect, Function, JoinLocation, Location, Locations, NodeId,
+	NodeKind, RegionKind, UseSite, Uses,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +23,11 @@ pub enum ValuePlacement {
 	/// For example, `(x + y) * 2` nests the addition in the multiplication,
 	/// passing its result directly without a temporary local.
 	Nested(Location),
+	/// A construct's one exit value, left on the stack by it for the one
+	/// statement right after it, which reads it: the construct is built
+	/// where that statement reads it, without a local. For example,
+	/// `return (if c { a } else { b }) * 2`.
+	Stack(Location),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -54,6 +59,14 @@ pub struct Placement<'a> {
 	values: Vec<Option<ValuePlacement>>,
 	/// Ordinary computations in dependency-first order, including at equal gaps.
 	computations: Vec<NodeId>,
+	/// Per region, the index of its first gap: an executable region has one
+	/// per position, a wrapper (an `if`'s, a switch's) none.
+	region_gaps: Vec<u32>,
+	/// Per gap, where its stored computations start in `scheduled`; one more
+	/// entry ends the last.
+	gap_starts: Vec<u32>,
+	/// The stored computations, by gap, each gap's in dependency order.
+	scheduled: Vec<NodeId>,
 }
 
 impl<'a> Placement<'a> {
@@ -79,6 +92,9 @@ impl<'a> Placement<'a> {
 			function,
 			values: vec![None; function.kinds.len()],
 			computations: Vec::new(),
+			region_gaps: Vec::new(),
+			gap_starts: Vec::new(),
+			scheduled: Vec::new(),
 		};
 		let mut earliest = vec![None; function.kinds.len()];
 		for &node in uses.used_nodes() {
@@ -222,7 +238,8 @@ impl<'a> Placement<'a> {
 				ValuePlacement::Direct => None,
 				ValuePlacement::Fixed(location)
 				| ValuePlacement::Stored(location)
-				| ValuePlacement::Nested(location) => Some(location),
+				| ValuePlacement::Nested(location)
+				| ValuePlacement::Stack(location) => Some(location),
 			};
 			for site in uses.sites(node) {
 				let reader = plan.reader(site, locations);
@@ -240,7 +257,250 @@ impl<'a> Placement<'a> {
 				}
 			}
 		}
+		plan.schedule(locations);
+		plan.stack_exit_values(uses, locations, &dominators);
 		Ok(plan)
+	}
+
+	/// Group the stored computations by gap.
+	fn schedule(&mut self, locations: &Locations<'_>) {
+		let function = self.function;
+		let mut gaps = 0;
+		self.region_gaps = (0..function.regions.len())
+			.map(|index| {
+				let first = gaps;
+				let region = super::RegionId::new(index as u32);
+				if locations.is_executable(region) {
+					gaps += function.regions[index].effects.len() as u32 + 1;
+				}
+				first
+			})
+			.collect();
+		let mut starts = vec![0u32; gaps as usize + 1];
+		for &node in &self.computations {
+			if let Some(ValuePlacement::Stored(location)) =
+				self.values[usize::from(node)]
+			{
+				starts[self.gap(location) + 1] += 1;
+			}
+		}
+		for index in 1..starts.len() {
+			starts[index] += starts[index - 1];
+		}
+		let mut cursors = starts[..gaps as usize].to_vec();
+		let mut scheduled =
+			vec![NodeId::new(0); *starts.last().unwrap() as usize];
+		for &node in &self.computations {
+			if let Some(ValuePlacement::Stored(location)) =
+				self.values[usize::from(node)]
+			{
+				let cursor = &mut cursors[self.gap(location)];
+				scheduled[*cursor as usize] = node;
+				*cursor += 1;
+			}
+		}
+		self.gap_starts = starts;
+		self.scheduled = scheduled;
+	}
+
+	fn gap(&self, location: Location) -> usize {
+		(self.region_gaps[usize::from(location.region)] + location.position)
+			as usize
+	}
+
+	/// Leave each construct's exit value on the stack when what runs right
+	/// after the construct reads it, needing nothing defined inside the
+	/// construct before: then the construct can be built at that read, the
+	/// values evaluated before it there unaffected by its effects, as they
+	/// are pure. Each construct looks only at what follows it, so every
+	/// statement is walked for at most one construct.
+	fn stack_exit_values(
+		&mut self,
+		uses: &Uses<'_>,
+		locations: &Locations<'_>,
+		dominators: &Dominators<'_>,
+	) {
+		let function = self.function;
+		// Per join column, whether its phi is used: a demanded column.
+		let mut demanded = vec![false; function.columns.len()];
+		let mut demanded_per_join = vec![0u32; function.joins.len()];
+		for &node in uses.used_nodes() {
+			if let NodeKind::Phi { join, column } = function.kind(node) {
+				let columns = function.joins[usize::from(join)].columns;
+				demanded[columns.start as usize + column as usize] = true;
+				demanded_per_join[usize::from(join)] += 1;
+			}
+		}
+		let mut pending = Vec::new();
+		let mut roots = Vec::new();
+		for &phi in uses.used_nodes() {
+			let NodeKind::Phi { join, .. } = function.kind(phi) else {
+				continue;
+			};
+			let JoinLocation::Exit { owner } = locations.join(join) else {
+				continue;
+			};
+			if demanded_per_join[usize::from(join)] != 1
+				|| uses.sites(phi).nth(1).is_some()
+			{
+				continue;
+			}
+			let construct =
+				locations.entry(owner).expect("an exit has an owner");
+			let next = self.after(construct, locations, &demanded_per_join);
+			// A value defined before the construct, or by a computation
+			// emitted after it and before the read.
+			let available = |plan: &Self, node: NodeId| match plan.values
+				[usize::from(node)]
+			.unwrap()
+			{
+				ValuePlacement::Direct => true,
+				ValuePlacement::Stored(location) if location == next => true,
+				ValuePlacement::Fixed(location)
+				| ValuePlacement::Stored(location)
+				| ValuePlacement::Stack(location) => {
+					dominators.dominates(location, construct)
+				}
+				ValuePlacement::Nested(_) => {
+					unreachable!("a nested computation is expanded")
+				}
+			};
+			// What runs from `next`, in order: its stored computations, then
+			// its statement, whose values are read outside any block of its
+			// own (not a loop's entry, nor a switch's selector).
+			let mut walk = Walk::Complete;
+			for &computation in self.computations_at(next) {
+				walk = self.walk(
+					computation,
+					true,
+					Some(phi),
+					&mut pending,
+					|node| available(self, node),
+				);
+				if walk != Walk::Complete {
+					break;
+				}
+			}
+			let region = &function.regions[usize::from(next.region)];
+			let statement = function.sequence[region.effects.range()]
+				.get(next.position as usize);
+			if walk == Walk::Complete
+				&& let Some(&effect) = statement
+			{
+				roots.clear();
+				match function.effects[usize::from(effect)] {
+					Effect::Branch { join, row } => {
+						let columns = function.joins[usize::from(join)].columns;
+						for (column, slot) in columns.range().enumerate() {
+							if demanded[slot] {
+								roots.push(function.row(join, row)[column]);
+							}
+						}
+					}
+					Effect::Region(region)
+						if !matches!(
+							function.regions[usize::from(region)].kind,
+							RegionKind::If { .. }
+						) => {}
+					_ => function.operands(effect, |node| roots.push(node)),
+				}
+				for &root in &roots {
+					walk = self.walk(
+						root,
+						false,
+						Some(phi),
+						&mut pending,
+						|node| available(self, node),
+					);
+					if walk != Walk::Complete {
+						break;
+					}
+				}
+			}
+			if walk == Walk::Reached {
+				let Some(ValuePlacement::Fixed(location)) =
+					self.values[usize::from(phi)]
+				else {
+					unreachable!("a phi is fixed")
+				};
+				self.values[usize::from(phi)] =
+					Some(ValuePlacement::Stack(location));
+			}
+		}
+	}
+
+	/// Where the statement after the construct at `construct` is: past the
+	/// ends of the blocks it ends that emit nothing there, ones with no
+	/// label and no value, as an inlined call's wrapper with no `return`.
+	fn after(
+		&self,
+		mut construct: Location,
+		locations: &Locations<'_>,
+		demanded_per_join: &[u32],
+	) -> Location {
+		let function = self.function;
+		loop {
+			let next = Location {
+				position: construct.position + 1,
+				..construct
+			};
+			let region = &function.regions[usize::from(construct.region)];
+			let sequence = &function.sequence[region.effects.range()];
+			let RegionKind::Block { exit } = region.kind else {
+				return next;
+			};
+			let ends = sequence.len() == next.position as usize + 1
+				&& matches!(
+					function.effects[usize::from(sequence[next.position as usize])],
+					Effect::Branch { join, .. } if join == exit
+				);
+			let empty_end = function.edges(exit) == 1
+				&& demanded_per_join[usize::from(exit)] == 0
+				&& self.computations_at(next).is_empty();
+			if !(ends && empty_end) {
+				return next;
+			}
+			construct = locations
+				.entry(construct.region)
+				.expect("a block has an enclosing construct");
+		}
+	}
+
+	/// Walk the values `root` evaluates, in order, through its nested
+	/// computations (and through `root` itself when it is a statement's
+	/// `computed` value), until `target`: whether each before it is
+	/// `available`.
+	fn walk(
+		&self,
+		root: NodeId,
+		computed: bool,
+		target: Option<NodeId>,
+		pending: &mut Vec<NodeId>,
+		available: impl Fn(NodeId) -> bool,
+	) -> Walk {
+		let function = self.function;
+		pending.clear();
+		pending.push(function.resolve(root));
+		while let Some(node) = pending.pop() {
+			if Some(node) == target {
+				return Walk::Reached;
+			}
+			let expand = computed && node == function.resolve(root)
+				|| matches!(
+					self.values[usize::from(node)],
+					Some(ValuePlacement::Nested(_))
+				);
+			if !expand {
+				if !available(node) {
+					return Walk::Unavailable;
+				}
+				continue;
+			}
+			let start = pending.len();
+			function.inputs(node, |input, _| pending.push(input));
+			pending[start..].reverse();
+		}
+		Walk::Complete
 	}
 
 	fn reader(&self, site: UseSite, locations: &Locations<'_>) -> Location {
@@ -268,6 +528,22 @@ impl<'a> Placement<'a> {
 	pub fn computations(&self) -> &[NodeId] {
 		&self.computations
 	}
+
+	/// The computations stored at `location`, in the order they run.
+	pub fn computations_at(&self, location: Location) -> &[NodeId] {
+		let gap = self.gap(location);
+		let (start, end) = (self.gap_starts[gap], self.gap_starts[gap + 1]);
+		&self.scheduled[start as usize..end as usize]
+	}
+}
+
+#[derive(PartialEq, Eq)]
+enum Walk {
+	/// Every value was available, and the target was not among them.
+	Complete,
+	/// The target, after only available values.
+	Reached,
+	Unavailable,
 }
 
 fn is_computation(kind: NodeKind) -> bool {

@@ -2,8 +2,8 @@
 //! and simultaneous incoming-row assignments. Effects retain graph order.
 
 use super::{
-	Effect, EffectId, Function, JoinId, NodeId, NodeKind, Placement, RegionId,
-	RegionKind, TrappingOp, ValuePlacement,
+	Effect, EffectId, Function, JoinId, Location, NodeId, NodeKind, Placement,
+	RegionId, RegionKind, TrappingOp, ValuePlacement,
 };
 use crate::mir::{
 	self, ExprId, ExprKind, FunctionId, LabelId, LocalIndex, MIR, ValueType,
@@ -38,28 +38,13 @@ pub fn emit(
 		region_labels: vec![None; graph.regions.len()],
 		label_count: 0,
 		region_bodies: vec![None; graph.regions.len()],
-		region_gap_offsets: Vec::with_capacity(graph.regions.len() + 1),
-		computation_offsets: Vec::new(),
-		scheduled_computations: Vec::new(),
+		on_stack: vec![false; graph.regions.len()],
 		pending_computations: Vec::new(),
 		computation_inputs: Vec::new(),
 	};
 	// Branch targets name their owners. Labels are allocated only when an
 	// emitted transfer needs one (or when a loop itself is emitted).
-	emitter.region_gap_offsets.push(0);
 	for (index, region) in graph.regions.iter().enumerate() {
-		let executable = !matches!(
-			region.kind,
-			RegionKind::If { .. } | RegionKind::Switch { .. }
-		);
-		let base = *emitter.region_gap_offsets.last().unwrap();
-		emitter.region_gap_offsets.push(
-			base + if executable {
-				region.effects.len() + 1
-			} else {
-				0
-			},
-		);
 		let exit = match region.kind {
 			RegionKind::Block { exit }
 			| RegionKind::Loop { exit, .. }
@@ -84,10 +69,20 @@ pub fn emit(
 			Some(ValuePlacement::Stored(_) | ValuePlacement::Fixed(_))
 		);
 		if let NodeKind::Phi { join, column } = graph.kind(node) {
-			if stored {
+			let on_stack =
+				matches!(placement.value(node), Some(ValuePlacement::Stack(_)));
+			if stored || on_stack {
 				let slot = graph.joins[usize::from(join)].columns.start
 					as usize + column as usize;
 				assert!(emitter.phi_targets[slot].replace(node).is_none());
+			}
+			if on_stack {
+				let Some(JoinTarget::Exit(owner)) =
+					emitter.join_targets[usize::from(join)]
+				else {
+					unreachable!("a value on the stack is a construct's exit")
+				};
+				emitter.on_stack[usize::from(owner)] = true;
 			}
 			// A loop's parameters: their locals are allocated together.
 			if matches!(
@@ -141,39 +136,6 @@ pub fn emit(
 		.into_iter()
 		.map(|node| node.expect("missing effect output"))
 		.collect();
-
-	// Count/prefix/fill across executable gaps, preserving dependency order.
-	emitter.computation_offsets =
-		vec![0; emitter.region_gap_offsets.last().unwrap() + 1];
-	for &node in placement.computations() {
-		let Some(ValuePlacement::Stored(location)) = placement.value(node)
-		else {
-			continue;
-		};
-		let gap = emitter.region_gap_offsets[usize::from(location.region)]
-			+ location.position as usize;
-		emitter.computation_offsets[gap + 1] += 1;
-	}
-	for index in 1..emitter.computation_offsets.len() {
-		emitter.computation_offsets[index] +=
-			emitter.computation_offsets[index - 1];
-	}
-	let mut cursors = emitter.computation_offsets
-		[..emitter.computation_offsets.len() - 1]
-		.to_vec();
-	emitter.scheduled_computations =
-		vec![NodeId::new(0); *emitter.computation_offsets.last().unwrap()];
-	for &node in placement.computations() {
-		let Some(ValuePlacement::Stored(location)) = placement.value(node)
-		else {
-			continue;
-		};
-		let gap = emitter.region_gap_offsets[usize::from(location.region)]
-			+ location.position as usize;
-		emitter.scheduled_computations[cursors[gap]] = node;
-		cursors[gap] += 1;
-	}
-	drop(cursors);
 
 	// Build child bodies before owners using an explicit work stack. Region
 	// nesting does not consume the Rust call stack, and no MIR input is walked.
@@ -249,7 +211,9 @@ pub fn emit(
 			}
 			_ => {}
 		}
-		for &effect in &graph.sequence[region.effects.range()] {
+		// Reversed, so siblings are built in order: a construct whose value
+		// is left on the stack before the one reading it.
+		for &effect in graph.sequence[region.effects.range()].iter().rev() {
 			if let Effect::Region(child) = graph.effects[usize::from(effect)] {
 				pending_regions.push(RegionTask {
 					region: child,
@@ -309,11 +273,9 @@ struct Emitter<'a> {
 	region_labels: Vec<Option<LabelId>>,
 	label_count: u32,
 	region_bodies: Vec<Option<ExprId>>,
-	/// Region ID to its first executable gap; wrappers contribute no gaps.
-	region_gap_offsets: Vec<usize>,
-	/// Gap index to a run in `scheduled_computations`, with an end offset.
-	computation_offsets: Vec<usize>,
-	scheduled_computations: Vec<NodeId>,
+	/// Per region, whether it is a construct whose exit value is left on
+	/// the stack: it is built where that value is read, not as a statement.
+	on_stack: Vec<bool>,
 	/// Reused across expressions, empty between computations.
 	pending_computations: Vec<ComputationTask>,
 	computation_inputs: Vec<ExprId>,
@@ -329,77 +291,42 @@ impl Emitter<'_> {
 		local
 	}
 
-	/// A loop's parameters given by row `row` of its `header`: the values
-	/// of its demanded columns, as one value; none without one.
-	fn header_values(
+	/// The type of `join`'s demanded columns as one value: what its
+	/// construct gives at its exit, or what its loop takes as parameters.
+	fn join_type(&self, mir: &mut MIR, join: JoinId) -> ValueType {
+		let columns = self.graph.joins[usize::from(join)].columns;
+		let types: Vec<_> = self.phi_targets[columns.range()]
+			.iter()
+			.flatten()
+			.map(|&phi| value_type(self.graph.ty(phi)))
+			.collect();
+		mir.signatures.value_of(&types)
+	}
+
+	/// Row `row` of `join`: the values of its demanded columns, as one
+	/// value, which its edge carries; none without one.
+	fn join_values(
 		&mut self,
 		mir: &mut MIR,
-		header: JoinId,
+		join: JoinId,
 		row: u32,
 	) -> Option<ExprId> {
-		let columns = self.graph.joins[usize::from(header)].columns;
+		let columns = self.graph.joins[usize::from(join)].columns;
 		let mut values = Vec::new();
-		let mut types = Vec::new();
 		for (column, slot) in columns.range().enumerate() {
-			let Some(phi) = self.phi_targets[slot] else {
-				continue;
-			};
-			values.push(self.read(self.graph.row(header, row)[column]));
-			types.push(value_type(self.graph.ty(phi)));
+			if self.phi_targets[slot].is_some() {
+				values.push(self.read(self.graph.row(join, row)[column]));
+			}
 		}
 		match *values {
 			[] => None,
 			[value] => Some(value),
 			_ => {
-				let ty = mir.signatures.value_of(&types);
+				let ty = self.join_type(mir, join);
 				let values = self.body.push_list(values);
 				Some(self.body.push(ExprKind::Values { values }, ty))
 			}
 		}
-	}
-
-	/// Assign only demanded phi columns. Values evaluates every source before
-	/// SetLocals writes any target, including cyclic swaps and self reads.
-	fn row(&mut self, mir: &mut MIR, join: JoinId, row: u32) -> Option<ExprId> {
-		let columns = self.graph.joins[usize::from(join)].columns;
-		let targets = self.body.push_targets(
-			self.phi_targets[columns.range()]
-				.iter()
-				.flatten()
-				.copied()
-				.map(|phi| self.value_locals[usize::from(phi)]),
-		);
-		let (values, ty) = match targets.len() {
-			0 => return None,
-			1 => {
-				let (column, phi) = columns
-					.range()
-					.enumerate()
-					.find_map(|(column, slot)| {
-						self.phi_targets[slot].map(|phi| (column, phi))
-					})
-					.unwrap();
-				let value = self.read(self.graph.row(join, row)[column]);
-				(self.body.push_list([value]), value_type(self.graph.ty(phi)))
-			}
-			_ => {
-				let mut values = Vec::with_capacity(targets.len());
-				let mut types = Vec::with_capacity(targets.len());
-				for (column, slot) in columns.range().enumerate() {
-					let Some(phi) = self.phi_targets[slot] else {
-						continue;
-					};
-					values.push(self.read(self.graph.row(join, row)[column]));
-					types.push(value_type(self.graph.ty(phi)));
-				}
-				(self.body.push_list(values), mir.signatures.value_of(&types))
-			}
-		};
-		let value = self.body.push(ExprKind::Values { values }, ty);
-		Some(
-			self.body
-				.push(ExprKind::SetLocals { targets, value }, ValueType::Unit),
-		)
 	}
 
 	fn ensure_label(&mut self, owner: RegionId) -> LabelId {
@@ -452,7 +379,7 @@ impl Emitter<'_> {
 					.iter()
 					.any(|&arm| self.body.ty(arm) != ValueType::Never)
 				{
-					ValueType::Unit
+					self.join_type(mir, exit)
 				} else {
 					ValueType::Never
 				};
@@ -483,7 +410,7 @@ impl Emitter<'_> {
 							!= ValueType::Never
 					});
 				let ty = if falls_through {
-					ValueType::Unit
+					self.join_type(mir, exit)
 				} else {
 					ValueType::Never
 				};
@@ -511,13 +438,13 @@ impl Emitter<'_> {
 			_ => {
 				let mut statements = Vec::new();
 				let sequence = &self.graph.sequence[region.effects.range()];
+				let placement = self.placement;
 				for position in 0..=sequence.len() {
-					let gap =
-						self.region_gap_offsets[usize::from(id)] + position;
-					for index in self.computation_offsets[gap]
-						..self.computation_offsets[gap + 1]
-					{
-						let node = self.scheduled_computations[index];
+					let gap = Location {
+						region: id,
+						position: position as u32,
+					};
+					for &node in placement.computations_at(gap) {
 						let value = self.computation(node);
 						let local =
 							self.value_locals[usize::from(node)].unwrap();
@@ -527,6 +454,12 @@ impl Emitter<'_> {
 						));
 					}
 					if let Some(&effect) = sequence.get(position) {
+						if let Effect::Region(child) =
+							self.graph.effects[usize::from(effect)]
+							&& self.on_stack[usize::from(child)]
+						{
+							continue;
+						}
 						// Only the final transfer may become fallthrough. Its row
 						// assignments are still emitted after this gap's computations.
 						let effect_fallthrough =
@@ -574,14 +507,13 @@ impl Emitter<'_> {
 		let ty = if self.graph.edges(exit) == 0 {
 			ValueType::Never
 		} else {
-			ValueType::Unit
+			self.join_type(mir, exit)
 		};
 		if let RegionKind::Loop { header, .. } = kind {
 			let label = self.ensure_label(id);
-			let entry =
-				self.header_values(mir, header, 0).unwrap_or_else(|| {
-					self.body.push(ExprKind::Noop, ValueType::Unit)
-				});
+			let entry = self.join_values(mir, header, 0).unwrap_or_else(|| {
+				self.body.push(ExprKind::Noop, ValueType::Unit)
+			});
 			let params = mir.signatures.scalars(&self.body.ty(entry)).to_vec();
 			let signature = mir.signatures.intern(&params, &[]);
 			let columns = self.graph.joins[usize::from(header)].columns;
@@ -626,6 +558,17 @@ impl Emitter<'_> {
 				}
 			}
 			ValuePlacement::Nested(_) => return self.computation(node),
+			ValuePlacement::Stack(_) => {
+				let NodeKind::Phi { join, .. } = self.graph.kind(node) else {
+					unreachable!("a value on the stack is a phi")
+				};
+				let Some(JoinTarget::Exit(owner)) =
+					self.join_targets[usize::from(join)]
+				else {
+					unreachable!("a value on the stack is a construct's exit")
+				};
+				return self.region_bodies[usize::from(owner)].unwrap();
+			}
 			ValuePlacement::Direct => match self.graph.kind(node) {
 				NodeKind::Int(value) => ExprKind::Int { value },
 				NodeKind::Float(bits) => ExprKind::Float {
@@ -857,40 +800,58 @@ impl Emitter<'_> {
 				return self.body.push(ExprKind::Unreachable, ValueType::Never);
 			}
 			Effect::Region(region) => {
-				return self.region_bodies[usize::from(region)].unwrap();
+				let body = self.region_bodies[usize::from(region)].unwrap();
+				let exit = match self.graph.regions[usize::from(region)].kind {
+					RegionKind::Block { exit }
+					| RegionKind::Loop { exit, .. }
+					| RegionKind::If { exit, .. }
+					| RegionKind::Switch { exit, .. } => exit,
+					RegionKind::Arm => {
+						unreachable!("an arm is not a statement")
+					}
+				};
+				let ty = self.body.ty(body);
+				if ty == ValueType::Unit || ty == ValueType::Never {
+					return body;
+				}
+				// Its exit's values arrive on the stack; its demanded columns'
+				// locals take them once, after it.
+				let columns = self.graph.joins[usize::from(exit)].columns;
+				let targets = self.body.push_targets(
+					self.phi_targets[columns.range()]
+						.iter()
+						.flatten()
+						.map(|&phi| self.value_locals[usize::from(phi)]),
+				);
+				return self.body.push(
+					ExprKind::SetLocals {
+						targets,
+						value: body,
+					},
+					ValueType::Unit,
+				);
 			}
 			Effect::Branch { join, row } => {
-				if let Some(JoinTarget::LoopHeader(owner)) =
-					self.join_targets[usize::from(join)]
+				let value = self.join_values(mir, join, row);
+				let target = self.join_targets[usize::from(join)].unwrap();
+				if let JoinTarget::Exit(_) = target
+					&& Some(join) == fallthrough
 				{
-					let value = self.header_values(mir, join, row);
-					let label = self.ensure_label(owner);
-					return self.body.push(
-						ExprKind::Continue { label, value },
-						ValueType::Never,
-					);
-				}
-				let update = self.row(mir, join, row);
-				if Some(join) == fallthrough {
-					return update.unwrap_or_else(|| {
+					return value.unwrap_or_else(|| {
 						self.body.push(ExprKind::Noop, ValueType::Unit)
 					});
 				}
-				let transfer =
-					match self.join_targets[usize::from(join)].unwrap() {
-						JoinTarget::LoopHeader(_) => {
-							unreachable!("a back edge is a continue")
-						}
-						JoinTarget::Exit(owner) => ExprKind::Break {
-							label: self.ensure_label(owner),
-							value: None,
-						},
-					};
-				let transfer = self.body.push(transfer, ValueType::Never);
-				return match update {
-					Some(update) => self.sequence(&[update, transfer]),
-					None => transfer,
+				let transfer = match target {
+					JoinTarget::LoopHeader(owner) => ExprKind::Continue {
+						label: self.ensure_label(owner),
+						value,
+					},
+					JoinTarget::Exit(owner) => ExprKind::Break {
+						label: self.ensure_label(owner),
+						value,
+					},
 				};
+				return self.body.push(transfer, ValueType::Never);
 			}
 		};
 		let ty = self.result_type(mir, &self.effect_results[outputs.clone()]);
