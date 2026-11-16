@@ -6,8 +6,8 @@
 //!   both: a `Break` exits the `block`, a `Continue` restarts the `loop`, and
 //!   a body that falls off its end restarts it (`br 0`). Its entry is
 //!   evaluated in the `block`, before the `loop` that takes it as its
-//!   parameters, and the body starts by setting them into locals of their
-//!   own, which each `LoopParam` reads;
+//!   parameters, and the body starts by setting them into its parameter
+//!   locals;
 //! - a `Switch` is a `br_table` over nested blocks when [`uses_br_table`],
 //!   else a chain of `if`s comparing the selector, kept in its own local
 //!   when more than one comparison reads it;
@@ -116,12 +116,11 @@ enum Task {
 }
 
 /// A loop's continue target is its loop frame; its break target is the
-/// surrounding block, one frame earlier. `params` is the first of the locals
-/// its parameters are set into.
+/// surrounding block, one frame earlier.
 #[derive(Clone, Copy)]
 enum Label {
 	Block(u32),
-	Loop { frame: u32, params: u32 },
+	Loop(u32),
 }
 
 impl<'a> Linearizer<'a> {
@@ -431,7 +430,7 @@ impl<'a> Linearizer<'a> {
 					});
 				}
 				self.tasks.push(Task::OpenLoop(expr));
-				self.tasks.extend(entry.map(Task::Expr));
+				self.tasks.push(Task::Expr(entry));
 			}
 			ExprKind::IfElse { condition, .. } => {
 				self.schedule_operands([condition], expr)
@@ -471,7 +470,6 @@ impl<'a> Linearizer<'a> {
 			| ExprKind::Int { .. }
 			| ExprKind::Float { .. }
 			| ExprKind::LocalGet { .. }
-			| ExprKind::LoopParam { .. }
 			| ExprKind::Global { .. }
 			| ExprKind::DataEnd { .. }
 			| ExprKind::MemoryIndex { .. }
@@ -499,14 +497,6 @@ impl<'a> Linearizer<'a> {
 			}),
 			ExprKind::LocalGet { local } => {
 				self.push(Instruction::LocalGet(u32::from(local)))
-			}
-			ExprKind::LoopParam { label, index } => {
-				let Label::Loop { params, .. } =
-					self.labels[usize::from(label)]
-				else {
-					unreachable!("a LoopParam of a Block's label")
-				};
-				self.push(Instruction::LocalGet(params + index))
 			}
 			ExprKind::LocalSet { local, .. } => {
 				self.push(Instruction::LocalSet(u32::from(local)))
@@ -542,13 +532,12 @@ impl<'a> Linearizer<'a> {
 			ExprKind::Break { label, .. } => {
 				let frame = match self.labels[usize::from(label)] {
 					Label::Block(frame) => frame,
-					Label::Loop { frame, .. } => frame - 1,
+					Label::Loop(frame) => frame - 1,
 				};
 				self.push(Instruction::Br(self.branch_depth(frame)));
 			}
 			ExprKind::Continue { label, .. } => {
-				let Label::Loop { frame, .. } = self.labels[usize::from(label)]
-				else {
+				let Label::Loop(frame) = self.labels[usize::from(label)] else {
 					unreachable!("a Continue of a Block's label")
 				};
 				self.push(Instruction::Br(self.branch_depth(frame)));
@@ -666,37 +655,32 @@ impl<'a> Linearizer<'a> {
 		}
 	}
 
-	/// The `loop` of a `Loop` whose entry, if any, is on the stack: it takes
-	/// it as its parameters, which the body first sets into locals of their
-	/// own, the last one first.
+	/// The `loop` of a `Loop` whose entry is on the stack: it takes it as
+	/// its parameters, which the body first sets into its parameter locals,
+	/// the last one first.
 	fn open_loop(&mut self, expression: ExprId) {
 		let ExprKind::Loop {
 			label,
 			signature,
+			params,
 			body,
 			..
 		} = self.body.kind(expression)
 		else {
 			unreachable!("a loop opening requires a loop")
 		};
-		let scalars = self.mir.signatures.params(signature);
+		let count = self.mir.signatures.params(signature).len() as u32;
 		let frame = self.open(Instruction::Loop {
-			ty: match scalars {
-				[] => BlockType::Empty,
+			ty: match count {
+				0 => BlockType::Empty,
 				_ => BlockType::Signature(signature),
 			},
 		});
-		let first = self.function.locals.len() as u32;
-		for &ty in scalars {
-			self.function.locals.push(Local { ty: scalar(ty) });
-		}
-		for local in (first..self.function.locals.len() as u32).rev() {
+		let first = u32::from(params);
+		for local in (first..first + count).rev() {
 			self.push(Instruction::LocalSet(local));
 		}
-		self.labels[usize::from(label)] = Label::Loop {
-			frame,
-			params: first,
-		};
+		self.labels[usize::from(label)] = Label::Loop(frame);
 		self.tasks.push(Task::FinishLoop(expression));
 		self.tasks.push(Task::Expr(body));
 	}

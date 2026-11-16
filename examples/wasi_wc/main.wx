@@ -33,8 +33,7 @@ func main() {
         local chunk = Fd::STDIN.read(arena, buffer);
         if chunk.len() == 0 { break };
         bytes += chunk.len();
-        local mut i: u32 = 0;
-        loop {
+        loop (i: u32 = 0) {
             if i == chunk.len() { break };
             local byte = chunk[i];
             if byte == '\n' { lines += 1 };
@@ -44,7 +43,7 @@ func main() {
                 if !in_word { words += 1 };
                 in_word = True;
             }
-            i += 1;
+            continue i + 1;
         }
     }
     print(arena, digits, lines, " ");

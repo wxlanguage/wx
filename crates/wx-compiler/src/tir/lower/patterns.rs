@@ -20,7 +20,9 @@
 
 use std::collections::HashSet;
 
-use super::{Binding, Body, ExprIdx, FunctionState, Lowerer, ScalarRange, mir};
+use super::{
+	Body, ExprIdx, FunctionState, LocalRun, Lowerer, ScalarRange, mir,
+};
 use crate::ast::BinaryOp;
 use crate::diagnostics::TextSpan;
 use crate::tir::body::{
@@ -39,7 +41,7 @@ use crate::tir::types::{GenericArgs, Type, TypeIndex};
 #[derive(Clone, Copy)]
 struct Projection {
 	/// Where the stored value the projection is rooted in is.
-	root: Binding,
+	root: LocalRun,
 	range: ScalarRange,
 	ty: mir::ValueType,
 	/// Concrete: substituted with the instance's arguments where it was read.
@@ -79,7 +81,7 @@ impl Lowerer<'_> {
 			}
 			PatternKind::Bind(local) => {
 				let value = self.lower_expr(body, state, value)?;
-				let run = state.bindings[usize::from(local)].locals();
+				let run = state.bindings[usize::from(local)];
 				return Ok(self.write_locals(state, run, value));
 			}
 			_ => {}
@@ -289,7 +291,7 @@ impl Lowerer<'_> {
 						let subject = subject
 							.expect("a binding default has a stored scrutinee");
 						let bind = self.projection_value(state, subject);
-						let run = state.bindings[usize::from(local)].locals();
+						let run = state.bindings[usize::from(local)];
 						let set = self.write_locals(state, run, bind);
 						self.sequence(state, vec![set], value)
 					}
@@ -399,7 +401,7 @@ impl Lowerer<'_> {
 				#[cfg(debug_assertions)]
 				debug_assert_eq!(state.ty(value), ty);
 				let (set, root) = self.temporary(state, value);
-				(Binding::Locals(root), vec![set])
+				(root, vec![set])
 			}
 		};
 		let len = self.signatures.scalars(&ty).len() as u32;
@@ -769,7 +771,7 @@ impl Lowerer<'_> {
 			| PatternKind::Error => Ok(()),
 			PatternKind::Bind(local) => {
 				let value = self.projection_value(state, subject);
-				let run = state.bindings[usize::from(local)].locals();
+				let run = state.bindings[usize::from(local)];
 				out.push(self.write_locals(state, run, value));
 				Ok(())
 			}
@@ -949,8 +951,8 @@ impl Lowerer<'_> {
 		state: &mut FunctionState,
 		subject: Projection,
 	) -> mir::ExprId {
-		let binding = subject.root.slice(subject.range);
-		self.read_binding(state, binding, subject.ty)
+		let run = subject.root.slice(subject.range);
+		self.read_locals(state, run, subject.ty)
 	}
 
 	/// `subject == constant`, as a boolean.

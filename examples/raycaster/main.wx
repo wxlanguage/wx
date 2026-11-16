@@ -54,13 +54,12 @@ func is_wall(x: f64, y: f64) -> Bool {
 // Scans row-major for the first open cell and spawns the player there, so an
 // uploaded map doesn't need to guarantee any particular cell is walkable.
 func find_spawn() {
-    local mut y: i32 = 0;
     local mut found = False;
-    loop {
+    loop (y: i32 = 0) {
         if found { break };
         if y >= transmute(map_h.get()) { break };
         local mut x: i32 = 0;
-        loop {
+        loop (x: i32 = 0) {
             if found { break };
             if x >= transmute(map_w.get()) { break };
             if map_at(x, y) == 0 {
@@ -69,9 +68,9 @@ func find_spawn() {
                 player_angle.set(0.0);
                 found = True;
             }
-            x += 1;
+            continue x + 1;
         }
-        y += 1;
+        continue y + 1;
     };
 }
 
@@ -187,8 +186,7 @@ func cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
 
 // ── render ───────────────────────────────────────────────────────────────────
 pub func render() {
-    local mut x: i32 = 0;
-    loop {
+    loop (x: i32 = 0) {
         if x >= SCREEN_W { break };
 
         local t = x.to_f64() / SCREEN_W.to_f64();
@@ -209,8 +207,7 @@ pub func render() {
         local mut shade: u8 = 200;
         if hit.side == 1 { shade = 140 };
 
-        local mut y: i32 = 0;
-        loop {
+        loop (y: i32 = 0) {
             if y >= SCREEN_H { break };
             if y < draw_start {
                 put_pixel(x, y, 40, 40, 60);
@@ -221,9 +218,9 @@ pub func render() {
                     put_pixel(x, y, shade, 0, 0);
                 };
             }
-            y += 1;
+            continue y + 1;
         }
-        x += 1;
+        continue x + 1;
     };
 }
 

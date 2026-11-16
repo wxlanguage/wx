@@ -270,19 +270,24 @@ the name finds the first.
 A Wasm `loop` is a block whose type is a function type, `[params] -> []`, and
 a `br` to it carries values for its parameters. A loop's state maps onto that:
 
-- MIR's `Loop` carries its signature and its entry value, `LoopParam` reads
-  one of its parameters, and `Continue` carries the next state.
-- An immutable parameter reads the loop's Wasm parameters where it is used,
-  and has no local of its own. A `mut` one is a local, set from them at the
-  top of the body.
+- MIR's `Loop` carries its signature, its entry value, and the first of its
+  parameter locals; `Continue` carries the next state. Each iteration starts
+  by setting the Wasm parameters into those locals, which the body reads; a
+  parameter, `mut` or not, is a local like any other.
+- The optimizer treats them as locals the loop writes: they are its header's
+  first columns. It emits every demanded header column, a parameter's or a
+  local's the body assigns, as a parameter of the emitted loop, so the entry
+  and each back edge give the values and set no local.
 - The block type is the signature: `0x40` for `[] -> []`, a value type for
   `[] -> [t]`, and a type index otherwise (`BlockType::Signature`).
 
 ```wat
-i32.const 0
-local.get $n            ;; the first state
 block
+  i32.const 0
+  local.get $n          ;; the first state
   loop (param i32 i32)
+    local.set $high
+    local.set $low
     ...                 ;; body
     br 0                ;; with the next state on the stack
   end
@@ -290,9 +295,10 @@ end
 ```
 
 Where values sit between uses is the scheduler's choice, not the language's:
-codegen takes a loop's parameters off the stack into locals at its top today,
-and opt still materializes a header's parameters as locals. Keeping them on
-the stack where a value is consumed at once is an optimization for later.
+codegen takes a loop's parameters off the stack into locals at its top.
+Keeping them on the stack where a value is consumed at once is an
+optimization for later, as is carrying a block's exit values on its `br`s
+rather than through locals.
 
 ## Examples
 

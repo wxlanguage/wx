@@ -6,8 +6,7 @@ use super::{
 	RegionKind, TrappingOp, ValuePlacement,
 };
 use crate::mir::{
-	self, ExprId, ExprKind, FunctionId, LabelId, LocalIndex, MIR,
-	SignatureIndex, ValueType,
+	self, ExprId, ExprKind, FunctionId, LabelId, LocalIndex, MIR, ValueType,
 };
 use crate::wasm::ScalarType;
 
@@ -45,57 +44,6 @@ pub fn emit(
 		pending_computations: Vec::new(),
 		computation_inputs: Vec::new(),
 	};
-	for index in 0..graph.kinds.len() {
-		let node = NodeId::new(index as u32);
-		if graph.resolve(node) != node {
-			continue;
-		}
-		if matches!(
-			placement.value(node),
-			Some(ValuePlacement::Stored(_) | ValuePlacement::Fixed(_))
-		) {
-			let local = LocalIndex::new(emitter.locals.len() as u32);
-			emitter.locals.push(mir::Local {
-				ty: value_type(graph.ty(node)),
-				mutability: mir::Mutability::Mutable,
-			});
-			emitter.value_locals[index] = Some(local);
-		}
-		if let NodeKind::Phi { join, column } = graph.kind(node) {
-			if emitter.value_locals[index].is_some() {
-				let slot = graph.joins[usize::from(join)].columns.start
-					as usize + column as usize;
-				assert!(emitter.phi_targets[slot].replace(node).is_none());
-			}
-		}
-		if let NodeKind::Result { effect, .. } = graph.kind(node) {
-			emitter.effect_result_offsets[usize::from(effect) + 1] += 1;
-		}
-	}
-	for index in 1..emitter.effect_result_offsets.len() {
-		emitter.effect_result_offsets[index] +=
-			emitter.effect_result_offsets[index - 1];
-	}
-	// Keep even unused outputs: they carry result types and must be dropped.
-	let mut results =
-		vec![None; *emitter.effect_result_offsets.last().unwrap()];
-	for (node, kind) in graph.kinds.iter().enumerate() {
-		if let NodeKind::Result { effect, index } = *kind {
-			let start = emitter.effect_result_offsets[usize::from(effect)];
-			let end = emitter.effect_result_offsets[usize::from(effect) + 1];
-			let slot = start + index as usize;
-			assert!(slot < end, "effect output outside its result run");
-			assert!(
-				results[slot].replace(NodeId::new(node as u32)).is_none(),
-				"duplicate effect output"
-			);
-		}
-	}
-	emitter.effect_results = results
-		.into_iter()
-		.map(|node| node.expect("missing effect output"))
-		.collect();
-
 	// Branch targets name their owners. Labels are allocated only when an
 	// emitted transfer needs one (or when a loop itself is emitted).
 	emitter.region_gap_offsets.push(0);
@@ -126,6 +74,74 @@ pub fn emit(
 				Some(JoinTarget::LoopHeader(owner));
 		}
 	}
+	for index in 0..graph.kinds.len() {
+		let node = NodeId::new(index as u32);
+		if graph.resolve(node) != node {
+			continue;
+		}
+		let stored = matches!(
+			placement.value(node),
+			Some(ValuePlacement::Stored(_) | ValuePlacement::Fixed(_))
+		);
+		if let NodeKind::Phi { join, column } = graph.kind(node) {
+			if stored {
+				let slot = graph.joins[usize::from(join)].columns.start
+					as usize + column as usize;
+				assert!(emitter.phi_targets[slot].replace(node).is_none());
+			}
+			// A loop's parameters: their locals are allocated together.
+			if matches!(
+				emitter.join_targets[usize::from(join)],
+				Some(JoinTarget::LoopHeader(_))
+			) {
+				continue;
+			}
+		}
+		if stored {
+			emitter.value_locals[index] = Some(emitter.push_local(node));
+		}
+		if let NodeKind::Result { effect, .. } = graph.kind(node) {
+			emitter.effect_result_offsets[usize::from(effect) + 1] += 1;
+		}
+	}
+	// Each loop's demanded header columns, in order, are its parameters,
+	// set into consecutive locals.
+	for region in &graph.regions {
+		let RegionKind::Loop { header, .. } = region.kind else {
+			continue;
+		};
+		let columns = graph.joins[usize::from(header)].columns;
+		for slot in columns.range() {
+			if let Some(phi) = emitter.phi_targets[slot] {
+				emitter.value_locals[usize::from(phi)] =
+					Some(emitter.push_local(phi));
+			}
+		}
+	}
+	for index in 1..emitter.effect_result_offsets.len() {
+		emitter.effect_result_offsets[index] +=
+			emitter.effect_result_offsets[index - 1];
+	}
+	// Keep even unused outputs: they carry result types and must be dropped.
+	let mut results =
+		vec![None; *emitter.effect_result_offsets.last().unwrap()];
+	for (node, kind) in graph.kinds.iter().enumerate() {
+		if let NodeKind::Result { effect, index } = *kind {
+			let start = emitter.effect_result_offsets[usize::from(effect)];
+			let end = emitter.effect_result_offsets[usize::from(effect) + 1];
+			let slot = start + index as usize;
+			assert!(slot < end, "effect output outside its result run");
+			assert!(
+				results[slot].replace(NodeId::new(node as u32)).is_none(),
+				"duplicate effect output"
+			);
+		}
+	}
+	emitter.effect_results = results
+		.into_iter()
+		.map(|node| node.expect("missing effect output"))
+		.collect();
+
 	// Count/prefix/fill across executable gaps, preserving dependency order.
 	emitter.computation_offsets =
 		vec![0; emitter.region_gap_offsets.last().unwrap() + 1];
@@ -304,6 +320,44 @@ struct Emitter<'a> {
 }
 
 impl Emitter<'_> {
+	fn push_local(&mut self, node: NodeId) -> LocalIndex {
+		let local = LocalIndex::new(self.locals.len() as u32);
+		self.locals.push(mir::Local {
+			ty: value_type(self.graph.ty(node)),
+			mutability: mir::Mutability::Mutable,
+		});
+		local
+	}
+
+	/// A loop's parameters given by row `row` of its `header`: the values
+	/// of its demanded columns, as one value; none without one.
+	fn header_values(
+		&mut self,
+		mir: &mut MIR,
+		header: JoinId,
+		row: u32,
+	) -> Option<ExprId> {
+		let columns = self.graph.joins[usize::from(header)].columns;
+		let mut values = Vec::new();
+		let mut types = Vec::new();
+		for (column, slot) in columns.range().enumerate() {
+			let Some(phi) = self.phi_targets[slot] else {
+				continue;
+			};
+			values.push(self.read(self.graph.row(header, row)[column]));
+			types.push(value_type(self.graph.ty(phi)));
+		}
+		match *values {
+			[] => None,
+			[value] => Some(value),
+			_ => {
+				let ty = mir.signatures.value_of(&types);
+				let values = self.body.push_list(values);
+				Some(self.body.push(ExprKind::Values { values }, ty))
+			}
+		}
+	}
+
 	/// Assign only demanded phi columns. Values evaluates every source before
 	/// SetLocals writes any target, including cyclic swaps and self reads.
 	fn row(&mut self, mir: &mut MIR, join: JoinId, row: u32) -> Option<ExprId> {
@@ -522,14 +576,28 @@ impl Emitter<'_> {
 		} else {
 			ValueType::Unit
 		};
-		if matches!(kind, RegionKind::Loop { .. }) {
-			// Its header's values are in locals: it takes no parameters.
+		if let RegionKind::Loop { header, .. } = kind {
 			let label = self.ensure_label(id);
+			let entry =
+				self.header_values(mir, header, 0).unwrap_or_else(|| {
+					self.body.push(ExprKind::Noop, ValueType::Unit)
+				});
+			let params = mir.signatures.scalars(&self.body.ty(entry)).to_vec();
+			let signature = mir.signatures.intern(&params, &[]);
+			let columns = self.graph.joins[usize::from(header)].columns;
+			let params = self.phi_targets[columns.range()]
+				.iter()
+				.flatten()
+				.next()
+				.map_or(LocalIndex::new(0), |&phi| {
+					self.value_locals[usize::from(phi)].unwrap()
+				});
 			self.body.push(
 				ExprKind::Loop {
 					label,
-					signature: SignatureIndex::EMPTY,
-					entry: None,
+					signature,
+					params,
+					entry,
 					body: inner,
 				},
 				ty,
@@ -789,21 +857,19 @@ impl Emitter<'_> {
 				return self.body.push(ExprKind::Unreachable, ValueType::Never);
 			}
 			Effect::Region(region) => {
-				let body = self.region_bodies[usize::from(region)].unwrap();
-				if let RegionKind::Loop { header, .. } =
-					self.graph.regions[usize::from(region)].kind
-				{
-					if let Some(entry) = self.row(mir, header, 0) {
-						let statements = self.body.push_list([entry, body]);
-						let ty = self.body.ty(body);
-						return self
-							.body
-							.push(ExprKind::Sequence { statements }, ty);
-					}
-				}
-				return body;
+				return self.region_bodies[usize::from(region)].unwrap();
 			}
 			Effect::Branch { join, row } => {
+				if let Some(JoinTarget::LoopHeader(owner)) =
+					self.join_targets[usize::from(join)]
+				{
+					let value = self.header_values(mir, join, row);
+					let label = self.ensure_label(owner);
+					return self.body.push(
+						ExprKind::Continue { label, value },
+						ValueType::Never,
+					);
+				}
 				let update = self.row(mir, join, row);
 				if Some(join) == fallthrough {
 					return update.unwrap_or_else(|| {
@@ -812,10 +878,9 @@ impl Emitter<'_> {
 				}
 				let transfer =
 					match self.join_targets[usize::from(join)].unwrap() {
-						JoinTarget::LoopHeader(owner) => ExprKind::Continue {
-							value: None,
-							label: self.ensure_label(owner),
-						},
+						JoinTarget::LoopHeader(_) => {
+							unreachable!("a back edge is a continue")
+						}
 						JoinTarget::Exit(owner) => ExprKind::Break {
 							label: self.ensure_label(owner),
 							value: None,

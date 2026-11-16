@@ -65,24 +65,22 @@ func pop_back() {
         head.set(0);
         return;
     }
-    local mut cur = first;
-    loop {
-        local next = cur.as_ref().next;
+    loop (curr = first) {
+        local next = curr.as_ref().next;
         if next.as_ref().next.is_null() {
-            cur.as_ptr().next = RawPtr::null();
+            curr.as_ptr().next = RawPtr::null();
             break;
         }
-        cur = next;
+        continue next;
     }
 }
 
 func contains(x: i32, y: i32) -> Bool {
-    local mut cur = RawPtr::<heap, Node>::from_addr(head.get());
-    loop {
-        if cur.is_null() { break False };
-        local n = cur.as_ref();
+    loop (curr = RawPtr::<heap, Node>::from_addr(head.get())) {
+        if curr.is_null() { break False };
+        local n = curr.as_ref();
         if n.x == x && n.y == y { break True };
-        cur = n.next;
+        continue n.next;
     }
 }
 

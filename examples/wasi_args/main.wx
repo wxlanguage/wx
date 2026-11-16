@@ -10,14 +10,13 @@ func main() {
     local digits = arena.allocate_slice_uninit::<u8>(fmt::DECIMAL_LEN);
     local arguments = wasi::args(arena);
     if arguments.len() < 2 { wasi::panic(arena, "usage: args <word>...") };
-    local mut i: u32 = 0;
-    loop {
+    loop (i: u32 = 0) {
         if i == arguments.len() { break };
         Fd::STDOUT.write(arena, fmt::decimal::<heap>(digits, i));
         Fd::STDOUT.write(arena, ": ");
         Fd::STDOUT.write(arena, arguments[i]);
         Fd::STDOUT.write(arena, "\n");
-        i += 1;
+        continue i + 1;
     }
 }
 

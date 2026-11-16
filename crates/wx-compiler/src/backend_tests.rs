@@ -689,11 +689,13 @@ fn flat_pack_crosses_a_loop_join() {
 
 		let body =
 			f.sequence([break_when_zero, bump_first_scalar, decrement_n], unit);
+		let entry = f.push(mir::ExprKind::Noop, unit);
 		let looped = f.push(
 			mir::ExprKind::Loop {
 				label,
 				signature: mir::SignatureIndex::EMPTY,
-				entry: None,
+				params: mir::LocalIndex::new(0),
+				entry,
 				body,
 			},
 			unit,
@@ -938,11 +940,13 @@ fn a_diverging_break_value_does_not_break() {
 			mir::ValueType::Never,
 		);
 		let body = f.sequence([leave], mir::ValueType::Never);
+		let entry = f.push(mir::ExprKind::Noop, mir::ValueType::Unit);
 		f.push(
 			mir::ExprKind::Loop {
 				label,
 				signature: mir::SignatureIndex::EMPTY,
-				entry: None,
+				params: mir::LocalIndex::new(0),
+				entry,
 				body,
 			},
 			mir::ValueType::Never,

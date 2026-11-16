@@ -23,7 +23,12 @@ pub fn build(mir: &MIR, id: FunctionId) -> Function {
 		mir,
 		body: &code.body,
 		function: Function::new(),
-		writes: WriteSets::compute(&code.body, code.root, code.locals.len()),
+		writes: WriteSets::compute(
+			&code.body,
+			code.root,
+			code.locals.len(),
+			&mir.signatures,
+		),
 		bindings: Vec::with_capacity(code.locals.len()),
 		saved: Vec::new(),
 		labels: vec![None; code.label_count as usize],
@@ -87,9 +92,6 @@ enum Label {
 		header: JoinId,
 		exit: JoinId,
 		writes: Run,
-		/// The placeholder phi of its first parameter column; the rest
-		/// follow it.
-		params: NodeId,
 	},
 }
 
@@ -286,15 +288,6 @@ impl Builder<'_> {
 			ExprKind::Loop {
 				label, entry, body, ..
 			} => self.lp(expr, label, entry, body, ty),
-			ExprKind::LoopParam { label, index } => {
-				let Some(Label::Loop { params, .. }) =
-					self.labels[usize::from(label)]
-				else {
-					unreachable!("a loop parameter of a block's label")
-				};
-				self.built.push(NodeId::new(u32::from(params) + index));
-				true
-			}
 			ExprKind::Break { label, value } => {
 				let base = self.built.len();
 				if let Some(value) = value
@@ -324,7 +317,7 @@ impl Builder<'_> {
 				else {
 					unreachable!("a continue of a block's label")
 				};
-				let row = self.add_row(header, writes, base);
+				let row = self.add_header_row(header, writes, base);
 				self.built.truncate(base);
 				self.effect(Effect::Branch { join: header, row });
 				false
@@ -506,31 +499,30 @@ impl Builder<'_> {
 		self.close_join(exit, writes)
 	}
 
-	/// A loop's header has a column per local its subtree writes, then one
-	/// per parameter: the entry's values come in on its first row, the
-	/// body's and each `Continue`'s on the back edges. Each column gets a
-	/// placeholder phi before the body is built, since the body reads them
-	/// before the back edges exist; once they do, a placeholder whose rows
-	/// are itself or one value is that value.
+	/// A loop's header has a column per local its subtree writes, its
+	/// parameter locals first: the entry's values come in on its first row,
+	/// the body's and each `Continue`'s on the back edges, and every other
+	/// local's binding with them. Each column gets a placeholder phi before
+	/// the body is built, since the body reads them before the back edges
+	/// exist; once they do, a placeholder whose rows are itself or one value
+	/// is that value.
 	fn lp(
 		&mut self,
 		expr: ExprId,
 		label: LabelId,
-		entry: Option<ExprId>,
+		entry: ExprId,
 		body: ExprId,
 		ty: ValueType,
 	) -> bool {
 		let base = self.built.len();
-		if let Some(entry) = entry
-			&& !self.expr(entry)
-		{
+		if !self.expr(entry) {
 			return false;
 		}
-		let params = self.built.len() - base;
 		let writes = self.writes.of(expr);
 		let exit = self.open_join(writes, scalars(self.mir, ty).len());
-		let header = self.open_join(writes, params);
-		self.add_row(header, writes, base);
+		let header = self.open_join(writes, 0);
+		self.add_header_row(header, writes, base);
+		self.built.truncate(base);
 		let placeholders = self.function.kinds.len();
 		for (column, &local) in
 			self.writes.locals[writes.range()].iter().enumerate()
@@ -542,26 +534,15 @@ impl Builder<'_> {
 			};
 			self.bindings[usize::from(local)] = self.function.push(phi, ty);
 		}
-		let first_param = NodeId::new(self.function.kinds.len() as u32);
-		for at in 0..params {
-			let ty = self.function.ty(self.built[base + at]);
-			let phi = NodeKind::Phi {
-				join: header,
-				column: (writes.len() + at) as u32,
-			};
-			self.function.push(phi, ty);
-		}
-		self.built.truncate(base);
 		self.labels[usize::from(label)] = Some(Label::Loop {
 			header,
 			exit,
 			writes,
-			params: first_param,
 		});
 		let start = self.sequence.len();
 		// The body's value is the next iteration's parameters.
 		if self.expr(body) {
-			let row = self.add_row(header, writes, base);
+			let row = self.add_header_row(header, writes, base);
 			self.effect(Effect::Branch { join: header, row });
 		}
 		self.built.truncate(base);
@@ -742,6 +723,38 @@ impl Builder<'_> {
 		open.edges - 1
 	}
 
+	/// Give a loop's `header` a row: the scalars built since `base` for its
+	/// parameter locals, the first columns of `writes`, then the bindings of
+	/// the rest. Returns its index.
+	fn add_header_row(
+		&mut self,
+		header: JoinId,
+		writes: Run,
+		base: usize,
+	) -> u32 {
+		let Self {
+			open,
+			writes: sets,
+			bindings,
+			built,
+			..
+		} = self;
+		let open = open
+			.iter_mut()
+			.rev()
+			.find(|open| open.join == header)
+			.expect("a continue inside its loop");
+		let params = built.len() - base;
+		open.rows.extend_from_slice(&built[base..]);
+		open.rows.extend(
+			sets.locals[writes.range()][params..]
+				.iter()
+				.map(|&local| bindings[usize::from(local)]),
+		);
+		open.edges += 1;
+		open.edges - 1
+	}
+
 	/// Move the innermost open join's rows into the function.
 	fn commit(&mut self, join: JoinId) {
 		let mut open = self.open.pop().expect("an open join");
@@ -835,7 +848,8 @@ impl Builder<'_> {
 }
 
 /// Per MIR join construct (`Block`, `Loop`, `IfElse`, `Switch`), the locals
-/// its subtree writes, each once.
+/// its subtree writes, each once; a `Loop`'s parameter locals first, in
+/// order.
 struct WriteSets {
 	locals: Vec<LocalIndex>,
 	/// By `ExprId`; empty for anything but a join construct.
@@ -843,7 +857,12 @@ struct WriteSets {
 }
 
 impl WriteSets {
-	fn compute(body: &mir::Body, root: ExprId, locals: usize) -> Self {
+	fn compute(
+		body: &mir::Body,
+		root: ExprId,
+		locals: usize,
+		signatures: &mir::Signatures,
+	) -> Self {
 		enum Step {
 			Enter(ExprId),
 			/// Close a join construct whose writes start at `start` in
@@ -865,13 +884,6 @@ impl WriteSets {
 			match step {
 				Step::Enter(expr) => {
 					let mut kind = body.kind(expr);
-					match kind {
-						ExprKind::LocalSet { local, .. } => found.push(local),
-						ExprKind::SetLocals { targets, .. } => {
-							found.extend(body.targets(targets).iter().flatten())
-						}
-						_ => {}
-					}
 					if matches!(
 						kind,
 						ExprKind::Block { .. }
@@ -880,6 +892,25 @@ impl WriteSets {
 							| ExprKind::Switch { .. }
 					) {
 						stack.push(Step::Leave(expr, found.len()));
+					}
+					match kind {
+						ExprKind::LocalSet { local, .. } => found.push(local),
+						ExprKind::SetLocals { targets, .. } => {
+							found.extend(body.targets(targets).iter().flatten())
+						}
+						// Its own, before its children's: its header's first
+						// columns.
+						ExprKind::Loop {
+							signature, params, ..
+						} => {
+							let first = u32::from(params);
+							let count =
+								signatures.params(signature).len() as u32;
+							found.extend(
+								(first..first + count).map(LocalIndex::new),
+							);
+						}
+						_ => {}
 					}
 					kind.body_ids_mut(|id| match id {
 						mir::body::BodyId::Expr(child) => {

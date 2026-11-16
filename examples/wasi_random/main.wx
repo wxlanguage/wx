@@ -56,13 +56,12 @@ func main() {
 
     // Two hex digits per random byte, plus a trailing newline.
     local text = alloc.allocate_slice_uninit::<u8>(RANDOM_BYTES * 2 + 1);
-    local mut i: u32 = 0;
-    loop {
+    loop (i: u32 = 0) {
         if i == RANDOM_BYTES { break };
         local byte = random_bytes[i];
         text[i * 2] = hex_digit(byte / 16);
         text[i * 2 + 1] = hex_digit(byte % 16);
-        i += 1;
+        continue i + 1;
     }
     text[RANDOM_BYTES * 2] = '\n';
 

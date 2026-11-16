@@ -811,11 +811,13 @@ fn mixed_scalar_values_cross_all_construct_exit_joins() {
 						let statements = f.body.push_list([exit]);
 						f.push(E::Block { label, statements }, pack)
 					} else {
+						let entry = f.push(E::Noop, T::Unit);
 						f.push(
 							E::Loop {
 								label,
 								signature: mir::SignatureIndex::EMPTY,
-								entry: None,
+								params: mir::LocalIndex::new(0),
+								entry,
 								body: exit,
 							},
 							pack,
@@ -1022,6 +1024,56 @@ fn nonlocal_exits_keep_their_wrapper_and_skip_parent_continuation() {
 			run.call(&mut store, flag).unwrap(),
 			if flag == 0 { (9, 2) } else { (7, 1) }
 		);
+	}
+}
+
+/// Every column of a loop's header, a source parameter's or a written
+/// local's, is a parameter of the emitted loop: each back edge gives them
+/// as its value, none sets a local. A parameter's source reads a local's
+/// value from before the row assigns it.
+#[test]
+fn a_loop_header_s_columns_are_its_emitted_parameters() {
+	let source = r#"
+		func run(n: i32) -> i32 {
+			local mut total: i32 = 0;
+			local last = loop (a: i32 = 0, b: i32 = 1, k = n) {
+				if k == 0 { break a };
+				local previous = total;
+				total = a + b;
+				(b, previous + b, k - 1)
+			};
+			last * 1000 + total
+		}
+		export { run as "run" }
+	"#;
+	let (strings, mut mir) = lower_source(source);
+	opt::emit_for_tests(&mut mir);
+	let code = mir.code(mir::FunctionId::new(0));
+	let kinds = code.body.kinds();
+	let signature = kinds
+		.iter()
+		.find_map(|kind| match *kind {
+			E::Loop { signature, .. } => Some(signature),
+			_ => None,
+		})
+		.unwrap();
+	assert_eq!(mir.signatures.params(signature), [T::I32; 4]);
+	assert!(kinds.iter().all(|kind| !matches!(
+		kind,
+		E::SetLocals { .. } | E::Continue { value: None, .. }
+	)));
+	let (mut store, instance) = run_mode(mir, &strings, false);
+	let run = instance
+		.get_typed_func::<i32, i32>(&mut store, "run")
+		.unwrap();
+	let (mut a, mut b, mut total) = (0i32, 1i32, 0i32);
+	for n in 0..12 {
+		assert_eq!(
+			run.call(&mut store, n).unwrap(),
+			a.wrapping_mul(1000).wrapping_add(total),
+			"n={n}"
+		);
+		(a, b, total) = (b, total.wrapping_add(b), a.wrapping_add(b));
 	}
 }
 

@@ -60,15 +60,14 @@ func decide(packet: host::io::&[u8]) -> Verdict {
     local port = be16(packet, 2);
 
     local table = RULES;
-    local mut i: u32 = 0;
-    loop {
+    loop (i: u32 = 0) {
         if i == table.len() { break Verdict::Drop };
         if (table[i] == 0 || table[i] == protocol)
             && be16(table, i + 1) == port {
             if table[i + 3] == 1 { break Verdict::Accept };
-            break Verdict::Drop
+            break Verdict::Drop;
         }
-        i += RULE_LEN;
+        continue i + RULE_LEN;
     }
 }
 
