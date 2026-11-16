@@ -1350,8 +1350,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 			// A left-out result is `()`; its function's name stands for it.
 			let written = |file_id, syntax: &ast::FunctionSignature| {
 				if position < params {
-					WrittenType::Written(
-						self.ast(file_id).list(syntax.params)[position].ty,
+					// A parameter with no type written has the error type,
+					// which matches anything; its name stands for it.
+					let param = self.ast(file_id).list(syntax.params)[position];
+					param.ty.map_or(
+						WrittenType::Implied(param.binding.name.span),
+						WrittenType::Written,
 					)
 				} else {
 					syntax.result.map_or(

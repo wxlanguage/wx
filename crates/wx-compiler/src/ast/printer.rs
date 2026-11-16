@@ -596,15 +596,13 @@ impl<'a> Printer<'a> {
 
 	/// What a parameter or a field is bound to, then its type: `x T` or
 	/// `mut x T`.
-	fn bound_to(&self, binding: Binding, ty: TypeId) -> Vec<Sexp> {
+	fn bound_to(&self, binding: Binding, ty: Option<TypeId>) -> Vec<Sexp> {
 		binding
 			.mut_at
 			.map(|_| Sexp::atom("mut"))
 			.into_iter()
-			.chain([
-				Sexp::atom(self.name(binding.name.inner)),
-				Sexp::atom(self.ty(ty)),
-			])
+			.chain([Sexp::atom(self.name(binding.name.inner))])
+			.chain(ty.map(|ty| Sexp::atom(self.ty(ty))))
 			.collect()
 	}
 
@@ -772,11 +770,36 @@ impl<'a> Printer<'a> {
 		label: Option<Spanned<SymbolU32>>,
 		block: BlockId,
 	) -> Sexp {
+		self.headed_block(head, label, None, block)
+	}
+
+	/// A block after its label and, for a loop, its state.
+	fn headed_block(
+		&self,
+		head: &str,
+		label: Option<Spanned<SymbolU32>>,
+		header: Option<LoopHeaderId>,
+		block: BlockId,
+	) -> Sexp {
 		let Block { statements, tail } = self.ast.block(block);
+		let header = header.map(|header| {
+			let LoopHeader {
+				state, initializer, ..
+			} = self.ast.loop_header(header);
+			let slots =
+				self.ast.list(state).iter().map(|slot| {
+					Sexp::List(self.bound_to(slot.binding, slot.ty))
+				});
+			Sexp::head(
+				"state",
+				[Sexp::head("slots", slots), self.expr(initializer)],
+			)
+		});
 		Sexp::head(
 			head,
 			self.label(label)
 				.into_iter()
+				.chain(header)
 				.chain(
 					self.ast
 						.list(statements)
@@ -876,9 +899,12 @@ impl<'a> Printer<'a> {
 					.into_iter()
 					.chain(value.map(|value| self.expr(value))),
 			),
-			Expression::Continue { label } => {
-				Sexp::head("continue", self.label(label))
-			}
+			Expression::Continue { label, value } => Sexp::head(
+				"continue",
+				self.label(label)
+					.into_iter()
+					.chain(value.map(|value| self.expr(value))),
+			),
 			Expression::IfElse {
 				condition,
 				then_block,
@@ -900,9 +926,11 @@ impl<'a> Printer<'a> {
 					}),
 				),
 			),
-			Expression::Loop { label, block } => {
-				self.block("loop", label, block)
-			}
+			Expression::Loop {
+				label,
+				header,
+				block,
+			} => self.headed_block("loop", label, header, block),
 			Expression::Path(segments) => {
 				Sexp::Atom(self.path(self.ast.list(segments), "::"))
 			}

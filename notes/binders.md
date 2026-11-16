@@ -1,6 +1,6 @@
 # Binders: names in parameters, fields and patterns
 
-Status: decided 2026-11-16. Implemented, except the loop header, which is built with `notes/loop-bindings.md`. "As built" records where the implementation went another way than the plan.
+Status: decided 2026-11-16. Implemented, except the loop header, which is built with `notes/loop-bindings.md`. "A slot's type may be left to inference" was revised the same day and is implemented. "As built" records where the implementation went another way than the plan.
 
 ## Problem
 
@@ -51,18 +51,46 @@ A binder is `name` or `mut name`, wherever it binds:
 
 | Where | Binder | `: Type` |
 | --- | --- | --- |
-| Parameter | `name`, `mut name` | required |
-| Struct field, enum repr | `name`, `mut name`, optional `pub` | required |
-| Loop header | `name`, `mut name` | optional (the initializer gives it) |
+| Parameter | `name`, `mut name` | written: nothing infers it |
+| Struct field, enum repr | `name`, `mut name`, optional `pub` | written: nothing infers it |
+| Loop header | `name`, `mut name` | optional: the initializer gives it |
 | `local` and match patterns | `name`, `mut name`, or `_` | optional on `local` |
 
 `_` stays only where a value really arrives and is thrown away: as a pattern
 in a destructuring `local` or a match arm, and in `_ = expr;`. It is never a
 binder.
 
-**The type is required where nothing else gives it** (a parameter, a field, a
+**The type is needed where nothing else gives it** (a parameter, a field, a
 repr) and optional where an initializer does (a `local`, a loop header). That
-is the only difference between the rows.
+is the only difference between the rows, and it is the checker's, not the
+grammar's (next section).
+
+### A slot's type may be left to inference
+
+Revised 2026-11-16, with the loop header. Every slot that binds a name has
+one grammar, a parameter's, a field's, a repr's and a loop header's alike:
+
+```
+[pub] [mut] name (: Type)?
+```
+
+The type is optional in the syntax, and an omitted type means the same as a
+written `_` (`x: _`, the placeholder any type position accepts): infer it.
+Whether anything can is decided where the slot is checked:
+
+- **A loop header** infers it from its initializer (`notes/loop-bindings.md`).
+- **A signature** (a parameter, a field, a repr) has nothing to infer it
+  from: no type is read from a body or a use. The slot is reported, E2051
+  (`InferInSignature`, the code `_` in a signature already has), at the name
+  for an omitted type and at the `_` for a written one, and keeps an `ERROR`
+  type, so everything after it is silent. `func log(i32)` is such a slot: a
+  parameter named `i32` whose type is missing. No hint guesses that `i32`
+  was meant as a type.
+
+So the parser records what is written (`ty: Option<TypeId>`) and reports
+nothing for a missing type; E1023 (`MissingTypeAnnotation`) is retired, and
+wx-fmt prints a slot without a type as `name`. The inference itself is the
+same as a `local`'s: statement-scoped, from the initializer alone.
 
 ### Syntax stays shared; meaning is checked
 
@@ -71,10 +99,10 @@ The parser keeps one slot grammar for parameters, fields and reprs:
 parses `_` there, so wx-fmt and the LSP see one tree whether or not the code
 is valid, and the checker reports it:
 
-- **A lone identifier is a binder with no type.** `func log(i32);` is E1023
-  (`MissingTypeAnnotation`) at `i32`, as `self` and `mut x` alone are today:
-  "expected a type annotation", "expected `: Type` after this name". The
-  parameter is kept, named `i32`, with an `ERROR` type, so its uses are silent.
+- **A lone identifier is a binder with no type.** `func log(i32);` is a
+  parameter named `i32` with an `ERROR` type, so its uses are silent; the
+  missing type is reported (as revised: E2051 by the checker, "A slot's type
+  may be left to inference").
 - **A slot that starts with a type is a missing binder.** `func f(heap::&u8)`
   (an identifier followed by `::`, `<` or anything but `:`, `,` or `)`, or a
   slot starting with `(`, `[`, `*`, `&`, `!` or `func`) reports a missing name
@@ -170,7 +198,14 @@ checker. It went simpler, in the parser alone:
   unnamed and stays silent on it: no local, no name to call or match by, no
   duplicate, no conformance mismatch.
 - **A lone identifier** with the slot ending after it (`func log(i32)`) is a
-  binding with no type: E1023 and an error type. An identifier followed by
+  binding with no type: E1023 and an error type. Revised: a slot's type is
+  optional in the parser (`ty: Option<TypeId>` on `FunctionParam` and
+  `StructField`), and signature building resolves a type left out as a
+  written `_` (`resolve_infer` in `tir/signatures.rs`, the one place the
+  infer policy is applied), so a signature reports it with the same E2051, at
+  the name; silent for a slot whose name the parser reported missing. E1023
+  is retired. See "A
+  slot's type may be left to inference". An identifier followed by
   anything else (`heap::*u8`) is "expected `:`", and the slot is skipped:
   telling a name from a type there is the lookahead this removes.
 - **Anything else** is "expected a name", and the list skips the slot.

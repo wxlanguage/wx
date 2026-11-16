@@ -2053,14 +2053,18 @@ impl<'a> Builder<'a> {
 		&mut self,
 		out: &mut Vec<NodeId>,
 		binding: ast::Binding,
-		ty: ast::TypeId,
+		ty: Option<ast::TypeId>,
 	) {
 		if binding.mut_at.is_some() {
 			out.push(self.text(Text::Mut));
 		}
 		out.push(self.symbol(binding.name.inner));
-		out.push(self.text(Text::ColonSp));
-		out.push(self.build_type_expression(ty));
+		// A type left out is printed as written: the checker infers it or
+		// reports it.
+		if let Some(ty) = ty {
+			out.push(self.text(Text::ColonSp));
+			out.push(self.build_type_expression(ty));
+		}
 	}
 
 	fn build_global_definition(
@@ -2513,11 +2517,53 @@ impl<'a> Builder<'a> {
 				}
 				self.arena.concat(items)
 			}
-			ast::Expression::Loop { label, block } => {
-				let loop_kw = self.labelled_keyword(Text::Loop, label);
-				let block_id =
-					self.build_block_content(block, ast.block_span(block));
-				self.arena.concat2(loop_kw, block_id)
+			ast::Expression::Loop {
+				label,
+				header,
+				block,
+			} => {
+				let mut items = vec![self.labelled_keyword(Text::Loop, label)];
+				// The state is printed on the keyword's line, its slots as a
+				// parameter list's, one without parentheses. `() = ()` is
+				// the state `()`, the same as none, and is dropped; an
+				// initializer that computes something is kept.
+				let header = header.map(|header| ast.loop_header(header));
+				if let Some(ast::LoopHeader {
+					state, initializer, ..
+				}) = header && !(state.is_empty()
+					&& matches!(
+						ast.expr(initializer),
+						ast::Expression::Tuple { elements } if elements.is_empty()
+					)) {
+					let slots = ast.list(state);
+					if let [slot] = slots {
+						self.build_binding_and_type(
+							&mut items,
+							slot.binding,
+							slot.ty,
+						);
+					} else {
+						items.push(self.text(Text::LParen));
+						for (index, slot) in slots.iter().enumerate() {
+							if index > 0 {
+								items.push(self.text(Text::CommaSp));
+							}
+							self.build_binding_and_type(
+								&mut items,
+								slot.binding,
+								slot.ty,
+							);
+						}
+						items.push(self.text(Text::RParen));
+					}
+					items.push(self.text(Text::EqSp));
+					items.push(self.build_expression(initializer));
+					items.push(self.text(Text::Space));
+				}
+				items.push(
+					self.build_block_content(block, ast.block_span(block)),
+				);
+				self.arena.concat(items)
 			}
 			ast::Expression::Match { scrutinee, arms } => {
 				self.build_match_expression(span, scrutinee, ast.list(arms))
@@ -2542,11 +2588,15 @@ impl<'a> Builder<'a> {
 				}
 				self.arena.concat(items)
 			}
-			ast::Expression::Continue { label } => {
+			ast::Expression::Continue { label, value } => {
 				let mut items: Vec<NodeId> = vec![self.text(Text::Continue)];
 				if let Some(label) = label {
 					items.push(self.text(Text::LabelColon));
 					items.push(self.symbol(label.inner));
+				}
+				if let Some(value) = value {
+					items.push(self.text(Text::Space));
+					items.push(self.build_expression(value));
 				}
 				self.arena.concat(items)
 			}

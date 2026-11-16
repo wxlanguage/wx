@@ -855,7 +855,7 @@ impl Cursor<'_> {
 				variants,
 				..
 			} => Within::Signature(Anchor::Name(name.span))
-				.position(self.node(*repr).and_then(|field| self.ty(field.ty)))
+				.position(self.node(*repr).and_then(|field| self.ty(field.ty?)))
 				.or_else(|| {
 					let variant: EnumVariant = self.node(*variants)?;
 					Within::Body(variant.name.span)
@@ -868,7 +868,7 @@ impl Cursor<'_> {
 				..
 			} => Within::Signature(Anchor::Name(name.span)).position(
 				self.type_params(*type_params)
-					.or_else(|| self.ty(self.node(*fields)?.ty)),
+					.or_else(|| self.ty(self.node(*fields)?.ty?)),
 			),
 			Item::TypeAlias {
 				name,
@@ -1078,7 +1078,7 @@ impl Cursor<'_> {
 		let name = signature.name.span;
 		let site = self
 			.type_params(signature.type_params)
-			.or_else(|| self.ty(self.node(signature.params)?.ty))
+			.or_else(|| self.ty(self.node(signature.params)?.ty?))
 			.or_else(|| self.ty(signature.result?));
 		Within::Signature(Anchor::Name(name))
 			.position(site)
@@ -1337,7 +1337,9 @@ impl Cursor<'_> {
 			Expression::Break { label, value } => self
 				.label(label, Jump::Break)
 				.or_else(|| self.expression(value?)),
-			Expression::Continue { label } => self.label(label, Jump::Continue),
+			Expression::Continue { label, value } => self
+				.label(label, Jump::Continue)
+				.or_else(|| self.expression(value?)),
 			Expression::IfElse {
 				condition,
 				then_block,
@@ -1357,7 +1359,14 @@ impl Cursor<'_> {
 					self.pattern(arm.pattern).or_else(|| self.branch(arm.body))
 				})
 			}
-			Expression::Loop { block, .. } => self.block(block),
+			Expression::Loop { header, block, .. } => header
+				.and_then(|header| {
+					let header = ast.loop_header(header);
+					self.node(header.state)
+						.and_then(|slot| self.ty(slot.ty?))
+						.or_else(|| self.expression(header.initializer))
+				})
+				.or_else(|| self.block(block)),
 			Expression::QualifiedPath { root, segments } => self
 				.qualified_path(
 					ast.qualified_root(root),

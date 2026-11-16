@@ -2691,8 +2691,43 @@ impl Roles<'_> {
 		let (ea, eb) = (self.a.expr(a), self.b.expr(b));
 		assert_eq!(std::mem::discriminant(&ea), std::mem::discriminant(&eb));
 		match (ea, eb) {
-			(E::Block { block: a, .. }, E::Block { block: b, .. })
-			| (E::Loop { block: a, .. }, E::Loop { block: b, .. }) => self.block(a, b),
+			(E::Block { block: a, .. }, E::Block { block: b, .. }) => {
+				self.block(a, b)
+			}
+			(
+				E::Loop {
+					header: ha,
+					block: a,
+					..
+				},
+				E::Loop {
+					header: hb,
+					block: b,
+					..
+				},
+			) => {
+				match (ha, hb) {
+					(Some(ha), Some(hb)) => self.expr(
+						self.a.loop_header(ha).initializer,
+						self.b.loop_header(hb).initializer,
+					),
+					// Only the state `() = ()` is dropped.
+					(Some(ha), None) => {
+						let header = self.a.loop_header(ha);
+						assert!(header.state.is_empty(), "loop state dropped");
+						assert!(
+							matches!(
+								self.a.expr(header.initializer),
+								E::Tuple { elements } if elements.is_empty()
+							),
+							"loop state dropped"
+						);
+					}
+					(None, None) => {}
+					(None, Some(_)) => panic!("loop state added"),
+				}
+				self.block(a, b)
+			}
 			(
 				E::IfElse {
 					condition: ac,
@@ -3736,6 +3771,52 @@ fn ascriptions_and_labels_are_printed_as_written() {
 			"loop :outer { break :outer }",
 		),
 		("block :found { 1 }", "block :found { 1 }"),
+	] {
+		assert_eq!(
+			checked_format(&format!("func f() {{ {source} }}"), 80, 4),
+			format!("func f() {{\n    {expected}\n}}\n")
+		);
+	}
+}
+
+#[test]
+fn a_slot_without_a_type_is_printed_as_written() {
+	assert_eq!(
+		checked_format("func f(mut x,y:u32,z:_) {}", 80, 4),
+		"func f(mut x, y: u32, z: _) {}\n",
+	);
+	assert_eq!(
+		checked_format("struct S(pub a);", 80, 4),
+		"struct S(pub a);\n"
+	);
+}
+
+#[test]
+fn a_loop_state_and_a_continue_value_are_printed_after_their_labels() {
+	let source = indoc! {"
+        func f(n: u32) -> u32 {
+            loop :rows (mut a: u32, b) = (0, n) {
+                if a == b { continue :rows (a, b + 1) };
+                loop i = (0: u32) {
+                    if i == n { break };
+                    continue i + 1;
+                }
+                (b, a)
+            }
+        }
+    "};
+	assert_eq!(checked_format(source, 80, 4), source);
+	for (source, expected) in [
+		(
+			"loop i:u32=0{ continue  i+1 }",
+			"loop i: u32 = 0 { continue i + 1 }",
+		),
+		// One slot is the list of it.
+		("loop (i: u32,) = 0 { }", "loop i: u32 = 0 {}"),
+		// The state `()` is none; one computed is kept.
+		("loop () = () { }", "loop {}"),
+		("loop :l () = () { }", "loop :l {}"),
+		("loop () = f() { }", "loop () = f() {}"),
 	] {
 		assert_eq!(
 			checked_format(&format!("func f() {{ {source} }}"), 80, 4),

@@ -269,13 +269,17 @@ pub enum Expression {
 		scrutinee: ExprId,
 		arms: List<MatchArm>,
 	},
-	/// `continue (:{label})?`
+	/// `continue (:{label})? {expr}?`: the value is the next state of the
+	/// loop it restarts.
 	Continue {
 		label: Option<Spanned<SymbolU32>>,
+		value: Option<ExprId>,
 	},
-	/// `loop :label { ... }`
+	/// `loop :label { ... }`, or `loop :label P: T = e { ... }` with a
+	/// state ([`LoopHeader`]).
 	Loop {
 		label: Option<Spanned<SymbolU32>>,
+		header: Option<LoopHeaderId>,
 		block: BlockId,
 	},
 	/// `_` — discard in value position (e.g. `_ = expr;`)
@@ -340,6 +344,19 @@ pub struct NamedArgument {
 	pub name: Spanned<SymbolU32>,
 	/// `None` means shorthand: `{ name }` is equivalent to `{ name: name }`
 	pub value: Option<ExprId>,
+}
+
+/// A loop's state, `(a: A, b) = e` between its label and its body: the
+/// loop body's parameter list, each slot written as a parameter is with its
+/// type optional, and the first state (`notes/loop-bindings.md`). One slot
+/// may be written without parentheses, and is the same list.
+#[derive(Clone, Copy)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
+pub struct LoopHeader {
+	pub state: List<FunctionParam>,
+	/// The slots, with the parentheses when written.
+	pub state_span: TextSpan,
+	pub initializer: ExprId,
 }
 
 /// One arm of a `match` expression: `{pattern} => { ... }` or
@@ -812,7 +829,9 @@ impl Binding {
 /// is `self: Type`.
 pub struct FunctionParam {
 	pub binding: Binding,
-	pub ty: TypeId,
+	/// `None` when none is written: inferred where something gives it,
+	/// reported in a signature (`notes/binders.md`).
+	pub ty: Option<TypeId>,
 }
 
 /// The payload of an attribute.
@@ -1206,7 +1225,8 @@ pub struct StructField {
 	pub pub_at: Option<TextOffset>,
 	/// A binding's `mut` is parsed; what it allows is not checked yet.
 	pub binding: Binding,
-	pub ty: TypeId,
+	/// `None` when none is written, which a signature reports.
+	pub ty: Option<TypeId>,
 }
 
 impl Item {
@@ -1340,6 +1360,10 @@ index_newtype!(
 index_newtype!(
 	/// The `<Type as Trait>` of a qualified path, in its file's [`AST`].
 	QualifiedRootId
+);
+index_newtype!(
+	/// A loop's state, in its file's [`AST`].
+	LoopHeaderId
 );
 index_newtype!(
 	/// A pattern, in its file's [`AST`].
@@ -1569,6 +1593,7 @@ pub struct AST {
 	stmts: Column<Statement>,
 	blocks: Column<Block>,
 	qualified_roots: Box<[QualifiedPathRoot]>,
+	loop_headers: Box<[LoopHeader]>,
 	segments: Box<[PathSegment]>,
 	type_args: Box<[TypeArgument]>,
 	type_lists: Box<[TypeId]>,
@@ -1607,6 +1632,7 @@ struct AstBuilder {
 	stmts: ColumnBuilder<Statement>,
 	blocks: ColumnBuilder<Block>,
 	qualified_roots: Vec<QualifiedPathRoot>,
+	loop_headers: Vec<LoopHeader>,
 	segments: Vec<PathSegment>,
 	type_args: Vec<TypeArgument>,
 	type_lists: Vec<TypeId>,
@@ -1646,6 +1672,7 @@ impl AstBuilder {
 			stmts: self.stmts.finish(),
 			blocks: self.blocks.finish(),
 			qualified_roots: self.qualified_roots.into_boxed_slice(),
+			loop_headers: self.loop_headers.into_boxed_slice(),
 			segments: self.segments.into_boxed_slice(),
 			type_args: self.type_args.into_boxed_slice(),
 			type_lists: self.type_lists.into_boxed_slice(),
@@ -1716,6 +1743,13 @@ impl AstBuilder {
 			u32::try_from(self.qualified_roots.len()).unwrap(),
 		);
 		self.qualified_roots.push(root);
+		id
+	}
+
+	fn push_loop_header(&mut self, header: LoopHeader) -> LoopHeaderId {
+		let id =
+			LoopHeaderId::new(u32::try_from(self.loop_headers.len()).unwrap());
+		self.loop_headers.push(header);
 		id
 	}
 
@@ -1877,6 +1911,19 @@ impl AST {
 
 	pub fn qualified_root(&self, id: QualifiedRootId) -> QualifiedPathRoot {
 		self.qualified_roots[usize::from(id)]
+	}
+
+	pub fn loop_header(&self, id: LoopHeaderId) -> LoopHeader {
+		self.loop_headers[usize::from(id)]
+	}
+
+	/// From the state's slots to the end of its initializer.
+	pub fn loop_header_span(&self, id: LoopHeaderId) -> TextSpan {
+		let header = self.loop_header(id);
+		TextSpan::new(
+			header.state_span.start,
+			self.expr_span(header.initializer).end,
+		)
 	}
 
 	pub fn list<T: Listed>(&self, list: List<T>) -> &[T] {

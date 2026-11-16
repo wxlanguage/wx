@@ -113,7 +113,6 @@ define_diagnostic_codes! {
 		StructFieldsNeedParentheses => "E1019",
 		StructLiteralIsACall => "E1020",
 		MissingPackageAlias => "E1021",
-		MissingTypeAnnotation => "E1023",
 		LabelOnIf => "E1025",
 		PackageMemberHasBody => "E1026",
 		AttributeArgumentsAreNamed => "E1027",

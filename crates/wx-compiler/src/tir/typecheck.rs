@@ -691,7 +691,22 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			} => self.build_if_else(
 				condition, then_block, else_block, expected, span,
 			),
-			ast::Expression::Loop { label, block } => {
+			ast::Expression::Loop {
+				label,
+				header,
+				block,
+			} => {
+				if let Some(header) = header {
+					let ast = self.ast();
+					self.report_unsupported(
+						ast.loop_header_span(header),
+						"a loop's state",
+					);
+					self.build(
+						ast.loop_header(header).initializer,
+						TypeIndex::ERROR,
+					);
+				}
 				// A name not written yet (`block : {`) declares nothing.
 				let label = label
 					.filter(|name| name.inner != Keyword::Error.symbol())
@@ -703,7 +718,15 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			ast::Expression::Break { label, value } => {
 				self.build_break(label, value, span)
 			}
-			ast::Expression::Continue { label } => {
+			ast::Expression::Continue { label, value } => {
+				if let Some(value) = value {
+					let ast = self.ast();
+					self.report_unsupported(
+						ast.expr_span(value),
+						"a `continue` value",
+					);
+					self.build(value, TypeIndex::ERROR);
+				}
 				self.build_continue(label, span)
 			}
 			ast::Expression::Return { value } => self.build_return(value, span),

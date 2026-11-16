@@ -1406,6 +1406,25 @@ impl Semantics {
 	}
 }
 
+/// A type to infer, at `span`: a written `_`, or a slot's type left out, at
+/// its name. A signature has nothing to infer it from, so its policy
+/// rejects it.
+fn resolve_infer(
+	sema: &mut Semantics,
+	file_id: FileId,
+	span: TextSpan,
+	infer_policy: InferPolicy,
+) -> TypeIndex {
+	match infer_policy {
+		InferPolicy::Allow => TypeIndex::INFER,
+		InferPolicy::Reject(kind) => {
+			sema.diagnostics
+				.push(report_infer_in_signature(file_id, span, kind));
+			TypeIndex::ERROR
+		}
+	}
+}
+
 fn report_infer_in_signature(
 	file_id: FileId,
 	span: TextSpan,
@@ -1414,13 +1433,13 @@ fn report_infer_in_signature(
 	Diagnostic::error()
 		.with_code(DiagnosticCode::InferInSignature.code())
 		.with_message(format!(
-			"the placeholder `_` is not allowed within types on item signatures for {}",
+			"types on item signatures for {} cannot be inferred",
 			kind.noun(),
 		))
 		.with_label(
 			SourceSpan::new(file_id, span)
 				.primary_label()
-				.with_message("not allowed in type signatures"),
+				.with_message("the type must be written"),
 		)
 }
 
@@ -2230,7 +2249,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 	) -> (Option<TextSpan>, Option<TextSpan>) {
 		let ast = self.ast(file_id);
 		let args = match ast.list(signature.params) {
-			[param] => Some(ast.type_span(param.ty)),
+			[param] => param.ty.map(|ty| ast.type_span(ty)),
 			_ => None,
 		};
 		(args, signature.result.map(|result| ast.type_span(result)))
@@ -2328,6 +2347,20 @@ impl<'ast> SemanticsBuilder<'ast> {
 				if receiver {
 					return TypeIndex::ERROR;
 				}
+				let policy = InferPolicy::Reject(InferSignatureKind::Function);
+				// A type left out is `_`, which a signature rejects; a slot
+				// whose name is missing was reported by the parser.
+				let Some(ty) = param.ty else {
+					if param.binding.is_missing() {
+						return TypeIndex::ERROR;
+					}
+					return resolve_infer(
+						sema,
+						file_id,
+						param.binding.name.span,
+						policy,
+					);
+				};
 				self.resolve_value_type(
 					sema,
 					obligations,
@@ -2339,8 +2372,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 							.assumption_envs
 							.of_frame(generic_env),
 					},
-					param.ty,
-					InferPolicy::Reject(InferSignatureKind::Function),
+					ty,
+					policy,
 				)
 			})
 			.collect();
@@ -2408,6 +2441,20 @@ impl<'ast> SemanticsBuilder<'ast> {
 			.list(signature.params)
 			.iter()
 			.map(|param| {
+				let policy = InferPolicy::Reject(InferSignatureKind::Function);
+				// A type left out is `_`, which a signature rejects; a slot
+				// whose name is missing was reported by the parser.
+				let Some(ty) = param.ty else {
+					if param.binding.is_missing() {
+						return TypeIndex::ERROR;
+					}
+					return resolve_infer(
+						sema,
+						file_id,
+						param.binding.name.span,
+						policy,
+					);
+				};
 				self.resolve_value_type(
 					sema,
 					obligations,
@@ -2417,14 +2464,15 @@ impl<'ast> SemanticsBuilder<'ast> {
 						generic_env: scope,
 						assumption_env: sema.assumption_envs.of_frame(scope),
 					},
-					param.ty,
-					InferPolicy::Reject(InferSignatureKind::Function),
+					ty,
+					policy,
 				)
 			})
 			.collect();
 
 		if let Some(param) = self.ast(file_id).list(signature.params).first()
 			&& param.binding.name.inner == Keyword::SelfLower.symbol()
+			&& let Some(written) = param.ty
 		{
 			let self_type = match sema.generic_envs.owner(parent) {
 				GenericEnvOwner::Trait(_) => {
@@ -2442,7 +2490,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				frame: scope,
 				ty: param_types[0],
 				self_type,
-				reference: self.type_site(file_id, param.ty),
+				reference: self.type_site(file_id, written),
 			});
 		}
 
@@ -3325,7 +3373,24 @@ impl<'ast> SemanticsBuilder<'ast> {
 				let mut field_types: Vec<TypeIndex> =
 					Vec::with_capacity(fields.len());
 				for f in self.ast(file_id).list(*fields) {
-					let ty_expr = f.ty;
+					let policy =
+						InferPolicy::Reject(InferSignatureKind::Struct);
+					// A type left out is `_`, which a signature rejects; a slot
+					// whose name is missing was reported by the parser.
+					let Some(ty_expr) = f.ty else {
+						let ty = if f.binding.is_missing() {
+							TypeIndex::ERROR
+						} else {
+							resolve_infer(
+								sema,
+								file_id,
+								f.binding.name.span,
+								policy,
+							)
+						};
+						field_types.push(ty);
+						continue;
+					};
 					let ty = self.resolve_type(
 						sema,
 						obligations,
@@ -3338,7 +3403,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 								.of_frame(generic_env),
 						},
 						ty_expr,
-						InferPolicy::Reject(InferSignatureKind::Struct),
+						policy,
 					);
 					self.check_struct_direct_recursion(
 						sema,
@@ -3633,13 +3698,22 @@ impl<'ast> SemanticsBuilder<'ast> {
 					.list(*repr)
 					.iter()
 					.map(|field| {
-						self.resolve_type(
-							sema,
-							obligations,
-							scope,
-							field.ty,
-							InferPolicy::Reject(InferSignatureKind::EnumRepr),
-						)
+						let policy =
+							InferPolicy::Reject(InferSignatureKind::EnumRepr);
+						// A type left out is `_`, which a signature rejects; a slot
+						// whose name is missing was reported by the parser.
+						let Some(ty) = field.ty else {
+							if field.binding.is_missing() {
+								return TypeIndex::ERROR;
+							}
+							return resolve_infer(
+								sema,
+								file_id,
+								field.binding.name.span,
+								policy,
+							);
+						};
+						self.resolve_type(sema, obligations, scope, ty, policy)
 					})
 					.collect();
 				let repr_type = match (ast.list(*repr), &mut *field_types) {
@@ -3649,7 +3723,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 						TypeIndex::ERROR
 					}
 					([field], [ty]) => {
-						if *ty != TypeIndex::ERROR && !ty.is_integer() {
+						if let Some(written) = field.ty
+							&& *ty != TypeIndex::ERROR
+							&& !ty.is_integer()
+						{
 							let integer = sema.decls.intrinsics.integer.expect(
 								"the core must declare the `Integer` typeset",
 							);
@@ -3663,7 +3740,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 								.unwrap();
 							let diagnostic = report_enum_repr_not_integer(
 								file_id,
-								self.ast(file_id).type_span(field.ty),
+								self.ast(file_id).type_span(written),
 								name,
 								sema.decls.declaration_span(typeset.loc),
 							);
@@ -4855,17 +4932,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 		match ast.ty(type_expr) {
 			// Reported by the parser.
 			ast::TypeExpression::Error => TypeIndex::ERROR,
-			ast::TypeExpression::Infer => match infer_policy {
-				InferPolicy::Allow => TypeIndex::INFER,
-				InferPolicy::Reject(kind) => {
-					sema.diagnostics.push(report_infer_in_signature(
-						scope.file_id,
-						ast.type_span(type_expr),
-						kind,
-					));
-					TypeIndex::ERROR
-				}
-			},
+			ast::TypeExpression::Infer => resolve_infer(
+				sema,
+				scope.file_id,
+				ast.type_span(type_expr),
+				infer_policy,
+			),
 			ast::TypeExpression::Never => TypeIndex::NEVER,
 			ast::TypeExpression::Path(segments) => {
 				let ty = self.resolve_type_path(
@@ -8580,6 +8652,42 @@ pub(super) mod tests {
 		assert!((0..2).all(|i| case.declared_bounds(env, i).is_empty()));
 	}
 
+	/// A slot's type left out is `_`: nothing infers it in a signature, so
+	/// it is reported at the name, once, and the slot has the error type.
+	#[test]
+	fn a_signature_slot_without_a_type_is_reported_at_its_name() {
+		for (source, name) in [
+			("func f(i32) {}", "i32"),
+			("func f(a: u32, mut b) {}", "b"),
+			("struct S(); impl S { func m(self) {} }", "self"),
+			("struct P(x: u32, y);", "y"),
+			("enum E(value) { A = 0 }", "value"),
+		] {
+			let case = TestCase::new(source);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::InferInSignature]);
+			let label = &case.sema.diagnostics[0].labels[0];
+			assert_eq!(&source[label.range.clone()], name, "{source}");
+		}
+		let case = TestCase::new("func f(a: u32, b) -> u32 { a }");
+		assert_eq!(
+			case.sema
+				.types
+				.list(case.function_signature("f").param_types),
+			[TypeIndex::U32, TypeIndex::ERROR]
+		);
+	}
+
+	/// A slot whose name the parser reported missing is not reported again
+	/// for its type.
+	#[test]
+	fn a_slot_missing_its_name_and_its_type_is_reported_once() {
+		let mut strings = Keyword::create_interner();
+		let graph = recovered_source_graph("func f(_) {}", &mut strings);
+		let case = TestCase::from_graph(graph, strings);
+		case.diagnostics().assert_none();
+	}
+
 	#[test]
 	fn written_infer_in_an_alias_is_reported_at_its_own_span_once() {
 		let source = "type B = A; type A = _;";
@@ -8600,14 +8708,11 @@ pub(super) mod tests {
 		);
 		assert_eq!(
 			diagnostic.message,
-			"the placeholder `_` is not allowed within types on item signatures for type aliases"
+			"types on item signatures for type aliases cannot be inferred"
 		);
 		assert_eq!(diagnostic.labels.len(), 1);
 		assert_eq!(&source[diagnostic.labels[0].range.clone()], "_");
-		assert_eq!(
-			diagnostic.labels[0].message,
-			"not allowed in type signatures"
-		);
+		assert_eq!(diagnostic.labels[0].message, "the type must be written");
 	}
 
 	#[test]
@@ -9031,13 +9136,13 @@ pub(super) mod tests {
 			);
 			assert_eq!(
 				diagnostic.message,
-				"the placeholder `_` is not allowed within types on item signatures for functions"
+				"types on item signatures for functions cannot be inferred"
 			);
 			assert_eq!(diagnostic.labels.len(), 1);
 			assert_eq!(&source[diagnostic.labels[0].range.clone()], "_");
 			assert_eq!(
 				diagnostic.labels[0].message,
-				"not allowed in type signatures"
+				"the type must be written"
 			);
 		}
 		assert_ne!(
@@ -9060,13 +9165,13 @@ pub(super) mod tests {
 		for diagnostic in &*case.sema.diagnostics {
 			assert_eq!(
 				diagnostic.message,
-				"the placeholder `_` is not allowed within types on item signatures for return types"
+				"types on item signatures for return types cannot be inferred"
 			);
 			assert_eq!(diagnostic.labels.len(), 1);
 			assert_eq!(&source[diagnostic.labels[0].range.clone()], "_");
 			assert_eq!(
 				diagnostic.labels[0].message,
-				"not allowed in type signatures"
+				"the type must be written"
 			);
 		}
 		assert_ne!(
@@ -9094,7 +9199,7 @@ pub(super) mod tests {
 		for diagnostic in &*case.sema.diagnostics {
 			assert_eq!(
 				diagnostic.message,
-				"the placeholder `_` is not allowed within types on item signatures for structs"
+				"types on item signatures for structs cannot be inferred"
 			);
 		}
 	}

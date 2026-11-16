@@ -328,22 +328,9 @@ fn report_missing_binding(
 		.with_code(DiagnosticCode::UnexpectedToken.code())
 		.with_message(message)
 		.with_label(
-			Label::primary(file_id, span)
-				.with_message("a parameter or a field needs a name"),
-		)
-		.with_note("write `name: Type`")
-}
-
-fn report_binding_without_type(
-	file_id: FileId,
-	name_span: TextSpan,
-) -> Diagnostic<FileId> {
-	Diagnostic::error()
-		.with_code(DiagnosticCode::MissingTypeAnnotation.code())
-		.with_message("expected a type annotation")
-		.with_label(
-			Label::primary(file_id, name_span)
-				.with_message("expected `: Type` after this name"),
+			Label::primary(file_id, span).with_message(
+				"a parameter, a field or a loop state needs a name",
+			),
 		)
 		.with_note("write `name: Type`")
 }
@@ -1219,27 +1206,34 @@ impl<'ctx> Parser<'ctx> {
 		parser: &mut Parser,
 	) -> Result<Spanned<FunctionParam>, ()> {
 		let start = parser.lexer.peek().span.start;
-		let (binding, ty) = Parser::parse_binding_and_type(parser)?;
+		let (binding, ty, end) = Parser::parse_binding_and_type(parser)?;
 		Ok(Spanned {
-			span: TextSpan::new(
-				start,
-				parser.ast.types.spans[usize::from(ty)].end,
-			),
+			span: TextSpan::new(start, end),
 			inner: FunctionParam { binding, ty },
 		})
 	}
 
-	/// What a parameter or a struct field is written as: `binding: Type`, a
-	/// binding being `name` or `mut name`. A binding alone in its slot
-	/// (`func log(i32)`) is reported and given an error type. A slot whose
+	/// What a parameter or a struct field is written as: `binding (: Type)?`,
+	/// a binding being `name` or `mut name`, and where its slot ends. A
+	/// binding alone (`func log(i32)`) has no type, which is no error here:
+	/// whether anything infers it is the checker's to say (E2051 in a
+	/// signature, `notes/binders.md`). A slot whose
 	/// name is missing, `_: u8` or a type alone (`(u8, u16)`, `*u8`), is
 	/// reported and kept with a missing name ([`Binding::missing`]), so the
 	/// item keeps its arity. Anything else where the binding or the `:` goes
-	/// is reported, and the list's recovery skips the slot. `self` is parsed
+	/// is reported, and the list's recovery skips the slot. A slot ends at a
+	/// list's `,` or `)`, or at the `=` or `{` after a loop's one slot
+	/// (`loop i = 0 {`), wherever it is written. `self` is parsed
 	/// like any name; the item it is in says whether it may stand there.
 	fn parse_binding_and_type(
 		parser: &mut Parser,
-	) -> Result<(Binding, TypeId), ()> {
+	) -> Result<(Binding, Option<TypeId>, TextOffset), ()> {
+		let ends_slot = |token: Token| {
+			matches!(
+				token,
+				Token::Comma | Token::CloseParen | Token::Eq | Token::OpenBrace
+			)
+		};
 		let mut_at = matches!(parser.peek_keyword(), Some(Keyword::Mut))
 			.then(|| parser.lexer.next().span.start);
 		let token = parser.lexer.peek();
@@ -1280,7 +1274,12 @@ impl<'ctx> Parser<'ctx> {
 					parser.ast.types.spans[usize::from(ty)],
 					"expected a name before this type",
 				));
-				return Ok((Binding::missing(mut_at, token.span.start), ty));
+				let end = parser.ast.types.spans[usize::from(ty)].end;
+				return Ok((
+					Binding::missing(mut_at, token.span.start),
+					Some(ty),
+					end,
+				));
 			}
 			_ => {
 				parser.diagnostics.push(report_missing_binding(
@@ -1293,7 +1292,7 @@ impl<'ctx> Parser<'ctx> {
 		};
 		let Some(colon) = parser.lexer.next_if(Token::Colon) else {
 			let next = parser.lexer.peek();
-			if !matches!(next.inner, Token::Comma | Token::CloseParen) {
+			if !ends_slot(next.inner) {
 				parser.diagnostics.push(report_unexpected_token(
 					parser.file_id,
 					next,
@@ -1301,14 +1300,7 @@ impl<'ctx> Parser<'ctx> {
 				));
 				return Err(());
 			}
-			parser
-				.diagnostics
-				.push(report_binding_without_type(parser.file_id, token.span));
-			let missing = parser.ast.push_type(
-				TypeExpression::Error,
-				TextSpan::new(token.span.end, token.span.end),
-			);
-			return Ok((binding, missing));
+			return Ok((binding, None, token.span.end));
 		};
 		let ty = match parser.parse_type_expression() {
 			Ok(ty) => ty,
@@ -1319,7 +1311,7 @@ impl<'ctx> Parser<'ctx> {
 			// skips.
 			Err(()) => {
 				let token = parser.lexer.peek();
-				if !matches!(token.inner, Token::Comma | Token::CloseParen) {
+				if !ends_slot(token.inner) {
 					return Err(());
 				}
 				parser.ast.push_type(
@@ -1328,7 +1320,8 @@ impl<'ctx> Parser<'ctx> {
 				)
 			}
 		};
-		Ok((binding, ty))
+		let end = parser.ast.types.spans[usize::from(ty)].end;
+		Ok((binding, Some(ty), end))
 	}
 
 	fn parse_function_signature(
@@ -2968,10 +2961,19 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_continue_expression(&mut self) -> Result<ExprId, ()> {
 		let continue_keyword = self.lexer.next();
 		let label = self.parse_label();
-		let end =
-			label.map_or(continue_keyword.span.end, |label| label.span.end);
+		let token = self.lexer.peek();
+		let value = if Self::starts_expression(token.inner) {
+			Some(self.parse_expression(BindingPower::Default)?)
+		} else {
+			None
+		};
+		let end = match (label, value) {
+			(_, Some(value)) => self.ast.exprs.spans[usize::from(value)].end,
+			(Some(label), None) => label.span.end,
+			(None, None) => continue_keyword.span.end,
+		};
 		Ok(self.ast.push_expr(
-			Expression::Continue { label },
+			Expression::Continue { label, value },
 			TextSpan::new(continue_keyword.span.start, end),
 		))
 	}
@@ -3139,12 +3141,76 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_loop_expression(&mut self) -> Result<ExprId, ()> {
 		let loop_keyword = self.lexer.next();
 		let label = self.parse_label();
+		// After the label only the body's `{` or a state can come, and no
+		// pattern starts with `{`.
+		let header = if self.lexer.peek().inner == Token::OpenBrace {
+			None
+		} else {
+			Some(self.parse_loop_header()?)
+		};
 		let block = self.parse_block()?;
 		let span = TextSpan::new(
 			loop_keyword.span.start,
 			self.ast.blocks.spans[usize::from(block)].end,
 		);
-		Ok(self.ast.push_expr(Expression::Loop { label, block }, span))
+		Ok(self.ast.push_expr(
+			Expression::Loop {
+				label,
+				header,
+				block,
+			},
+			span,
+		))
+	}
+
+	/// A loop's state, `slots = e`: one slot (`i: u32`), or a list of them
+	/// in parentheses, each read as a parameter is
+	/// ([`Parser::parse_binding_and_type`]), with its type optional. The
+	/// initializer ends at the body's `{`, as an `if`'s condition does, since
+	/// `{` never starts an expression; one not written is reported and kept
+	/// as an error node spanning the gap where it belongs.
+	fn parse_loop_header(&mut self) -> Result<LoopHeaderId, ()> {
+		let state = if self.lexer.peek().inner == Token::OpenParen {
+			let slots =
+				self.separated(PARENS, Parser::parse_function_param_item)?;
+			self.push_delimited_nodes(slots)
+		} else {
+			let slot = Parser::parse_function_param_item(self)?;
+			Spanned {
+				span: slot.span,
+				inner: self.ast.push_nodes([slot]),
+			}
+		};
+		let mut end = state.span.end;
+		let assigned = self.lexer.next_if(Token::Eq);
+		if let Some(eq) = assigned {
+			end = eq.span.end;
+		}
+		// A `{` here is the body, not a block written without its keyword.
+		let token = self.lexer.peek();
+		let initializer = if assigned.is_some()
+			&& token.inner != Token::OpenBrace
+			&& Self::starts_expression(token.inner)
+		{
+			self.parse_expression(BindingPower::Default)?
+		} else {
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::MissingInitializer.code())
+					.with_message("missing first state of the loop")
+					.with_note("example syntax: loop i: u32 = 0 { .. }")
+					.with_label(Label::primary(self.file_id, token.span)),
+			);
+			self.ast.push_expr(
+				Expression::Error,
+				TextSpan::new(end, token.span.start),
+			)
+		};
+		Ok(self.ast.push_loop_header(LoopHeader {
+			state: state.inner,
+			state_span: state.span,
+			initializer,
+		}))
 	}
 
 	fn parse_if_else_expression(&mut self) -> Result<ExprId, ()> {
@@ -4510,12 +4576,9 @@ impl<'ctx> Parser<'ctx> {
 		let start = parser.lexer.peek().span.start;
 		let pub_at = matches!(parser.peek_keyword(), Some(Keyword::Pub))
 			.then(|| parser.lexer.next().span.start);
-		let (binding, ty) = Parser::parse_binding_and_type(parser)?;
+		let (binding, ty, end) = Parser::parse_binding_and_type(parser)?;
 		Ok(Spanned {
-			span: TextSpan::new(
-				start,
-				parser.ast.types.spans[usize::from(ty)].end,
-			),
+			span: TextSpan::new(start, end),
 			inner: StructField {
 				pub_at,
 				binding,

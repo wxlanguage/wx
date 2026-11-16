@@ -401,7 +401,7 @@ fn test_enum_repr_after_name() {
 
 	assert_eq!(case.strings.resolve(name.inner), Some("Status"));
 	assert!(matches!(
-		case.ast.list(*repr).first().map(|repr| case.ast.ty(repr.ty)),
+		case.ast.list(*repr).first().map(|repr| case.ast.ty(repr.ty.unwrap())),
 		Some(TypeExpression::Path(p))
 			if p.len() == 1
 				&& case.strings.resolve(case.ast.list(p)[0].ident.inner)
@@ -455,7 +455,7 @@ fn test_fn_pointer_param() {
 	case.diagnostics().assert_none();
 
 	let param = &case.ast.list(case.function_signature(0).params)[0];
-	let ty = case.ast.ty(param.ty);
+	let ty = case.ast.ty(param.ty.unwrap());
 	let TypeExpression::Function { params, result } = ty else {
 		panic!("expected a function type, got {ty:?}")
 	};
@@ -506,16 +506,20 @@ fn test_type_expression_forms() {
 	};
 
 	assert!(matches!(
-		Some(case.ast.ty(case.ast.list(*fields)[0].ty)),
+		Some(case.ast.ty(case.ast.list(*fields)[0].ty.unwrap())),
 		Some(TypeExpression::Pointer { .. })
 	));
 	assert!(matches!(
-		pointee(&case.ast, case.ast.ty(case.ast.list(*fields)[1].ty)),
+		pointee(
+			&case.ast,
+			case.ast.ty(case.ast.list(*fields)[1].ty.unwrap())
+		),
 		TypeExpression::Slice { .. }
 	));
-	let TypeExpression::Array { length, .. } =
-		pointee(&case.ast, case.ast.ty(case.ast.list(*fields)[2].ty))
-	else {
+	let TypeExpression::Array { length, .. } = pointee(
+		&case.ast,
+		case.ast.ty(case.ast.list(*fields)[2].ty.unwrap()),
+	) else {
 		panic!("expected a pointer to an array")
 	};
 	assert!(matches!(
@@ -523,11 +527,11 @@ fn test_type_expression_forms() {
 		ConstArgument::Literal(Literal::Int(4))
 	));
 	assert!(matches!(
-		Some(case.ast.ty(case.ast.list(*fields)[3].ty)),
+		Some(case.ast.ty(case.ast.list(*fields)[3].ty.unwrap())),
 		Some(TypeExpression::Tuple { elements }) if elements.len() == 2
 	));
 	assert!(matches!(
-		Some(case.ast.ty(case.ast.list(*fields)[4].ty)),
+		Some(case.ast.ty(case.ast.list(*fields)[4].ty.unwrap())),
 		Some(TypeExpression::Path(p)) if p.len() == 2
 	));
 }
@@ -1158,7 +1162,7 @@ fn test_loop_break_label() {
 
 	// the loop carries its own label
 	let statements = case.function_block(0);
-	let Expression::Loop { label, block } =
+	let Expression::Loop { label, block, .. } =
 		case.statement_expression(&statements, 0)
 	else {
 		panic!("expected a loop")
@@ -1187,6 +1191,65 @@ fn test_loop_break_label() {
 		case.statement_expression(&statements, 2),
 		Expression::Continue { .. }
 	));
+}
+
+#[test]
+fn a_loop_takes_a_state_after_its_label() {
+	assert_eq!(
+		shape_of("loop i: u32 = 0 { i + 1 }"),
+		"(loop (state (slots (i u32)) 0) (+ i 1))"
+	);
+	assert_eq!(shape_of("loop i = n { }"), "(loop (state (slots (i)) n))");
+	assert_eq!(
+		shape_of("loop :rows (mut a: u32, b) = (0, n) { (b, a) }"),
+		"(loop :rows (state (slots (mut a u32) (b)) (tuple 0 n)) \
+		 (tuple b a))"
+	);
+	// The initializer ends at the body's `{`, as a condition does.
+	assert_eq!(
+		shape_of("loop at: _ = start + 1 { }"),
+		"(loop (state (slots (at _)) (+ start 1)))"
+	);
+	assert_eq!(
+		shape_of("loop () = () { }"),
+		"(loop (state (slots) (tuple)))"
+	);
+	assert_eq!(shape_of("loop :l { }"), "(loop :l)");
+}
+
+/// The state's slots are a parameter list's: a type alone or `_` is no
+/// name, and a pattern is no slot.
+#[test]
+fn a_loop_state_is_slots_not_a_pattern() {
+	for (body, message) in [
+		("loop (_: u32) = 0 { }", "expected a name, found `_`"),
+		(
+			"loop (*u8, a: u8) = (p, 1) { }",
+			"expected a name before this type",
+		),
+		("loop Point(x, y) = p { }", "expected `:`, found `(`"),
+		("loop 0 = 0 { }", "expected a name, found `integer`"),
+	] {
+		let case = TestCase::new(&format!("func f() {{ {body} }}"));
+		case.diagnostics().assert_error_saying(message);
+	}
+}
+
+#[test]
+fn a_continue_takes_a_value_after_its_label() {
+	assert_eq!(shape_of("continue i + 1"), "(continue (+ i 1))");
+	assert_eq!(shape_of("continue :rows row"), "(continue :rows row)");
+	assert_eq!(shape_of("continue :rows"), "(continue :rows)");
+	assert_eq!(shape_of("continue"), "(continue)");
+}
+
+#[test]
+fn a_loop_state_without_a_first_value_is_reported() {
+	for body in ["loop i: u32 { }", "loop i = { }", "loop i { }"] {
+		let case = TestCase::new(&format!("func f() {{ {body} }}"));
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::MissingInitializer]);
+	}
 }
 
 #[test]
@@ -1588,7 +1651,7 @@ fn parameters_and_fields_share_the_slot_grammar() {
 	assert_eq!(names, ["a", "mut d", "mut e"]);
 	assert!(fields[2].pub_at.is_some());
 	assert!(matches!(
-		case.ast.ty(fields[1].ty),
+		case.ast.ty(fields[1].ty.unwrap()),
 		TypeExpression::Pointer { .. }
 	));
 	assert!(case.struct_fields(2).is_empty());
@@ -1610,71 +1673,32 @@ fn the_receiver_is_written_with_its_type() {
 	}
 }
 
-/// A slot starts with a binding: a lone identifier is one, with no type;
-/// a type is not one, and neither is `_`, in a parameter and in a field
-/// alike. Each is reported once.
+/// A slot starts with a binding: a lone identifier is one, its type left
+/// out, which is no parse error (a signature reports it, a loop header
+/// infers it); a type is not one, and neither is `_`, in a parameter and in
+/// a field alike. Each is reported once.
 #[test]
 fn a_slot_starts_with_a_binding_and_its_type() {
-	for (source, code, message) in [
-		(
-			"func f(self) {}",
-			DiagnosticCode::MissingTypeAnnotation,
-			"expected a type annotation",
-		),
-		(
-			"func f(mut self) {}",
-			DiagnosticCode::MissingTypeAnnotation,
-			"expected a type annotation",
-		),
-		(
-			"func f(i32) {}",
-			DiagnosticCode::MissingTypeAnnotation,
-			"expected a type annotation",
-		),
-		(
-			"func f(mut x) {}",
-			DiagnosticCode::MissingTypeAnnotation,
-			"expected a type annotation",
-		),
-		(
-			"struct S(i32);",
-			DiagnosticCode::MissingTypeAnnotation,
-			"expected a type annotation",
-		),
-		(
-			"func f(heap::*u8) {}",
-			DiagnosticCode::UnexpectedToken,
-			"expected `:`, found `::`",
-		),
-		(
-			"func f(*u8) {}",
-			DiagnosticCode::UnexpectedToken,
-			"expected a name before this type",
-		),
-		(
-			"func f(mut *u8) {}",
-			DiagnosticCode::UnexpectedToken,
-			"expected a name before this type",
-		),
-		(
-			"func f(_: u32) {}",
-			DiagnosticCode::UnexpectedToken,
-			"expected a name, found `_`",
-		),
-		(
-			"struct S(pub _: u32);",
-			DiagnosticCode::UnexpectedToken,
-			"expected a name, found `_`",
-		),
-		(
-			"struct S([u8]);",
-			DiagnosticCode::UnexpectedToken,
-			"expected a name before this type",
-		),
+	for source in [
+		"func f(self) {}",
+		"func f(mut self) {}",
+		"func f(i32) {}",
+		"func f(mut x) {}",
+		"struct S(i32);",
+	] {
+		TestCase::new(source).diagnostics().assert_none();
+	}
+	for (source, message) in [
+		("func f(heap::*u8) {}", "expected `:`, found `::`"),
+		("func f(*u8) {}", "expected a name before this type"),
+		("func f(mut *u8) {}", "expected a name before this type"),
+		("func f(_: u32) {}", "expected a name, found `_`"),
+		("struct S(pub _: u32);", "expected a name, found `_`"),
+		("struct S([u8]);", "expected a name before this type"),
 	] {
 		let case = TestCase::new(source);
 		let diagnostics = case.diagnostics();
-		diagnostics.assert_codes(&[code]);
+		diagnostics.assert_codes(&[DiagnosticCode::UnexpectedToken]);
 		diagnostics.assert_error_saying(message);
 	}
 }
@@ -1694,7 +1718,7 @@ fn a_slot_missing_its_name_is_kept() {
 	assert_eq!(params.len(), 3);
 	assert!(params[0].binding.is_missing() && params[1].binding.is_missing());
 	assert!(matches!(
-		case.ast.ty(params[1].ty),
+		case.ast.ty(params[1].ty.unwrap()),
 		TypeExpression::Tuple { .. }
 	));
 	assert_eq!(case.name(params[2].binding.name.inner), "d");
@@ -1715,24 +1739,27 @@ fn a_failed_list_item_is_skipped_up_to_the_next_item() {
 	assert_eq!(case.struct_fields(2).len(), 1);
 }
 
-/// A binding written without its type keeps its name and is given an error
-/// type, so the parameter, and those after it, are still there.
+/// A binding written without its type keeps its name and has no type, and
+/// the parameters after it are read.
 #[test]
-fn a_binding_without_a_type_recovers_with_an_error_type() {
-	let case = TestCase::new("func f(self, mut x, y: i32) {}");
-	case.diagnostics().assert_codes(&[
-		DiagnosticCode::MissingTypeAnnotation,
-		DiagnosticCode::MissingTypeAnnotation,
-	]);
+fn a_binding_without_a_type_is_kept_without_one() {
+	let case = TestCase::new("func f(self, mut x, y: i32, z: _) {}");
+	case.diagnostics().assert_none();
 	let params = case.ast.list(case.function_signature(0).params);
 	let names: Vec<_> = params
 		.iter()
 		.map(|param| case.name(param.binding.name.inner))
 		.collect();
-	assert_eq!(names, ["self", "x", "y"]);
-	for param in &params[..2] {
-		assert!(matches!(case.ast.ty(param.ty), TypeExpression::Error));
-	}
+	assert_eq!(names, ["self", "x", "y", "z"]);
+	assert!(params[..2].iter().all(|param| param.ty.is_none()));
+	assert!(matches!(
+		case.ast.ty(params[3].ty.unwrap()),
+		TypeExpression::Infer
+	));
+	assert_eq!(
+		case.ast.function_params.spans[..2],
+		[TextSpan::from(7..11), TextSpan::from(13..18)]
+	);
 }
 
 /// Parentheses always make a `Tuple`, of the elements written (a trailing
@@ -2308,12 +2335,23 @@ fn test_unclosed_delimiter() {
 
 #[test]
 fn test_invalid_function_param_type_reports_parse_error() {
+	// `=` may end a slot (a loop's), so `x` is kept with an error type, and
+	// the list reports the `=` it does not expect.
 	let case = TestCase::new(indoc! {"
         func f(x: =) {}
     "});
 
-	case.diagnostics()
-		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::UnexpectedToken,
+		DiagnosticCode::MissingSeparator,
+		DiagnosticCode::UnexpectedToken,
+	]);
+	let params = case.ast.list(case.function_signature(0).params);
+	assert_eq!(params.len(), 1);
+	assert!(matches!(
+		case.ast.ty(params[0].ty.unwrap()),
+		TypeExpression::Error
+	));
 }
 
 #[test]
@@ -2768,9 +2806,11 @@ fn a_type_path_takes_constant_arguments() {
 	let case =
 		TestCase::new("func f<const N: u32>(b: Buffer<u8, const N, 4>) {}");
 	case.diagnostics().assert_none();
-	let TypeExpression::Path(segments) = case
+	let TypeExpression::Path(segments) = case.ast.ty(case
 		.ast
-		.ty(case.ast.list(case.function_signature(0).params)[0].ty)
+		.list(case.function_signature(0).params)[0]
+		.ty
+		.unwrap())
 	else {
 		panic!("expected a path")
 	};
@@ -2801,7 +2841,7 @@ fn an_array_length_is_a_literal_or_a_path() {
 	for (param, length) in params.iter().zip([1, 2]) {
 		let TypeExpression::Array {
 			length: written, ..
-		} = pointee(&case.ast, case.ast.ty(param.ty))
+		} = pointee(&case.ast, case.ast.ty(param.ty.unwrap()))
 		else {
 			panic!("expected an array type")
 		};
@@ -2842,7 +2882,7 @@ fn a_constant_path_may_start_from_a_bracketed_type() {
 	let params = case.ast.list(case.function_signature(0).params);
 	let length = |at: usize| {
 		let TypeExpression::Array { length, .. } =
-			pointee(&case.ast, case.ast.ty(params[at].ty))
+			pointee(&case.ast, case.ast.ty(params[at].ty.unwrap()))
 		else {
 			panic!("expected an array type")
 		};
@@ -2853,7 +2893,8 @@ fn a_constant_path_may_start_from_a_bracketed_type() {
 		ConstArgument::QualifiedPath { segments, .. } if segments.len() == 1
 	));
 	assert!(matches!(length(1), ConstArgument::Grouped { .. }));
-	let TypeExpression::Path(segments) = case.ast.ty(params[2].ty) else {
+	let TypeExpression::Path(segments) = case.ast.ty(params[2].ty.unwrap())
+	else {
 		panic!("expected a path")
 	};
 	assert!(matches!(
@@ -3189,7 +3230,7 @@ fn test_generic_application_type_args() {
 	let Item::Function { signature, .. } = case.item(1) else {
 		panic!("expected function")
 	};
-	let param_ty = case.ast.ty(case.ast.list(signature.params)[0].ty);
+	let param_ty = case.ast.ty(case.ast.list(signature.params)[0].ty.unwrap());
 	let TypeExpression::Path(segments) = param_ty else {
 		panic!("expected a path")
 	};
@@ -3215,7 +3256,7 @@ fn test_path_continues_after_a_segment_with_type_args() {
 	let Item::Function { signature, .. } = case.item(0) else {
 		panic!("expected function")
 	};
-	let param_ty = case.ast.ty(case.ast.list(signature.params)[0].ty);
+	let param_ty = case.ast.ty(case.ast.list(signature.params)[0].ty.unwrap());
 	let TypeExpression::Path(segments) = param_ty else {
 		panic!("expected a path")
 	};
@@ -3735,7 +3776,7 @@ fn test_qualified_and_grouped_paths_in_type_position() {
 	case.diagnostics().assert_none();
 
 	let params = case.ast.list(case.function_signature(0).params);
-	let ty = |index: usize| case.ast.ty(params[index].ty);
+	let ty = |index: usize| case.ast.ty(params[index].ty.unwrap());
 	let TypeExpression::QualifiedPath { root, segments } = ty(0) else {
 		panic!("expected a qualified path type")
 	};
@@ -3764,7 +3805,7 @@ fn test_a_qualified_type_may_open_another_without_a_space() {
 	let params = case.ast.list(case.function_signature(0).params);
 	for param in &params[..2] {
 		let TypeExpression::QualifiedPath { root, segments } =
-			case.ast.ty(param.ty)
+			case.ast.ty(param.ty.unwrap())
 		else {
 			panic!("expected a qualified path type")
 		};
@@ -3938,7 +3979,7 @@ fn test_never_type() {
 	let case = TestCase::new("func f(a: !) -> ! {}");
 	case.diagnostics().assert_none();
 	let signature = case.function_signature(0);
-	let param = case.ast.list(signature.params)[0].ty;
+	let param = case.ast.list(signature.params)[0].ty.unwrap();
 	assert!(matches!(case.ast.ty(param), TypeExpression::Never));
 	let result = signature.result.expect("a result type");
 	assert!(matches!(case.ast.ty(result), TypeExpression::Never));
@@ -3957,14 +3998,15 @@ fn test_infer_and_memory_tagged_types() {
 	// pointer to a slice included
 	let params = case.ast.list(case.function_signature(0).params);
 	for index in [0, 1] {
-		let ty = case.ast.ty(params[index].ty);
+		let ty = case.ast.ty(params[index].ty.unwrap());
 		let TypeExpression::Pointer { memory, .. } = ty else {
 			panic!("expected a pointer type");
 		};
 		let memory = memory.expect("tagged with an explicit memory");
 		assert_eq!(case.name(case.ast.list(memory)[0].ident.inner), "heap");
 	}
-	let TypeExpression::Pointer { inner, .. } = case.ast.ty(params[1].ty)
+	let TypeExpression::Pointer { inner, .. } =
+		case.ast.ty(params[1].ty.unwrap())
 	else {
 		unreachable!()
 	};
@@ -4365,8 +4407,11 @@ fn a_type_argument_list_may_open_with_a_qualified_type() {
 	case.diagnostics().assert_none();
 
 	let param = &case.ast.list(case.function_signature(0).params)[0];
-	let TypeExpression::Path(segments) = case.ast.ty(param.ty) else {
-		panic!("expected a path type, got {:?}", case.ast.ty(param.ty))
+	let TypeExpression::Path(segments) = case.ast.ty(param.ty.unwrap()) else {
+		panic!(
+			"expected a path type, got {:?}",
+			case.ast.ty(param.ty.unwrap())
+		)
 	};
 	let [segment] = case.ast.list(segments) else {
 		panic!("expected one segment, got {}", segments.len())
@@ -4693,7 +4738,7 @@ fn a_type_path_with_no_last_segment_keeps_its_prefix() {
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
 	let param = &case.ast.list(case.function_signature(0).params)[0];
-	assert_eq!(case.printer().ty(param.ty), "core::<error>");
+	assert_eq!(case.printer().ty(param.ty.unwrap()), "core::<error>");
 	assert_eq!(case.ast.root.len(), 2);
 }
 
@@ -4721,9 +4766,12 @@ fn a_qualified_path_with_no_segment_keeps_its_root() {
 		DiagnosticCode::InvalidNamespace,
 	]);
 	let params = case.ast.list(case.function_signature(0).params);
-	assert_eq!(case.printer().ty(params[0].ty), "<T as Tr>::<error>");
 	assert_eq!(
-		case.printer().ty(params[1].ty),
+		case.printer().ty(params[0].ty.unwrap()),
+		"<T as Tr>::<error>"
+	);
+	assert_eq!(
+		case.printer().ty(params[1].ty.unwrap()),
 		"heap::&[u8; <T as Array>::<error>]"
 	);
 	assert_eq!(case.ast.root.len(), 2);
@@ -4739,7 +4787,7 @@ fn an_array_with_no_length_keeps_the_array() {
 		DiagnosticCode::UnexpectedToken,
 	]);
 	let param = &case.ast.list(case.function_signature(0).params)[0];
-	assert_eq!(case.printer().ty(param.ty), "heap::&[u8; <error>]");
+	assert_eq!(case.printer().ty(param.ty.unwrap()), "heap::&[u8; <error>]");
 	assert_eq!(
 		case.shape(case.local_value(&case.function_block(0), 0)),
 		"(repeat 0 <error>)"
@@ -4857,8 +4905,14 @@ fn a_parameter_or_a_field_with_no_type_keeps_its_name() {
 	let params = case.ast.list(case.function_signature(0).params);
 	assert_eq!(params.len(), 2);
 	let param = &params[1];
-	assert!(matches!(case.ast.ty(param.ty), TypeExpression::Error));
-	assert_eq!(case.ast.type_span(param.ty), TextSpan::from(17..18));
+	assert!(matches!(
+		case.ast.ty(param.ty.unwrap()),
+		TypeExpression::Error
+	));
+	assert_eq!(
+		case.ast.type_span(param.ty.unwrap()),
+		TextSpan::from(17..18)
+	);
 
 	let case = TestCase::new("struct P(a: u32, b: );");
 	case.diagnostics()
@@ -4868,7 +4922,7 @@ fn a_parameter_or_a_field_with_no_type_keeps_its_name() {
 	};
 	assert_eq!(fields.len(), 2);
 	assert!(matches!(
-		case.ast.ty(case.ast.list(*fields)[1].ty),
+		case.ast.ty(case.ast.list(*fields)[1].ty.unwrap()),
 		TypeExpression::Error
 	));
 }
