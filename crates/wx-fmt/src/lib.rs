@@ -1543,7 +1543,7 @@ impl<'a> Builder<'a> {
 		let arm_span = |arm: &ast::MatchArm| {
 			TextSpan::new(
 				ast.pattern_span(arm.pattern).start,
-				ast.expr_span(arm.body).end,
+				ast.branch_span(arm.body).end,
 			)
 		};
 		let match_kw = self.text(Text::Match);
@@ -1568,11 +1568,15 @@ impl<'a> Builder<'a> {
 				let mut an: Vec<NodeId> = Vec::new();
 				self.build_pattern(&mut an, arm.pattern);
 				an.push(self.text(Text::FatArrow));
-				let body = match ast.expr(arm.body) {
-					ast::Expression::Block { block, .. } => {
-						self.build_block_content(block, ast.expr_span(arm.body))
+				// A written `block` keeps its keyword (and label): it is the
+				// arm's expression, and a `break` in it leaves it.
+				let body = match arm.body {
+					ast::Branch::Block(block) => {
+						self.build_block_content(block, ast.block_span(block))
 					}
-					_ => self.build_expression(arm.body),
+					ast::Branch::Expression(expr) => {
+						self.build_expression(expr)
+					}
 				};
 				an.push(self.arena.group(body));
 				if index + 1 < arms.len() {
@@ -2385,18 +2389,11 @@ impl<'a> Builder<'a> {
 
 	/// An `else { if .. }` wrapper is redundant only when the `if` is its
 	/// sole value. Keep wrappers that terminate the value or own comments.
-	fn else_if_expression(&self, block: ast::ExprId) -> Option<ast::ExprId> {
-		let ast::Expression::Block {
-			label: None,
-			block: inner,
-		} = self.ast.expr(block)
-		else {
+	fn else_if_expression(&self, block: ast::BlockId) -> Option<ast::ExprId> {
+		let [Entry::Tail(expression)] = *self.entries(block) else {
 			return None;
 		};
-		let [Entry::Tail(expression)] = *self.entries(inner) else {
-			return None;
-		};
-		let span = self.ast.expr_span(block);
+		let span = self.ast.block_span(block);
 		let expression_span = self.ast.expr_span(expression);
 		if !matches!(self.ast.expr(expression), ast::Expression::IfElse { .. })
 			|| !self
@@ -2501,17 +2498,22 @@ impl<'a> Builder<'a> {
 				let cond = self.build_expression(condition);
 				let sp = self.text(Text::Space);
 
-				let else_data = else_block.map(|b| match ast.expr(b) {
-					ast::Expression::Block { block, .. } => {
-						if let Some(nested) = self.else_if_expression(b) {
+				let else_data = else_block.map(|branch| match branch {
+					ast::Branch::Block(block) => {
+						if let Some(nested) = self.else_if_expression(block) {
 							self.build_expression_contents(nested)
 						} else {
-							self.build_block_content(block, ast.expr_span(b))
+							self.build_block_content(
+								block,
+								ast.block_span(block),
+							)
 						}
 					}
 					// A continuation belongs to the same layout group as the
 					// first `if`, so every branch breaks when the chain breaks.
-					_ => self.build_expression_contents(b),
+					ast::Branch::Expression(expr) => {
+						self.build_expression_contents(expr)
+					}
 				});
 
 				let then_id = self.build_block_content(

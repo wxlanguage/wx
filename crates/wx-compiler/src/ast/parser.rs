@@ -657,7 +657,12 @@ impl ListItem for Statement {
 
 impl ListItem for MatchArm {
 	fn ends_in_block(&self, ast: &AstBuilder) -> bool {
-		ast.exprs.kinds[usize::from(self.body)].is_block_like()
+		match self.body {
+			Branch::Block(_) => true,
+			Branch::Expression(expr) => {
+				ast.exprs.kinds[usize::from(expr)].is_block_like()
+			}
+		}
 	}
 }
 
@@ -3065,12 +3070,6 @@ impl<'ctx> Parser<'ctx> {
 						.with_message("expected `block` before `{`"),
 				),
 		);
-		self.parse_block_expression()
-	}
-
-	/// A block where an expression is expected (an `else` branch, a match
-	/// arm's body), with no keyword and no label.
-	fn parse_block_expression(&mut self) -> Result<ExprId, ()> {
 		let block = self.parse_block()?;
 		let span = self.ast.blocks.spans[usize::from(block)];
 		Ok(self
@@ -3138,19 +3137,21 @@ impl<'ctx> Parser<'ctx> {
 			Some(Keyword::Else) => {
 				let _ = self.lexer.next();
 				// `else if` nests an `if` in the else position; `else { .. }`
-				// stays a plain block. TIR's `IfElse` branch and the checker's
-				// `build_branch` already describe both shapes.
+				// is the `if`'s own block.
 				if matches!(self.peek_keyword(), Some(Keyword::If)) {
-					Some(self.parse_if_else_expression()?)
+					Some(Branch::Expression(self.parse_if_else_expression()?))
 				} else {
-					Some(self.parse_block_expression()?)
+					Some(Branch::Block(self.parse_block()?))
 				}
 			}
 			_ => None,
 		};
 		let end = match else_block {
-			Some(else_block) => {
-				self.ast.exprs.spans[usize::from(else_block)].end
+			Some(Branch::Block(block)) => {
+				self.ast.blocks.spans[usize::from(block)].end
+			}
+			Some(Branch::Expression(expr)) => {
+				self.ast.exprs.spans[usize::from(expr)].end
 			}
 			None => self.ast.blocks.spans[usize::from(then_block)].end,
 		};
@@ -3220,18 +3221,26 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_match_arm(parser: &mut Parser) -> Result<Spanned<MatchArm>, ()> {
 		let pattern = Parser::parse_pattern(parser)?;
 		parser.next_expect(Token::FatArrow)?;
-		// A braced body is a block; a bare expression must be separated by a
-		// comma like a statement.
-		let body = if parser.lexer.peek().inner == Token::OpenBrace {
-			parser.parse_block_expression()?
+		// A braced body is the arm's own block; a bare expression must be
+		// separated by a comma like a statement.
+		let (body, end) = if parser.lexer.peek().inner == Token::OpenBrace {
+			let block = parser.parse_block()?;
+			(
+				Branch::Block(block),
+				parser.ast.blocks.spans[usize::from(block)].end,
+			)
 		} else {
-			parser.parse_expression(BindingPower::Default)?
+			let expr = parser.parse_expression(BindingPower::Default)?;
+			(
+				Branch::Expression(expr),
+				parser.ast.exprs.spans[usize::from(expr)].end,
+			)
 		};
 		Ok(Spanned {
 			inner: MatchArm { pattern, body },
 			span: TextSpan::new(
 				parser.ast.patterns.spans[usize::from(pattern)].start,
-				parser.ast.exprs.spans[usize::from(body)].end,
+				end,
 			),
 		})
 	}

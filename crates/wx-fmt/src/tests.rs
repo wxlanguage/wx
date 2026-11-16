@@ -2684,6 +2684,18 @@ impl Roles<'_> {
 		}
 	}
 
+	/// The same kind of branch on both sides: formatting never turns a
+	/// written `block` into an arm's own braces, or back.
+	fn branch(&self, a: ast::Branch, b: ast::Branch) {
+		match (a, b) {
+			(ast::Branch::Block(a), ast::Branch::Block(b)) => self.block(a, b),
+			(ast::Branch::Expression(a), ast::Branch::Expression(b)) => {
+				self.expr(a, b)
+			}
+			_ => panic!("a branch changed between braces and an expression"),
+		}
+	}
+
 	fn expr(&self, a: ast::ExprId, b: ast::ExprId) {
 		use ast::Expression as E;
 		let (ea, eb) = (self.a.expr(a), self.b.expr(b));
@@ -2709,10 +2721,9 @@ impl Roles<'_> {
 				let (Some(a), Some(b)) = (ae, be) else {
 					return;
 				};
-				if let E::Block { label, block } = self.a.expr(a)
-					&& matches!(self.b.expr(b), E::IfElse { .. })
+				if let (ast::Branch::Block(block), ast::Branch::Expression(b)) =
+					(a, b) && matches!(self.b.expr(b), E::IfElse { .. })
 				{
-					assert!(label.is_none());
 					let block = self.a.block(block);
 					assert!(
 						block.statements.is_empty(),
@@ -2723,7 +2734,7 @@ impl Roles<'_> {
 						.expect("removed else block without a tail expression");
 					self.expr(nested, b);
 				} else {
-					self.expr(a, b);
+					self.branch(a, b);
 				}
 			}
 			(
@@ -2740,7 +2751,7 @@ impl Roles<'_> {
 				let (aa, ba) = (self.a.list(aa), self.b.list(ba));
 				assert_eq!(aa.len(), ba.len());
 				for (a, b) in aa.iter().zip(ba) {
-					self.expr(a.body, b.body);
+					self.branch(a.body, b.body);
 				}
 			}
 			(
@@ -3707,6 +3718,21 @@ fn test_format_match_arm_bodies() {
             }
         "}
 	);
+}
+
+/// A `block` written as an arm's body keeps its keyword and its label: a
+/// `break` in it leaves it, and an arm's own braces are no target.
+#[test]
+fn test_format_keeps_a_written_block_in_an_arm() {
+	let source = indoc! {"
+        func f(x: i32) -> i32 {
+            match x {
+                0 => block :b { break :b 1 },
+                _ => block { break 2 },
+            }
+        }
+    "};
+	assert_eq!(checked_format(source, 80, 4), source);
 }
 
 #[test]

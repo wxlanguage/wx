@@ -240,9 +240,10 @@ pub enum Expression {
 	Return {
 		value: Option<ExprId>,
 	},
-	/// `block :label { ... }`, or a construct's own block where an
-	/// expression is expected (an `else` branch, a match arm), which has no
-	/// label. A keyword block's span starts before its braces.
+	/// `block :label { ... }`: a block written with its keyword, which an
+	/// unlabelled `break` leaves. Its span starts at the keyword. The braces a
+	/// construct owns (an `else` branch's, a match arm's) are a
+	/// `Branch::Block`, not this.
 	Block {
 		label: Option<Spanned<SymbolU32>>,
 		block: BlockId,
@@ -252,11 +253,12 @@ pub enum Expression {
 		label: Option<Spanned<SymbolU32>>,
 		value: Option<ExprId>,
 	},
-	/// `if {expr} { ... } else ...`; an `else` is a block or another `if`.
+	/// `if {expr} { ... } else ...`; an `else` is a block
+	/// (`Branch::Block`) or another `if` (`Branch::Expression`).
 	IfElse {
 		condition: ExprId,
 		then_block: BlockId,
-		else_block: Option<ExprId>,
+		else_block: Option<Branch>,
 	},
 	/// `match {expr} { {pattern} => { ... }, ... }`
 	Match {
@@ -344,7 +346,17 @@ pub struct NamedArgument {
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct MatchArm {
 	pub pattern: PatId,
-	pub body: ExprId,
+	pub body: Branch,
+}
+
+/// What an `else` or a match arm runs: the construct's own braces, or an
+/// expression (an arm's `=> x`, an `else if`). The braces are not a
+/// `block { .. }`: no `break` leaves them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
+pub enum Branch {
+	Block(BlockId),
+	Expression(ExprId),
 }
 
 /// A block's statements, as written between its braces: each statement in
@@ -1793,6 +1805,14 @@ impl AST {
 
 	pub fn statement(&self, id: StmtId) -> Statement {
 		self.stmts.kinds[usize::from(id)]
+	}
+
+	/// A branch's span: its braces, or its expression's.
+	pub fn branch_span(&self, branch: Branch) -> TextSpan {
+		match branch {
+			Branch::Block(block) => self.block_span(block),
+			Branch::Expression(expr) => self.expr_span(expr),
+		}
 	}
 
 	pub fn statement_span(&self, id: StmtId) -> TextSpan {

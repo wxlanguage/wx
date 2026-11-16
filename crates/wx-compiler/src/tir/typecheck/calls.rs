@@ -465,7 +465,9 @@ impl BodyBuilder<'_, '_> {
 			already_reported,
 			&mut type_args,
 		);
-		self.expect_arguments(&target, &type_args, &given);
+		self.expect_arguments(&target, &type_args, &mut given);
+		// Held to its parameter with the rest, which may have shared it.
+		let receiver = receiver.map(|_| given[0].value);
 		// One stored list for the bound checks and the node.
 		let use_args = self.use_args(&target, segment, &type_args, &given);
 		self.check_use_bounds(&target, proven, segment, use_args);
@@ -614,7 +616,7 @@ impl BodyBuilder<'_, '_> {
 		&mut self,
 		target: &CallTarget,
 		type_args: &[TypeIndex],
-		given: &[GivenArgument],
+		given: &mut [GivenArgument],
 	) {
 		for argument in given {
 			let ty = if self.sema.types.has_infer(argument.expected) {
@@ -626,7 +628,7 @@ impl BodyBuilder<'_, '_> {
 			} else {
 				argument.expected
 			};
-			self.expect(argument.value, ty);
+			argument.value = self.expect(argument.value, ty);
 		}
 	}
 
@@ -1171,7 +1173,7 @@ impl BodyBuilder<'_, '_> {
 			&mut given,
 			span,
 		);
-		self.expect_arguments(&target, &type_args, &given);
+		self.expect_arguments(&target, &type_args, &mut given);
 		let return_type =
 			self.sema.functions[usize::from(function)].return_type;
 		let result =

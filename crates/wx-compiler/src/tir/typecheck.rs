@@ -444,7 +444,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 
 	/// Pushes the root scope, which every body has.
 	fn enter_root(&mut self, span: TextSpan, expected: TypeIndex) {
-		let root = self.body.push_scope(ScopeKind::Block, None, None, span);
+		let root = self.body.push_scope(ScopeKind::Body, None, None, span);
 		debug_assert_eq!(root, ScopeIdx::ROOT);
 		self.scope_types.push(ScopeType {
 			expected,
@@ -506,63 +506,75 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		self.expect(built, expected)
 	}
 
+	/// Holds `expr` to `expected` where it is handed to the node that will
+	/// hold it, before that node exists: the one place a typed value is
+	/// converted, an exclusive pointer shared where a shared one to the same
+	/// place is expected (`p` is `p.*.&`). The conversion is a node of its
+	/// own, pushed after `expr` as a parent is after its child, so the caller
+	/// holds the node this returns. Anything else is `settle`d in place.
+	#[must_use]
 	fn expect(&mut self, expr: ExprIdx, expected: TypeIndex) -> ExprIdx {
+		if let (
+			Type::Pointer {
+				to: expected_to,
+				memory: expected_memory,
+				ownership: Ownership::Shared,
+			},
+			Type::Pointer {
+				to,
+				memory,
+				ownership: Ownership::Exclusive,
+			},
+		) = (
+			*self.sema.types.resolve(expected),
+			*self.sema.types.resolve(self.body.ty(expr)),
+		) && expected_to == to
+			&& expected_memory == memory
+		{
+			return self.shared_receiver(expr, to, memory);
+		}
+		self.settle(expr, expected);
+		expr
+	}
+
+	/// Holds `expr` to `expected` in place, which works after the node
+	/// holding it exists too: an untyped value takes the type (`coerce`), a
+	/// typed one must be it already, and `!` fits any type, since no value
+	/// ever arrives. `INFER` and `ERROR` expect nothing.
+	fn settle(&mut self, expr: ExprIdx, expected: TypeIndex) {
 		if expected == TypeIndex::INFER || expected == TypeIndex::ERROR {
-			return expr;
+			return;
 		}
 		let actual = self.body.ty(expr);
 		if self.sema.types.needs_context(actual) {
-			self.coerce(expr, expected);
-		} else if actual != TypeIndex::ERROR
-			&& actual != TypeIndex::NEVER
-			&& actual != expected
-		{
-			// An exclusive pointer fits where a shared one to the same
-			// place is expected: `p` is `p.*.&`.
-			if let (
-				Type::Pointer {
-					to: expected_to,
-					memory: expected_memory,
-					ownership: Ownership::Shared,
-				},
-				Type::Pointer {
-					to,
-					memory,
-					ownership: Ownership::Exclusive,
-				},
-			) = (
-				*self.sema.types.resolve(expected),
-				*self.sema.types.resolve(actual),
-			) {
-				if expected_to == to && expected_memory == memory {
-					return self.shared_receiver(expr, to, memory);
-				}
-			}
-			let span = self.body.span(expr);
-			match self.context().equality(
-				expected,
-				actual,
-				RewriteFlags::EQUALITIES | RewriteFlags::DEFINITIONS,
-				span,
-			) {
-				Ok(TypeEquality::Equal) => return expr,
-				// A constant left as written is compared once it has a
-				// value.
-				Ok(TypeEquality::NeedsValues) => {
-					self.obligations
-						.exprs
-						.push(ExprObligation::Equal { expr, expected });
-					return expr;
-				}
-				Ok(TypeEquality::Diff) => {
-					self.context().report_mismatch(expr, expected)
-				}
-				// Explained: nothing reads a value from it, and no mismatch
-				// on top.
-				Err(()) => self.body.set_ty(expr, TypeIndex::ERROR),
-			}
+			return self.coerce(expr, expected);
 		}
-		expr
+		if actual == TypeIndex::ERROR
+			|| actual == TypeIndex::NEVER
+			|| actual == expected
+		{
+			return;
+		}
+		let span = self.body.span(expr);
+		match self.context().equality(
+			expected,
+			actual,
+			RewriteFlags::EQUALITIES | RewriteFlags::DEFINITIONS,
+			span,
+		) {
+			Ok(TypeEquality::Equal) => {}
+			// A constant left as written is compared once it has a value.
+			Ok(TypeEquality::NeedsValues) => self
+				.obligations
+				.exprs
+				.push(ExprObligation::Equal { expr, expected }),
+			Ok(TypeEquality::Diff) => {
+				self.context().report_mismatch(expr, expected)
+			}
+			// Explained: nothing reads a value from it, and no mismatch on
+			// top.
+			Err(()) => self.body.set_ty(expr, TypeIndex::ERROR),
+		}
 	}
 
 	/// Lowers `expr`. `expected` is the type the context hints at this site:
@@ -670,7 +682,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 					.map(|name| {
 						self.body.push_label(super::body::Label { name })
 					});
-				self.build_block(block, expected, label, span)
+				self.build_block(ScopeKind::Block, block, expected, label, span)
 			}
 			ast::Expression::IfElse {
 				condition,
@@ -803,7 +815,12 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				Some(hints) => self.sema.types.list(hints)[at],
 				None => TypeIndex::INFER,
 			};
-			let value = self.build(element, hint);
+			let mut value = self.build(element, hint);
+			// An element whose part is known is held to it here, before the
+			// tuple holding it exists; the rest wait for their context.
+			if !self.sema.types.has_infer(hint) {
+				value = self.expect(value, hint);
+			}
 			values.push(value);
 			types.push(self.body.ty(value));
 		}
@@ -1501,7 +1518,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			already_reported,
 			&mut type_args,
 		);
-		self.expect_arguments(&target, &type_args, &given);
+		self.expect_arguments(&target, &type_args, &mut given);
 		let args = self.use_args(&target, segment, &type_args, &given);
 		self.check_use_bounds(&target, 0, segment, args);
 		let fields = self.arguments_value(
@@ -2720,7 +2737,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			let element = self.body.args(elements)[at];
 			let position = usize::from(self.body.declared_index(order, at));
 			let element_target = self.sema.types.list(targets)[position];
-			let element = self.expect(element, element_target);
+			self.settle(element, element_target);
 			types[position] = self.body.ty(element);
 		}
 		let ty = self.sema.types.intern_tuple(&types);
@@ -2877,14 +2894,14 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			ExprKind::Array { elements } => {
 				for at in 0..elements.len() {
 					let element = self.body.args(elements)[at];
-					self.expect(element, parts.of);
+					self.settle(element, parts.of);
 				}
 			}
 			ExprKind::ArrayRepeat { value, count } => {
-				self.expect(value, parts.of);
+				self.settle(value, parts.of);
 				if let (Some(count), Some(memory)) = (count, parts.memory) {
 					let length_type = self.memory_size(memory);
-					self.expect(count, length_type);
+					self.settle(count, length_type);
 				}
 				// `[value; _]` is as long as the array it becomes.
 				if count.is_none() {
@@ -4197,6 +4214,100 @@ mod tests {
 			DiagnosticCode::ContinueOutsideOfLoop,
 			DiagnosticCode::UndeclaredLabel,
 			DiagnosticCode::ContinueOutsideOfLoop,
+		]);
+	}
+
+	#[test]
+	fn a_break_leaves_the_nearest_written_block_or_loop() {
+		let case = TestCase::new(indoc! {"
+				func early(c: Bool) -> u32 {
+					block {
+						if c { break 1 };
+						2
+					}
+				}
+				func scoped(c: Bool) -> u32 {
+					loop {
+						block {
+							if c { break };
+						}
+						break 3;
+					}
+				}
+				func arm(o: Ordering) -> u32 {
+					loop {
+						match o {
+							Ordering::Less => { break 4 },
+							_ => block { break },
+						}
+					}
+				}
+				func past(c: Bool) -> u32 {
+					loop :outer {
+						block {
+							if c { break :outer 5 };
+						}
+					}
+				}
+			"});
+		case.diagnostics().assert_none();
+		// The `if`'s braces are not a target: the `break` leaves the `block`.
+		assert_eq!(
+			case.shape("early"),
+			"(block => (block (if c#0 (block => (break block 1))) => 2))"
+		);
+		// A `block` written to scope a temporary catches the `break` in it.
+		assert_eq!(
+			case.shape("scoped"),
+			"(block => (loop (block (if c#0 (block => (break block)))) \
+			 (break loop 3)))"
+		);
+		// An arm's braces are not a target; a `block` written in an arm is.
+		assert_eq!(
+			case.shape("arm"),
+			"(block => (loop (match o#0 (Less => (block => (break loop 4))) \
+			 (_ => (block => (break block))))))"
+		);
+		assert_eq!(
+			case.shape("past"),
+			"(block => (loop (block (if c#0 (block => (break outer 5))))))"
+		);
+	}
+
+	#[test]
+	fn continue_restarts_the_nearest_loop_through_a_block() {
+		let case = TestCase::new(indoc! {"
+				func f(c: Bool) {
+					loop {
+						block {
+							if c { continue };
+						}
+						break;
+					}
+				}
+				func g() { block { continue; } }
+			"});
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::ContinueOutsideOfLoop]);
+	}
+
+	#[test]
+	fn a_jump_with_no_target_is_not_known_to_diverge() {
+		// Nothing after it is unreachable, a block it ends gives no `()`, and
+		// its value is still checked.
+		let case = TestCase::new(indoc! {"
+				func f(c: Bool) -> u32 {
+					local x: u32 = if c { break 0; } else { 1 };
+					local y: u32 = if c { continue; } else { 2 };
+					x
+				}
+				func g() { break missing; }
+			"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::BreakOutsideOfLoop,
+			DiagnosticCode::ContinueOutsideOfLoop,
+			DiagnosticCode::BreakOutsideOfLoop,
+			DiagnosticCode::UndeclaredIdentifier,
 		]);
 	}
 
@@ -8194,6 +8305,63 @@ mod tests {
 			DiagnosticCode::TypeMistmatch,
 			DiagnosticCode::TypeMistmatch,
 		]);
+	}
+
+	#[test]
+	fn a_tuple_element_is_a_coercion_site() {
+		let case = TestCase::new(indoc! {"
+				memory heap: u32;
+				func f(s: heap::*[u8]) -> (u8, heap::&[u8]) { (1, s) }
+				func g(s: heap::*[u8]) -> (Ordering, heap::&[u8]) {
+					(Ordering::Less, s)
+				}
+				func h(s: heap::&[u8]) -> (Ordering, heap::*[u8]) {
+					(Ordering::Less, s)
+				}
+			"});
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+		// The element is replaced by the shared pointer, not only retyped.
+		assert_eq!(case.shape("f"), "(block => (tuple 1 (.& (* s#0))))");
+		assert_eq!(case.shape("g"), "(block => (tuple Less (.& (* s#0))))");
+	}
+
+	#[test]
+	fn a_value_handed_to_its_context_is_a_coercion_site() {
+		let case = TestCase::new(indoc! {"
+				memory heap: u32;
+				func read(s: heap::&[u8]) {}
+				func call(s: heap::*[u8]) { read(s); }
+				func result(s: heap::*[u8]) -> heap::&[u8] { block { s } }
+				func branches(
+					c: Bool,
+					s: heap::*[u8],
+					t: heap::&[u8],
+				) -> heap::&[u8] {
+					if c { s } else { t }
+				}
+				func arms(o: Ordering, s: heap::*[u8], t: heap::&[u8]) -> heap::&[u8] {
+					match o {
+						Ordering::Less => s,
+						Ordering::Equal => { s }
+						Ordering::Greater => t,
+					}
+				}
+				func early(c: Bool, s: heap::*[u8]) -> heap::&[u8] {
+					local r: heap::&[u8] = block :b {
+						if c { break :b s };
+						return s;
+					};
+					r
+				}
+			"});
+		case.diagnostics().assert_none();
+		assert_eq!(case.shape("call"), "(block (call read (.& (* s#0))))");
+		assert_eq!(case.shape("result"), "(block => (block => (.& (* s#0))))");
+		assert_eq!(
+			case.shape("branches"),
+			"(block => (if c#0 (block => (.& (* s#1))) (block => t#2)))"
+		);
 	}
 
 	#[test]

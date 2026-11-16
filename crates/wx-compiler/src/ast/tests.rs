@@ -966,10 +966,7 @@ fn test_if_else() {
 	// `else if` nests an `if` in the else position; the checker and lowering
 	// both expect either a block or a nested `if` there.
 	let else_block = else_block.expect("`else` should be recorded");
-	assert!(matches!(
-		case.ast.expr(else_block),
-		Expression::Block { .. }
-	));
+	assert!(matches!(else_block, Branch::Block(_)));
 }
 
 #[test]
@@ -989,16 +986,14 @@ fn test_else_if_nests_an_if_in_the_else_position() {
 	else {
 		panic!("expected an if/else")
 	};
-	let else_block = else_block.expect("`else` should be recorded");
-	let Expression::IfElse { else_block, .. } = case.ast.expr(else_block)
-	else {
+	let Some(Branch::Expression(else_if)) = else_block else {
+		panic!("expected the else position to hold a nested if")
+	};
+	let Expression::IfElse { else_block, .. } = case.ast.expr(else_if) else {
 		panic!("expected the else position to hold a nested if")
 	};
 	assert!(
-		matches!(
-			else_block.map(|block| case.ast.expr(block)),
-			Some(Expression::Block { .. })
-		),
+		matches!(else_block, Some(Branch::Block(_))),
 		"the nested if's own else must still be a block"
 	);
 }
@@ -1044,10 +1039,40 @@ fn test_match_arm_bodies_may_be_expressions_or_blocks() {
 	else {
 		panic!("expected a match")
 	};
-	let body = |at: usize| case.ast.expr(case.ast.list(arms)[at].body);
-	assert!(matches!(body(0), Expression::Int { .. }));
-	assert!(matches!(body(1), Expression::Block { .. }));
-	assert!(matches!(body(2), Expression::Binary { .. }));
+	let body = |at: usize| case.ast.list(arms)[at].body;
+	let expression = |at: usize| match body(at) {
+		Branch::Expression(expr) => case.ast.expr(expr),
+		Branch::Block(_) => panic!("expected arm {at} to be an expression"),
+	};
+	assert!(matches!(expression(0), Expression::Int { .. }));
+	assert!(matches!(body(1), Branch::Block(_)));
+	assert!(matches!(expression(2), Expression::Binary { .. }));
+}
+
+#[test]
+fn a_written_block_is_not_a_constructs_own() {
+	// `block { .. }` is a block expression wherever it is written; the braces
+	// an arm or an `else` owns are the construct's own.
+	let case = TestCase::new(indoc! {"
+        func f(x: i32) -> i32 {
+            match x {
+                0 => block { 1 },
+                _ => { 2 },
+            }
+        }
+    "});
+	case.diagnostics().assert_none();
+	let Expression::Match { arms, .. } =
+		case.statement_expression(&case.function_block(0), 0)
+	else {
+		panic!("expected a match")
+	};
+	let arms = case.ast.list(arms);
+	let Branch::Expression(written) = arms[0].body else {
+		panic!("a written `block` is an expression")
+	};
+	assert!(matches!(case.ast.expr(written), Expression::Block { .. }));
+	assert!(matches!(arms[1].body, Branch::Block(_)));
 }
 
 #[test]

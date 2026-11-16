@@ -18,7 +18,7 @@ use tower_lsp_server::ls_types::{
 };
 use wx_compiler::ast::{
 	AST, AssocBinding, AssocBindingKind, Block, BlockId, BoundExpression,
-	BoundId, Comment, CommentMap, ConstArgument, ConstId, Destructure,
+	BoundId, Branch, Comment, CommentMap, ConstArgument, ConstId, Destructure,
 	EnumVariant, ExprId, Expression, FunctionSignature, FunctionTypeParam,
 	ImplItem, ImportDeclaration, ImportEntry, InColumn, Item, List,
 	NamedArgument, PatId, Path, PathSegment, Pattern, PatternElement,
@@ -1261,6 +1261,14 @@ impl Cursor<'_> {
 		}
 	}
 
+	/// An `else` branch or a match arm's body.
+	fn branch(&self, branch: Branch) -> Option<Site> {
+		match branch {
+			Branch::Block(block) => self.block(block),
+			Branch::Expression(expression) => self.expression(expression),
+		}
+	}
+
 	fn expression(&self, expression: ExprId) -> Option<Site> {
 		let ast = self.ast;
 		let span = ast.expr_span(expression);
@@ -1336,17 +1344,16 @@ impl Cursor<'_> {
 			} => self
 				.expression(condition)
 				.or_else(|| self.block(then_block))
-				.or_else(|| self.expression(else_block?)),
+				.or_else(|| self.branch(else_block?)),
 			Expression::Match { scrutinee, arms } => {
 				self.expression(scrutinee).or_else(|| {
 					let arm = self.child_by(ast.list(arms), |arm| {
 						TextSpan::new(
 							ast.pattern_span(arm.pattern).start,
-							ast.expr_span(arm.body).end,
+							ast.branch_span(arm.body).end,
 						)
 					})?;
-					self.pattern(arm.pattern)
-						.or_else(|| self.expression(arm.body))
+					self.pattern(arm.pattern).or_else(|| self.branch(arm.body))
 				})
 			}
 			Expression::Loop { block, .. } => self.block(block),

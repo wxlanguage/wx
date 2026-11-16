@@ -505,10 +505,14 @@ pub(super) enum ExprKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum ScopeKind {
-	/// A block, an `if`/`else` branch, a match arm (declaring its
-	/// bindings, from the end of its pattern), or the body itself (the root
-	/// scope, the one without a parent, declaring the parameters).
+	/// A block written with its keyword, `block { .. }`, which an unlabelled
+	/// `break` leaves.
 	Block,
+	/// The braces a construct owns, which no `break` leaves unless it is a
+	/// loop's: an `if`/`else` branch, a match arm (declaring its bindings,
+	/// from the end of its pattern), or the body itself (the root scope, the
+	/// one without a parent, declaring the parameters).
+	Body,
 	/// The rest of a block after a `local` statement, which declares what
 	/// the statement binds: from the statement's end to the block's. Each
 	/// `local` opens one inside the one before, so a later local of the

@@ -138,16 +138,16 @@ impl Fd {
         Errno,
         heap::&[u8],
     ) {
-        if buffer.*.&.len() == 0 { return (Errno::INVAL, "") };
+        if buffer.len() == 0 { return (Errno::INVAL, "") };
         local mark = arena.mark();
         local io_vecs = arena.allocate_slice_uninit::<heap::*[u8]>(1);
         local count = arena.allocate_value::<u32>(0);
         io_vecs[0] = buffer;
-        local error = sys::fd_read(self, io_vecs.*.&, count);
+        local error = sys::fd_read(self, io_vecs, count);
         local read = count.*;
         arena.release(mark);
         if error != Errno::SUCCESS { return (error, "") };
-        (Errno::SUCCESS, slices::slice_at(buffer.*.&, 0, read))
+        (Errno::SUCCESS, slices::slice_at(buffer, 0, read))
     }
 
     pub func read(
@@ -208,7 +208,7 @@ pub func try_args(arena: heap::*Arena) -> (Errno, heap::&[heap::&[u8]]) {
         }
         at += 1;
     }
-    (Errno::SUCCESS, arguments.*.&)
+    (Errno::SUCCESS, arguments)
 }
 
 pub func args(arena: heap::*Arena) -> heap::&[heap::&[u8]] {

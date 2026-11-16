@@ -805,6 +805,14 @@ impl<'a> Printer<'a> {
 
 	// ── Expressions ─────────────────────────────────────────────────────────
 
+	/// A construct's own block prints as an `if`'s does.
+	fn branch(&self, branch: Branch) -> Sexp {
+		match branch {
+			Branch::Block(block) => self.block("block", None, block),
+			Branch::Expression(expr) => self.expr(expr),
+		}
+	}
+
 	pub(super) fn expr(&self, expr: ExprId) -> Sexp {
 		match self.ast.expr(expr) {
 			Expression::Error => Sexp::atom("<error>"),
@@ -882,7 +890,7 @@ impl<'a> Printer<'a> {
 				"if",
 				[self.expr(condition), self.block("block", None, then_block)]
 					.into_iter()
-					.chain(else_block.map(|block| self.expr(block))),
+					.chain(else_block.map(|branch| self.branch(branch))),
 			),
 			Expression::Match { scrutinee, arms } => Sexp::head(
 				"match",
@@ -890,7 +898,7 @@ impl<'a> Printer<'a> {
 					self.ast.list(arms).iter().map(|arm| {
 						Sexp::head(
 							"=>",
-							[self.pattern(arm.pattern), self.expr(arm.body)],
+							[self.pattern(arm.pattern), self.branch(arm.body)],
 						)
 					}),
 				),

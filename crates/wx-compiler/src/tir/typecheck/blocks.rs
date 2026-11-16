@@ -97,15 +97,18 @@ impl BodyBuilder<'_, '_> {
 		local
 	}
 
-	/// `{ .. }` in a scope of its own, held to `expected`.
+	/// `{ .. }` in a scope of its own, of `kind`, held to `expected`: a
+	/// written `block` (`ScopeKind::Block`), or braces a construct owns
+	/// (`ScopeKind::Body`), which take no label.
 	pub(super) fn build_block(
 		&mut self,
+		kind: ScopeKind,
 		block: ast::BlockId,
 		expected: TypeIndex,
 		label: Option<LabelIdx>,
 		span: TextSpan,
 	) -> ExprIdx {
-		let scope = self.enter_scope(ScopeKind::Block, label, span, expected);
+		let scope = self.enter_scope(kind, label, span, expected);
 		let block = self.build_block_in(scope, block, span);
 		self.leave_scope(scope);
 		block
@@ -122,16 +125,25 @@ impl BodyBuilder<'_, '_> {
 		let ast = self.ast();
 		let ast::Block { statements, tail } = ast.block(block);
 		let (statements, result) = (ast.list(statements), tail);
-		let (built, diverges) =
-			self.build_statements(statements, result, span.end);
+		let (built, flow) = self.build_statements(statements, result, span.end);
 		let result = result.map(|result| {
 			let hint = self.scope_hint(scope);
 			let value = self.build(result, hint);
-			self.give(scope, value, true);
-			value
+			self.give(scope, value, true)
 		});
-		if result.is_none() && !diverges {
-			self.give_unit(scope, span);
+		if result.is_none() {
+			match flow {
+				StatementFlow::Convergent => self.give_unit(scope, span),
+				StatementFlow::Divergent => {}
+				// Whether it reaches its end is not known, so neither is
+				// what it gives there.
+				StatementFlow::Unknown => {
+					let slot = &mut self.scope_types[usize::from(scope)];
+					if slot.ty == TypeIndex::INFER {
+						slot.ty = TypeIndex::ERROR;
+					}
+				}
+			}
 		}
 		let ty = self.scope_type(scope);
 		let statements = self.body.push_args(built);
@@ -146,31 +158,39 @@ impl BodyBuilder<'_, '_> {
 		)
 	}
 
-	/// Builds `statements`, and whether one of them diverges (is `!`). What
-	/// follows the first that does, `result` included, is reported
-	/// unreachable once, and still checked. Each `local` among them opens
-	/// the rest of the block, up to `end`, as a scope of its own; the
+	/// Builds `statements`, and how control flows through them
+	/// (`StatementFlow`). What follows the first divergent one (of type `!`),
+	/// `result` included, is reported unreachable once, and still checked. Each `local` among them
+	/// opens the rest of the block, up to `end`, as a scope of its own; the
 	/// block's own scope closes them all when it is left.
 	fn build_statements(
 		&mut self,
 		statements: &[ast::StmtId],
 		result: Option<ast::ExprId>,
 		block_end: u32,
-	) -> (Vec<ExprIdx>, bool) {
+	) -> (Vec<ExprIdx>, StatementFlow) {
 		let ast = self.ast();
 		let mut built = Vec::with_capacity(statements.len());
-		let mut diverges_at = None;
+		let mut divergent_at = None;
+		let mut unknown = false;
 		for (at, &statement) in statements.iter().enumerate() {
 			let statement = self.build_statement(statement, block_end);
-			if diverges_at.is_none()
-				&& self.body.ty(statement) == TypeIndex::NEVER
-			{
-				diverges_at = Some(at);
+			match self.body.ty(statement) {
+				TypeIndex::NEVER if divergent_at.is_none() => {
+					divergent_at = Some(at);
+				}
+				TypeIndex::ERROR => unknown = true,
+				_ => {}
 			}
 			built.push(statement);
 		}
-		let Some(at) = diverges_at else {
-			return (built, false);
+		let Some(at) = divergent_at else {
+			let flow = if unknown {
+				StatementFlow::Unknown
+			} else {
+				StatementFlow::Convergent
+			};
+			return (built, flow);
 		};
 		let start = statements
 			.get(at + 1)
@@ -193,7 +213,7 @@ impl BodyBuilder<'_, '_> {
 					),
 			);
 		}
-		(built, true)
+		(built, StatementFlow::Divergent)
 	}
 
 	fn build_statement(
@@ -357,11 +377,11 @@ impl BodyBuilder<'_, '_> {
 		for &ast::MatchArm { pattern, body } in arms {
 			// Its bindings are in scope after its pattern.
 			let scope = self.enter_scope(
-				ScopeKind::Block,
+				ScopeKind::Body,
 				None,
 				TextSpan::new(
 					ast.pattern_span(pattern).end,
-					ast.expr_span(body).end,
+					ast.branch_span(body).end,
 				),
 				TypeIndex::INFER,
 			);
@@ -439,15 +459,20 @@ impl BodyBuilder<'_, '_> {
 		&mut self,
 		condition: ast::ExprId,
 		then_block: ast::BlockId,
-		else_block: Option<ast::ExprId>,
+		else_block: Option<ast::Branch>,
 		expected: TypeIndex,
 		span: TextSpan,
 	) -> ExprIdx {
 		let condition = self.check(condition, TypeIndex::BOOL);
 		let then_span = self.ast().block_span(then_block);
 		let Some(else_block) = else_block else {
-			let then_block =
-				self.build_block(then_block, TypeIndex::INFER, None, then_span);
+			let then_block = self.build_block(
+				ScopeKind::Body,
+				then_block,
+				TypeIndex::INFER,
+				None,
+				then_span,
+			);
 			let then_ty = self.body.ty(then_block);
 			let mut ty = TypeIndex::UNIT;
 			if then_ty != TypeIndex::UNIT
@@ -480,8 +505,13 @@ impl BodyBuilder<'_, '_> {
 				span,
 			);
 		};
-		let then_block =
-			self.build_block(then_block, expected, None, then_span);
+		let then_block = self.build_block(
+			ScopeKind::Body,
+			then_block,
+			expected,
+			None,
+			then_span,
+		);
 		let else_block = self.build_branch(else_block, expected);
 		let ty = self.join_branches(then_block, else_block);
 		self.body.push(
@@ -495,19 +525,21 @@ impl BodyBuilder<'_, '_> {
 		)
 	}
 
-	/// An `else` branch or a match arm's body: a block, the `if` of an
-	/// `else if`, or an arm's expression.
+	/// An `else` branch or a match arm's body: the construct's own block,
+	/// the `if` of an `else if`, or an arm's expression. Each is held to
+	/// `expected` as a block's result is (`give`), before the `if` or `match`
+	/// holding it exists, so `A => p` and `A => { p }` are checked alike.
 	fn build_branch(
 		&mut self,
-		branch: ast::ExprId,
+		branch: ast::Branch,
 		expected: TypeIndex,
 	) -> ExprIdx {
-		let ast = self.ast();
-		match ast.expr(branch) {
-			ast::Expression::Block { label: None, block } => {
-				self.build_block(block, expected, None, ast.expr_span(branch))
+		match branch {
+			ast::Branch::Block(block) => {
+				let span = self.ast().block_span(block);
+				self.build_block(ScopeKind::Body, block, expected, None, span)
 			}
-			_ => self.build(branch, expected),
+			ast::Branch::Expression(expr) => self.check(expr, expected),
 		}
 	}
 
@@ -597,13 +629,16 @@ impl BodyBuilder<'_, '_> {
 		span: TextSpan,
 	) -> ExprIdx {
 		let Some(scope) = self.jump_target(label, span, Jump::Break) else {
-			return self.body.push(ExprKind::Error, TypeIndex::NEVER, span);
+			// Its value is still checked, against nothing.
+			if let Some(value) = value {
+				self.build(value, TypeIndex::ERROR);
+			}
+			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
 		let value = value.map(|value| {
 			let hint = self.scope_hint(scope);
 			let value = self.build(value, hint);
-			self.give(scope, value, false);
-			value
+			self.give(scope, value, false)
 		});
 		if value.is_none() {
 			self.give_unit(scope, span);
@@ -619,7 +654,7 @@ impl BodyBuilder<'_, '_> {
 		span: TextSpan,
 	) -> ExprIdx {
 		let Some(scope) = self.jump_target(label, span, Jump::Continue) else {
-			return self.body.push(ExprKind::Error, TypeIndex::NEVER, span);
+			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
 		self.body
 			.push(ExprKind::Continue { scope }, TypeIndex::NEVER, span)
@@ -634,8 +669,7 @@ impl BodyBuilder<'_, '_> {
 		let value = value.map(|value| {
 			let hint = self.scope_hint(ScopeIdx::ROOT);
 			let value = self.build(value, hint);
-			self.give(ScopeIdx::ROOT, value, false);
-			value
+			self.give(ScopeIdx::ROOT, value, false)
 		});
 		if value.is_none() {
 			self.give_unit(ScopeIdx::ROOT, span);
@@ -670,7 +704,14 @@ impl BodyBuilder<'_, '_> {
 					self.body.label(scope_label).name.inner == name.inner
 				}
 				(Some(_), None) => false,
-				(None, _) => kind == ScopeKind::Loop,
+				// A `break` leaves the nearest written `block` or loop, a
+				// `continue` the nearest loop.
+				(None, _) => match jump {
+					Jump::Break => {
+						matches!(kind, ScopeKind::Block | ScopeKind::Loop)
+					}
+					Jump::Continue => kind == ScopeKind::Loop,
+				},
 			};
 			if found {
 				if let (Some(name), Some(scope_label)) = (label, scope_label) {
@@ -719,7 +760,7 @@ impl BodyBuilder<'_, '_> {
 			}
 			(None, Jump::Break) => Diagnostic::error()
 				.with_code(DiagnosticCode::BreakOutsideOfLoop.code())
-				.with_message("`break` outside of a loop or labelled block")
+				.with_message("`break` outside of a loop or `block`")
 				.with_label(Label::primary(self.scope.file_id, span)),
 			(None, Jump::Continue) => Diagnostic::error()
 				.with_code(DiagnosticCode::ContinueOutsideOfLoop.code())
@@ -747,14 +788,20 @@ impl BodyBuilder<'_, '_> {
 	}
 
 	/// Holds `value`, given to `scope`, to its type, or settles the scope's
-	/// type on it when nothing is known yet. A `!` value settles nothing. An
-	/// untyped value settles it only for a block's result
-	/// (`allow_untyped`), which the context coerces later; a `break` or
-	/// `return` needs a type.
-	fn give(&mut self, scope: ScopeIdx, value: ExprIdx, allow_untyped: bool) {
+	/// type on it when nothing is known yet, and returns the node the scope
+	/// is given (`expect`'s). A `!` value settles nothing. An untyped value
+	/// settles it only for a block's result (`allow_untyped`), which the
+	/// context coerces later; a `break` or `return` needs a type.
+	#[must_use]
+	fn give(
+		&mut self,
+		scope: ScopeIdx,
+		value: ExprIdx,
+		allow_untyped: bool,
+	) -> ExprIdx {
 		let ty = self.body.ty(value);
 		if ty == TypeIndex::NEVER {
-			return;
+			return value;
 		}
 		let hint = self.scope_hint(scope);
 		let slot = &mut self.scope_types[usize::from(scope)];
@@ -762,15 +809,15 @@ impl BodyBuilder<'_, '_> {
 			if slot.ty == TypeIndex::INFER {
 				slot.ty = hint;
 			}
-			self.expect(value, hint);
-			return;
+			return self.expect(value, hint);
 		}
 		if self.sema.types.needs_context(ty) && !allow_untyped {
 			self.report_annotation_required(value);
 			self.scope_types[usize::from(scope)].ty = TypeIndex::ERROR;
-			return;
+			return value;
 		}
 		self.scope_types[usize::from(scope)].ty = ty;
+		value
 	}
 
 	/// `give` for a `()` with no node of its own: a block without a result,
@@ -790,6 +837,18 @@ impl BodyBuilder<'_, '_> {
 			self.context().mismatch_at(hint, TypeIndex::UNIT, span);
 		self.sema.diagnostics.push(diagnostic);
 	}
+}
+
+/// How control flows through a block's statements.
+#[derive(Clone, Copy)]
+enum StatementFlow {
+	/// It reaches past the last one, where the block's result or `()` is.
+	Convergent,
+	/// It never gets past one of type `!`.
+	Divergent,
+	/// Not known: one is an error, which might have been either (a jump
+	/// with no target, a misspelled call of a `-> !` function).
+	Unknown,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
