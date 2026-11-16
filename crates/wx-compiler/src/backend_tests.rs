@@ -112,9 +112,16 @@ impl Fixture {
 		self,
 		signature: mir::SignatureIndex,
 		root: mir::ExprId,
+		signatures: &mir::Signatures,
 	) -> mir::Function {
-		mir::body::verify(&self.body, root, &self.locals, self.label_count)
-			.expect("a fixture is a valid MIR arena");
+		mir::body::verify(
+			&self.body,
+			root,
+			&self.locals,
+			self.label_count,
+			signatures,
+		)
+		.expect("a fixture is a valid MIR arena");
 		mir::Function {
 			signature,
 			origin: mir::Origin::Defined(mir::Code {
@@ -173,7 +180,7 @@ fn scalar_function(
 	let mut signatures = mir::Signatures::default();
 	let signature = signatures.intern(&[i32_ty, i32_ty], &[i32_ty]);
 	module(
-		vec![fixture.finish(signature, root)],
+		vec![fixture.finish(signature, root, &signatures)],
 		signatures,
 		export(name),
 		Vec::new(),
@@ -262,7 +269,7 @@ fn direct_call_resolves_its_callee_by_id() {
 	let a = add.local(0, i32_ty);
 	let b = add.local(1, i32_ty);
 	let sum = add.binary(mir::BinaryOp::Add, a, b, i32_ty);
-	let add = add.finish(add_sig, sum);
+	let add = add.finish(add_sig, sum, &signatures);
 
 	// `triple(a) = add(add(a, a), a)`
 	let mut triple = Fixture::new(&[i32_ty]);
@@ -281,7 +288,7 @@ fn direct_call_resolves_its_callee_by_id() {
 	let inner = call_add(&mut triple, first, second);
 	let third = triple.local(0, i32_ty);
 	let outer = call_add(&mut triple, inner, third);
-	let triple = triple.finish(triple_sig, outer);
+	let triple = triple.finish(triple_sig, outer, &signatures);
 
 	let mir = module(
 		vec![add, triple],
@@ -338,7 +345,7 @@ fn mixed_identity_mir(
 	let root = body(&mut fixture, ty);
 	let signature = signatures.intern(&MIXED, &MIXED);
 	module(
-		vec![fixture.finish(signature, root)],
+		vec![fixture.finish(signature, root, &signatures)],
 		signatures,
 		export(name),
 		memories,
@@ -500,7 +507,7 @@ fn pack_join_mir(
 	let root = body(&mut fixture, pack);
 	let signature = signatures.intern(&params, &params[..3]);
 	module(
-		vec![fixture.finish(signature, root)],
+		vec![fixture.finish(signature, root, &signatures)],
 		signatures,
 		export(name),
 		Vec::new(),
@@ -682,7 +689,15 @@ fn flat_pack_crosses_a_loop_join() {
 
 		let body =
 			f.sequence([break_when_zero, bump_first_scalar, decrement_n], unit);
-		let looped = f.push(mir::ExprKind::Loop { label, body }, unit);
+		let looped = f.push(
+			mir::ExprKind::Loop {
+				label,
+				signature: mir::SignatureIndex::EMPTY,
+				entry: None,
+				body,
+			},
+			unit,
+		);
 		let result = pack_param(f, pack);
 		f.sequence([looped, result], pack)
 	});
@@ -752,7 +767,7 @@ fn set_locals_takes_one_result_of_a_call() {
 
 	let mut callee = Fixture::new(&[]);
 	let root = pack_literal(&mut callee, pack, PACK_INPUT);
-	let callee = callee.finish(callee_type, root);
+	let callee = callee.finish(callee_type, root, &signatures);
 
 	let mut run_fn = Fixture::new(&[i64_ty]);
 	let args = run_fn.body.push_list([]);
@@ -776,7 +791,7 @@ fn set_locals_takes_one_result_of_a_call() {
 	);
 	let get = run_fn.local(0, i64_ty);
 	let root = run_fn.sequence([set, get], i64_ty);
-	let run_fn = run_fn.finish(run_type, root);
+	let run_fn = run_fn.finish(run_type, root, &signatures);
 
 	let mir = module(
 		vec![callee, run_fn],
@@ -923,7 +938,15 @@ fn a_diverging_break_value_does_not_break() {
 			mir::ValueType::Never,
 		);
 		let body = f.sequence([leave], mir::ValueType::Never);
-		f.push(mir::ExprKind::Loop { label, body }, mir::ValueType::Never)
+		f.push(
+			mir::ExprKind::Loop {
+				label,
+				signature: mir::SignatureIndex::EMPTY,
+				entry: None,
+				body,
+			},
+			mir::ValueType::Never,
+		)
 	});
 
 	let (mut store, instance) = run(&mir, &interner);
@@ -1076,7 +1099,8 @@ fn divergent_argument_stops_the_call_and_later_arguments_but_closes_its_block()
 		.intern(&[mir::ValueType::I32; 3], &[mir::ValueType::I32]);
 	let mut callee = Fixture::new(&[mir::ValueType::I32; 3]);
 	let root = callee.local(0, mir::ValueType::I32);
-	mir.functions.push(callee.finish(signature, root));
+	mir.functions
+		.push(callee.finish(signature, root, &mir.signatures));
 	mir.function_flags.push(mir::FunctionFlags::empty());
 	let output = crate::codegen::Builder::build_linearized(&mir, &interner)
 		.unwrap()

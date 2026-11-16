@@ -20,9 +20,7 @@
 
 use std::collections::HashSet;
 
-use super::{
-	Body, ExprIdx, FunctionState, LocalRun, Lowerer, ScalarRange, mir,
-};
+use super::{Binding, Body, ExprIdx, FunctionState, Lowerer, ScalarRange, mir};
 use crate::ast::BinaryOp;
 use crate::diagnostics::TextSpan;
 use crate::tir::body::{
@@ -40,8 +38,8 @@ use crate::tir::types::{GenericArgs, Type, TypeIndex};
 /// separate type stack).
 #[derive(Clone, Copy)]
 struct Projection {
-	/// The locals of the stored value the projection is rooted in.
-	root: LocalRun,
+	/// Where the stored value the projection is rooted in is.
+	root: Binding,
 	range: ScalarRange,
 	ty: mir::ValueType,
 	/// Concrete: substituted with the instance's arguments where it was read.
@@ -81,7 +79,7 @@ impl Lowerer<'_> {
 			}
 			PatternKind::Bind(local) => {
 				let value = self.lower_expr(body, state, value)?;
-				let run = state.local_map[usize::from(local)];
+				let run = state.bindings[usize::from(local)].locals();
 				return Ok(self.write_locals(state, run, value));
 			}
 			_ => {}
@@ -291,7 +289,7 @@ impl Lowerer<'_> {
 						let subject = subject
 							.expect("a binding default has a stored scrutinee");
 						let bind = self.projection_value(state, subject);
-						let run = state.local_map[usize::from(local)];
+						let run = state.bindings[usize::from(local)].locals();
 						let set = self.write_locals(state, run, bind);
 						self.sequence(state, vec![set], value)
 					}
@@ -394,14 +392,14 @@ impl Lowerer<'_> {
 		let tir_ty = self.expr_ty(body, state, scrutinee);
 		let (root, prefix) = match body.kind(scrutinee) {
 			ExprKind::Local(local) => {
-				(state.local_map[usize::from(local)], Vec::new())
+				(state.bindings[usize::from(local)], Vec::new())
 			}
 			_ => {
 				let value = self.lower_expr(body, state, scrutinee)?;
 				#[cfg(debug_assertions)]
 				debug_assert_eq!(state.ty(value), ty);
 				let (set, root) = self.temporary(state, value);
-				(root, vec![set])
+				(Binding::Locals(root), vec![set])
 			}
 		};
 		let len = self.signatures.scalars(&ty).len() as u32;
@@ -771,7 +769,7 @@ impl Lowerer<'_> {
 			| PatternKind::Error => Ok(()),
 			PatternKind::Bind(local) => {
 				let value = self.projection_value(state, subject);
-				let run = state.local_map[usize::from(local)];
+				let run = state.bindings[usize::from(local)].locals();
 				out.push(self.write_locals(state, run, value));
 				Ok(())
 			}
@@ -951,8 +949,8 @@ impl Lowerer<'_> {
 		state: &mut FunctionState,
 		subject: Projection,
 	) -> mir::ExprId {
-		let run = subject.root.slice(subject.range);
-		self.read_locals(state, run, subject.ty)
+		let binding = subject.root.slice(subject.range);
+		self.read_binding(state, binding, subject.ty)
 	}
 
 	/// `subject == constant`, as a boolean.

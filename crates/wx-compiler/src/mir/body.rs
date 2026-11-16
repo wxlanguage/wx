@@ -12,7 +12,8 @@
 //! parent, since rewriting a node in place (inlining) breaks that.
 
 use super::{
-	FunctionId, GlobalId, Local, LocalIndex, MemoryId, StaticEntryId, ValueType,
+	FunctionId, GlobalId, Local, LocalIndex, MemoryId, SignatureIndex,
+	Signatures, StaticEntryId, ValueType,
 };
 use crate::index::index_newtype;
 
@@ -412,17 +413,33 @@ pub enum ExprKind {
 		label: LabelId,
 		statements: ExprList,
 	},
+	/// A Wasm `loop` of type `signature`, `[t*] -> []`: entered with
+	/// `entry`'s value as its parameters (none without one), evaluated
+	/// before the loop, outside its label. The body reads them as
+	/// `LoopParam`s, and its value is the next iteration's parameters:
+	/// falling off its end restarts the loop with it, as each `Continue`
+	/// does with its value. The node's own type is what its `Break`s give.
 	Loop {
 		label: LabelId,
+		signature: SignatureIndex,
+		entry: Option<ExprId>,
 		body: ExprId,
+	},
+	/// Scalar `index` of the parameters of the current iteration of the loop
+	/// `label`, inside its body: a value, read any number of times.
+	LoopParam {
+		label: LabelId,
+		index: u32,
 	},
 	Break {
 		label: LabelId,
 		value: Option<ExprId>,
 	},
-	/// Restart a loop; `label` is a `Loop`'s.
+	/// Restart a loop with `value` as its parameters (none without one);
+	/// `label` is a `Loop`'s.
 	Continue {
 		label: LabelId,
+		value: Option<ExprId>,
 	},
 	Return {
 		value: Option<ExprId>,
@@ -568,6 +585,7 @@ impl ExprKind {
 			| Self::Sequence { .. }
 			| Self::Block { .. }
 			| Self::Loop { .. }
+			| Self::LoopParam { .. }
 			| Self::Break { .. }
 			| Self::Continue { .. }
 			| Self::Return { .. }
@@ -617,17 +635,28 @@ impl ExprKind {
 				f(BodyId::Label(label));
 				f(BodyId::List(statements));
 			}
-			Self::Loop { label, body } => {
+			Self::Loop {
+				label, entry, body, ..
+			} => {
+				if let Some(entry) = entry {
+					f(BodyId::Expr(entry));
+				}
 				f(BodyId::Label(label));
 				f(BodyId::Expr(body));
 			}
+			Self::LoopParam { label, .. } => f(BodyId::Label(label)),
 			Self::Break { label, value } => {
 				if let Some(value) = value {
 					f(BodyId::Expr(value));
 				}
 				f(BodyId::Label(label));
 			}
-			Self::Continue { label } => f(BodyId::Label(label)),
+			Self::Continue { label, value } => {
+				if let Some(value) = value {
+					f(BodyId::Expr(value));
+				}
+				f(BodyId::Label(label));
+			}
 			Self::Return { value } => {
 				if let Some(value) = value {
 					f(BodyId::Expr(value));
@@ -700,6 +729,7 @@ impl ExprKind {
 			}
 			Self::Int { .. }
 			| Self::LocalGet { .. }
+			| Self::LoopParam { .. }
 			| Self::LocalSet { .. }
 			| Self::Global { .. }
 			| Self::GlobalSet { .. }
@@ -915,9 +945,14 @@ pub enum VerifyError {
 	Orphan { expr: ExprId },
 	/// A label owned by two nodes.
 	LabelOwnedTwice { label: LabelId },
-	/// A `Break` or `Continue` outside the node owning its label, or a
-	/// `Continue` of a `Block`'s label.
+	/// A `Break`, `Continue` or `LoopParam` outside the node owning its
+	/// label, or a `Continue` or `LoopParam` of a `Block`'s label.
 	BadTarget { expr: ExprId },
+	/// A loop whose signature has results, or a value given to a loop or
+	/// read from it that is not of its parameters' types: its entry's, its
+	/// body's, a `Continue`'s, a `LoopParam`'s; or an entry that never
+	/// arrives.
+	LoopType { expr: ExprId },
 	/// A local that is not one scalar: every local holds one Wasm value.
 	NonScalarLocal { local: LocalIndex },
 	/// An operation whose operand or result type its opcode or access does
@@ -927,14 +962,16 @@ pub enum VerifyError {
 
 /// Check `body`'s invariants from `root`: every local one scalar, every id in
 /// range, every node in the tree exactly once, every label owned by one
-/// `Block` or `Loop`, every `Break` and `Continue` inside the node owning
-/// its label (a `Continue`'s a `Loop`), and every operation's types ones its
-/// opcode takes.
+/// `Block` or `Loop`, every `Break`, `Continue` and `LoopParam` inside the
+/// node owning its label (a `Continue`'s and a `LoopParam`'s a `Loop`, after
+/// its entry), every value a loop takes or gives of its parameters' type, and
+/// every operation's types ones its opcode takes.
 pub fn verify(
 	body: &Body,
 	root: ExprId,
 	locals: &[Local],
 	label_count: u32,
+	signatures: &Signatures,
 ) -> Result<(), VerifyError> {
 	if let Some(local) = locals.iter().position(|local| !local.ty.is_scalar()) {
 		return Err(VerifyError::NonScalarLocal {
@@ -949,15 +986,28 @@ pub fn verify(
 	}
 	enum Step {
 		Enter(ExprId),
+		Open(LabelId),
 		Leave(LabelId),
 	}
 	let mut seen = vec![false; body.len()];
 	let mut owners = vec![Owner::None; label_count as usize];
 	let mut open = vec![false; label_count as usize];
+	// Each loop's signature, by its label.
+	let mut loops = vec![None; label_count as usize];
+	// Whether a value of `ty` is the parameters of a loop of `signature`,
+	// which a diverging one never gives.
+	let fits = |ty: ValueType, signature: SignatureIndex| {
+		ty == ValueType::Never
+			|| signatures.scalars(&ty) == signatures.params(signature)
+	};
 	let mut stack = vec![Step::Enter(root)];
 	while let Some(step) = stack.pop() {
 		let expr = match step {
 			Step::Enter(expr) => expr,
+			Step::Open(label) => {
+				open[usize::from(label)] = true;
+				continue;
+			}
 			Step::Leave(label) => {
 				open[usize::from(label)] = false;
 				continue;
@@ -1017,29 +1067,72 @@ pub fn verify(
 		if !operation_types_fit(body, expr) {
 			return Err(VerifyError::OpcodeType { expr });
 		}
+		let is_open_loop = |label: LabelId| {
+			let index = usize::from(label);
+			open[index] && owners[index] == Owner::Loop
+		};
 		match kind {
-			ExprKind::Block { label, .. } | ExprKind::Loop { label, .. } => {
+			ExprKind::Block { label, .. } => {
 				let index = usize::from(label);
 				if owners[index] != Owner::None {
 					return Err(VerifyError::LabelOwnedTwice { label });
 				}
-				owners[index] = if matches!(kind, ExprKind::Loop { .. }) {
-					Owner::Loop
-				} else {
-					Owner::Block
-				};
+				owners[index] = Owner::Block;
 				open[index] = true;
 				stack.push(Step::Leave(label));
+			}
+			// Its entry is outside its label; its body inside.
+			ExprKind::Loop {
+				label,
+				signature,
+				entry,
+				body: loop_body,
+			} => {
+				let index = usize::from(label);
+				if owners[index] != Owner::None {
+					return Err(VerifyError::LabelOwnedTwice { label });
+				}
+				owners[index] = Owner::Loop;
+				let entry_ty =
+					entry.map_or(ValueType::Unit, |entry| body.ty(entry));
+				if !signatures.results(signature).is_empty()
+					|| entry_ty == ValueType::Never
+					|| !fits(entry_ty, signature)
+					|| !fits(body.ty(loop_body), signature)
+				{
+					return Err(VerifyError::LoopType { expr });
+				}
+				loops[index] = Some(signature);
+				stack.extend([
+					Step::Leave(label),
+					Step::Enter(loop_body),
+					Step::Open(label),
+				]);
+				stack.extend(entry.map(Step::Enter));
+				continue;
 			}
 			ExprKind::Break { label, .. } => {
 				if !open[usize::from(label)] {
 					return Err(VerifyError::BadTarget { expr });
 				}
 			}
-			ExprKind::Continue { label } => {
-				let index = usize::from(label);
-				if !open[index] || owners[index] != Owner::Loop {
+			ExprKind::Continue { label, value } => {
+				if !is_open_loop(label) {
 					return Err(VerifyError::BadTarget { expr });
+				}
+				let ty = value.map_or(ValueType::Unit, |value| body.ty(value));
+				if !fits(ty, loops[usize::from(label)].unwrap()) {
+					return Err(VerifyError::LoopType { expr });
+				}
+			}
+			ExprKind::LoopParam { label, index } => {
+				if !is_open_loop(label) {
+					return Err(VerifyError::BadTarget { expr });
+				}
+				let signature = loops[usize::from(label)].unwrap();
+				let params = signatures.params(signature);
+				if params.get(index as usize) != Some(&body.ty(expr)) {
+					return Err(VerifyError::LoopType { expr });
 				}
 			}
 			_ => {}
@@ -1147,7 +1240,7 @@ mod tests {
 		);
 		let statements = body.push_list([set, get]);
 		let root = body.push(ExprKind::Sequence { statements }, ValueType::I32);
-		verify(&body, root, &locals(1), 0).unwrap();
+		verify(&body, root, &locals(1), 0, &Signatures::default()).unwrap();
 	}
 
 	#[test]
@@ -1163,7 +1256,7 @@ mod tests {
 			ValueType::I32,
 		);
 		assert!(matches!(
-			verify(&body, root, &[], 0),
+			verify(&body, root, &[], 0, &Signatures::default()),
 			Err(VerifyError::Shared { .. })
 		));
 	}
@@ -1182,7 +1275,7 @@ mod tests {
 			ValueType::F32,
 		);
 		assert!(matches!(
-			verify(&body, root, &[], 0),
+			verify(&body, root, &[], 0, &Signatures::default()),
 			Err(VerifyError::OpcodeType { .. })
 		));
 	}
@@ -1193,7 +1286,7 @@ mod tests {
 		int(&mut body, 1);
 		let root = int(&mut body, 2);
 		assert!(matches!(
-			verify(&body, root, &[], 0),
+			verify(&body, root, &[], 0, &Signatures::default()),
 			Err(VerifyError::Orphan { .. })
 		));
 	}
@@ -1216,7 +1309,7 @@ mod tests {
 		let root =
 			body.push(ExprKind::Sequence { statements }, ValueType::Never);
 		assert!(matches!(
-			verify(&body, root, &[], 1),
+			verify(&body, root, &[], 1, &Signatures::default()),
 			Err(VerifyError::BadTarget { .. })
 		));
 	}
@@ -1225,12 +1318,13 @@ mod tests {
 	fn a_continue_of_a_blocks_label_has_a_bad_target() {
 		let mut body = Body::default();
 		let label = LabelId::new(0);
-		let restart = body.push(ExprKind::Continue { label }, ValueType::Never);
+		let restart = body
+			.push(ExprKind::Continue { label, value: None }, ValueType::Never);
 		let statements = body.push_list([restart]);
 		let root =
 			body.push(ExprKind::Block { label, statements }, ValueType::Never);
 		assert!(matches!(
-			verify(&body, root, &[], 1),
+			verify(&body, root, &[], 1, &Signatures::default()),
 			Err(VerifyError::BadTarget { .. })
 		));
 	}
@@ -1247,10 +1341,17 @@ mod tests {
 			},
 			ValueType::Unit,
 		);
-		let root =
-			body.push(ExprKind::Loop { label, body: inner }, ValueType::Never);
+		let root = body.push(
+			ExprKind::Loop {
+				label,
+				signature: SignatureIndex::EMPTY,
+				entry: None,
+				body: inner,
+			},
+			ValueType::Never,
+		);
 		assert!(matches!(
-			verify(&body, root, &[], 1),
+			verify(&body, root, &[], 1, &Signatures::default()),
 			Err(VerifyError::LabelOwnedTwice { .. })
 		));
 	}
@@ -1265,7 +1366,7 @@ mod tests {
 			ValueType::I32,
 		);
 		assert!(matches!(
-			verify(&body, root, &locals(1), 0),
+			verify(&body, root, &locals(1), 0, &Signatures::default()),
 			Err(VerifyError::OutOfRange { .. })
 		));
 	}

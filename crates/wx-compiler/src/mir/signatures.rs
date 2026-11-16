@@ -2,7 +2,8 @@
 //! entry is its parameters and then its results, every one a scalar, as one
 //! run of a shared column. A function's type is one; so is a multi-result
 //! type ([`ValueType::Aggregate`]), with no parameters, as a Wasm block
-//! yielding several values is typed by a signature `[] -> [t*]`.
+//! yielding several values is typed by a signature `[] -> [t*]`; and so is a
+//! loop's, `[t*] -> []`, its parameters.
 //!
 //! The table is interned by content, so equal lists are one entry and two
 //! source types with the same scalars are one MIR type.
@@ -23,7 +24,6 @@ struct Signature {
 	len: u32,
 }
 
-#[derive(Default)]
 pub struct Signatures {
 	entries: Vec<Signature>,
 	items: Vec<ValueType>,
@@ -31,6 +31,20 @@ pub struct Signatures {
 	/// compared in place in `items`.
 	lookup: HashTable<SignatureIndex>,
 	hasher: FxBuildHasher,
+}
+
+impl Default for Signatures {
+	fn default() -> Self {
+		let mut signatures = Self {
+			entries: Vec::new(),
+			items: Vec::new(),
+			lookup: HashTable::new(),
+			hasher: FxBuildHasher,
+		};
+		let empty = signatures.intern(&[], &[]);
+		debug_assert_eq!(empty, SignatureIndex::EMPTY);
+		signatures
+	}
 }
 
 impl Signatures {

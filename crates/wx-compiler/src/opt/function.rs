@@ -31,6 +31,7 @@ pub fn optimize_function(mir: &mut MIR, id: FunctionId) {
 		code.root,
 		&code.locals,
 		code.label_count,
+		&mir.signatures,
 	)
 	.expect("emitted MIR has valid ownership, locals and labels");
 	*mir.functions[usize::from(id)].code_mut().unwrap() = code;

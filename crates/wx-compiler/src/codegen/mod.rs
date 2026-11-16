@@ -908,7 +908,7 @@ impl Builder {
 			wasm::BlockType::Empty => sink.push(0x40),
 			wasm::BlockType::Value(vt) => vt.encode(sink),
 			// A type index, as a positive `s33`.
-			wasm::BlockType::Results(signature) => {
+			wasm::BlockType::Signature(signature) => {
 				let index = self.register_signature(&mir.signatures, signature);
 				i64::from(index.0).encode(sink);
 			}

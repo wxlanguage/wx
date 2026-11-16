@@ -6,7 +6,8 @@ use super::{
 	RegionKind, TrappingOp, ValuePlacement,
 };
 use crate::mir::{
-	self, ExprId, ExprKind, FunctionId, LabelId, LocalIndex, MIR, ValueType,
+	self, ExprId, ExprKind, FunctionId, LabelId, LocalIndex, MIR,
+	SignatureIndex, ValueType,
 };
 use crate::wasm::ScalarType;
 
@@ -522,8 +523,17 @@ impl Emitter<'_> {
 			ValueType::Unit
 		};
 		if matches!(kind, RegionKind::Loop { .. }) {
+			// Its header's values are in locals: it takes no parameters.
 			let label = self.ensure_label(id);
-			self.body.push(ExprKind::Loop { label, body: inner }, ty)
+			self.body.push(
+				ExprKind::Loop {
+					label,
+					signature: SignatureIndex::EMPTY,
+					entry: None,
+					body: inner,
+				},
+				ty,
+			)
 		} else if let Some(label) = self.region_labels[usize::from(id)] {
 			// Every possible branch from a descendant has already been emitted.
 			// An owner without a label needs no wrapper.
@@ -803,6 +813,7 @@ impl Emitter<'_> {
 				let transfer =
 					match self.join_targets[usize::from(join)].unwrap() {
 						JoinTarget::LoopHeader(owner) => ExprKind::Continue {
+							value: None,
 							label: self.ensure_label(owner),
 						},
 						JoinTarget::Exit(owner) => ExprKind::Break {

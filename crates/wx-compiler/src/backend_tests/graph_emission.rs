@@ -248,8 +248,8 @@ fn partial_call_results(name: SymbolU32, counter_name: SymbolU32) -> mir::MIR {
 	let root = caller.sequence([ignored, capture, sum], T::I64);
 	let mut mir = module(
 		vec![
-			caller.finish(caller_signature, root),
-			callee.finish(callee_signature, callee_root),
+			caller.finish(caller_signature, root, &signatures),
+			callee.finish(callee_signature, callee_root, &signatures),
 		],
 		signatures,
 		export(name),
@@ -381,7 +381,7 @@ fn trapping_conversions_keep_their_destination_type() {
 			T::I32,
 		);
 		let mir = module(
-			vec![f.finish(signature, root)],
+			vec![f.finish(signature, root, &signatures)],
 			signatures,
 			export(name),
 			Vec::new(),
@@ -453,7 +453,7 @@ fn typed_operations_and_float_leaves_survive_multi_value_returns() {
 		let values = f.body.push_list([comparison, negation, wrap, zero, bits]);
 		let root = f.push(E::Values { values }, aggregate);
 		let mir = module(
-			vec![f.finish(signature, root)],
+			vec![f.finish(signature, root, &signatures)],
 			signatures,
 			export(name),
 			Vec::new(),
@@ -496,8 +496,8 @@ fn a_diverging_call_gets_an_explicit_unreachable_boundary() {
 	let trap = callee.unreachable();
 	let mir = module(
 		vec![
-			caller.finish(caller_signature, call),
-			callee.finish(callee_signature, trap),
+			caller.finish(caller_signature, call, &signatures),
+			callee.finish(callee_signature, trap, &signatures),
 		],
 		signatures,
 		export(name),
@@ -520,7 +520,7 @@ fn empty_and_zero_initialized_values_need_no_computation_locals() {
 		let mut f = Fixture::new(&[]);
 		let root = f.push(E::Noop, T::Unit);
 		let mir = module(
-			vec![f.finish(signature, root)],
+			vec![f.finish(signature, root, &signatures)],
 			signatures,
 			export(name),
 			Vec::new(),
@@ -536,7 +536,7 @@ fn empty_and_zero_initialized_values_need_no_computation_locals() {
 		let mut f = Fixture::new(&[T::I64]);
 		let root = f.local(0, T::I64);
 		let mut mir = module(
-			vec![f.finish(signature, root)],
+			vec![f.finish(signature, root, &signatures)],
 			signatures,
 			export(name),
 			Vec::new(),
@@ -811,7 +811,15 @@ fn mixed_scalar_values_cross_all_construct_exit_joins() {
 						let statements = f.body.push_list([exit]);
 						f.push(E::Block { label, statements }, pack)
 					} else {
-						f.push(E::Loop { label, body: exit }, pack)
+						f.push(
+							E::Loop {
+								label,
+								signature: mir::SignatureIndex::EMPTY,
+								entry: None,
+								body: exit,
+							},
+							pack,
+						)
 					}
 				}
 				_ => {

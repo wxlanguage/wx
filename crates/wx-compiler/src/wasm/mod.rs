@@ -166,11 +166,16 @@ pub enum Instruction {
 #[cfg_attr(test, derive(Debug))]
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 #[derive(Clone, Copy)]
+/// A structured instruction's function type, `[t1*] -> [t2*]`: what it takes
+/// from the stack, which a `br` to a `loop` carries, and what it leaves.
 pub enum BlockType {
+	/// `[] -> []`.
 	Empty,
+	/// `[] -> [t]`.
 	Value(ScalarType),
-	/// Several results: the signature's, which has no parameters.
-	Results(mir::SignatureIndex),
+	/// Any other, by its signature: a block's `[] -> [t*]`, a loop's
+	/// `[t*] -> []`.
+	Signature(mir::SignatureIndex),
 }
 
 // ── Local coalescing ──────────────────────────────────────────────────────────

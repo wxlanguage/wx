@@ -4,7 +4,10 @@
 //!
 //! - a `Loop` that something leaves is a `block` around a `loop`, its label
 //!   both: a `Break` exits the `block`, a `Continue` restarts the `loop`, and
-//!   a body that falls off its end restarts it (`br 0`);
+//!   a body that falls off its end restarts it (`br 0`). Its entry is
+//!   evaluated in the `block`, before the `loop` that takes it as its
+//!   parameters, and the body starts by setting them into locals of their
+//!   own, which each `LoopParam` reads;
 //! - a `Switch` is a `br_table` over nested blocks when [`uses_br_table`],
 //!   else a chain of `if`s comparing the selector, kept in its own local
 //!   when more than one comparison reads it;
@@ -89,6 +92,7 @@ enum Task {
 		expression: ExprId,
 		count: u32,
 	},
+	OpenLoop(ExprId),
 	FinishLoop(ExprId),
 	Branch {
 		body: ExprId,
@@ -112,11 +116,12 @@ enum Task {
 }
 
 /// A loop's continue target is its loop frame; its break target is the
-/// surrounding block, one frame earlier.
+/// surrounding block, one frame earlier. `params` is the first of the locals
+/// its parameters are set into.
 #[derive(Clone, Copy)]
 enum Label {
 	Block(u32),
-	Loop(u32),
+	Loop { frame: u32, params: u32 },
 }
 
 impl<'a> Linearizer<'a> {
@@ -146,7 +151,9 @@ impl<'a> Linearizer<'a> {
 	fn block_type(&self, ty: ValueType) -> BlockType {
 		match ty {
 			ValueType::Unit | ValueType::Never => BlockType::Empty,
-			ValueType::Aggregate { signature } => BlockType::Results(signature),
+			ValueType::Aggregate { signature } => {
+				BlockType::Signature(signature)
+			}
 			ty => BlockType::Value(scalar(ty)),
 		}
 	}
@@ -230,6 +237,7 @@ impl<'a> Linearizer<'a> {
 					}
 					self.after_structured(self.ty(expression));
 				}
+				Task::OpenLoop(expression) => self.open_loop(expression),
 				Task::FinishLoop(expression) => {
 					let ExprKind::Loop { body, .. } =
 						self.body.kind(expression)
@@ -237,8 +245,8 @@ impl<'a> Linearizer<'a> {
 						unreachable!("a loop continuation requires a loop")
 					};
 					let ty = self.ty(expression);
+					// The body's value is the next iteration's parameters.
 					if !self.diverges(body) {
-						self.drop_values(self.ty(body));
 						self.push(Instruction::Br(0));
 					}
 					self.close();
@@ -390,12 +398,12 @@ impl<'a> Linearizer<'a> {
 					next: 0,
 				});
 			}
-			ExprKind::Break { value, .. } | ExprKind::Return { value } => {
-				match value {
-					Some(value) => self.schedule_operands([value], expr),
-					None => self.tasks.push(Task::AfterOperands(expr)),
-				}
-			}
+			ExprKind::Break { value, .. }
+			| ExprKind::Continue { value, .. }
+			| ExprKind::Return { value } => match value {
+				Some(value) => self.schedule_operands([value], expr),
+				None => self.tasks.push(Task::AfterOperands(expr)),
+			},
 			ExprKind::Sequence { .. } => {
 				self.tasks.push(Task::Statements {
 					expression: expr,
@@ -416,18 +424,14 @@ impl<'a> Linearizer<'a> {
 					next: 0,
 				});
 			}
-			ExprKind::Loop { label, body } => {
+			ExprKind::Loop { entry, .. } => {
 				if ty != ValueType::Never {
 					self.open(Instruction::Block {
 						ty: self.block_type(ty),
 					});
 				}
-				let frame = self.open(Instruction::Loop {
-					ty: BlockType::Empty,
-				});
-				self.labels[usize::from(label)] = Label::Loop(frame);
-				self.tasks.push(Task::FinishLoop(expr));
-				self.tasks.push(Task::Expr(body));
+				self.tasks.push(Task::OpenLoop(expr));
+				self.tasks.extend(entry.map(Task::Expr));
 			}
 			ExprKind::IfElse { condition, .. } => {
 				self.schedule_operands([condition], expr)
@@ -467,8 +471,8 @@ impl<'a> Linearizer<'a> {
 			| ExprKind::Int { .. }
 			| ExprKind::Float { .. }
 			| ExprKind::LocalGet { .. }
+			| ExprKind::LoopParam { .. }
 			| ExprKind::Global { .. }
-			| ExprKind::Continue { .. }
 			| ExprKind::DataEnd { .. }
 			| ExprKind::MemoryIndex { .. }
 			| ExprKind::MemorySize { .. }
@@ -495,6 +499,14 @@ impl<'a> Linearizer<'a> {
 			}),
 			ExprKind::LocalGet { local } => {
 				self.push(Instruction::LocalGet(u32::from(local)))
+			}
+			ExprKind::LoopParam { label, index } => {
+				let Label::Loop { params, .. } =
+					self.labels[usize::from(label)]
+				else {
+					unreachable!("a LoopParam of a Block's label")
+				};
+				self.push(Instruction::LocalGet(params + index))
 			}
 			ExprKind::LocalSet { local, .. } => {
 				self.push(Instruction::LocalSet(u32::from(local)))
@@ -530,12 +542,13 @@ impl<'a> Linearizer<'a> {
 			ExprKind::Break { label, .. } => {
 				let frame = match self.labels[usize::from(label)] {
 					Label::Block(frame) => frame,
-					Label::Loop(frame) => frame - 1,
+					Label::Loop { frame, .. } => frame - 1,
 				};
 				self.push(Instruction::Br(self.branch_depth(frame)));
 			}
-			ExprKind::Continue { label } => {
-				let Label::Loop(frame) = self.labels[usize::from(label)] else {
+			ExprKind::Continue { label, .. } => {
+				let Label::Loop { frame, .. } = self.labels[usize::from(label)]
+				else {
 					unreachable!("a Continue of a Block's label")
 				};
 				self.push(Instruction::Br(self.branch_depth(frame)));
@@ -651,6 +664,41 @@ impl<'a> Linearizer<'a> {
 				unreachable!("structured bodies have explicit closing tasks")
 			}
 		}
+	}
+
+	/// The `loop` of a `Loop` whose entry, if any, is on the stack: it takes
+	/// it as its parameters, which the body first sets into locals of their
+	/// own, the last one first.
+	fn open_loop(&mut self, expression: ExprId) {
+		let ExprKind::Loop {
+			label,
+			signature,
+			body,
+			..
+		} = self.body.kind(expression)
+		else {
+			unreachable!("a loop opening requires a loop")
+		};
+		let scalars = self.mir.signatures.params(signature);
+		let frame = self.open(Instruction::Loop {
+			ty: match scalars {
+				[] => BlockType::Empty,
+				_ => BlockType::Signature(signature),
+			},
+		});
+		let first = self.function.locals.len() as u32;
+		for &ty in scalars {
+			self.function.locals.push(Local { ty: scalar(ty) });
+		}
+		for local in (first..self.function.locals.len() as u32).rev() {
+			self.push(Instruction::LocalSet(local));
+		}
+		self.labels[usize::from(label)] = Label::Loop {
+			frame,
+			params: first,
+		};
+		self.tasks.push(Task::FinishLoop(expression));
+		self.tasks.push(Task::Expr(body));
 	}
 
 	fn drop_values(&mut self, ty: ValueType) {

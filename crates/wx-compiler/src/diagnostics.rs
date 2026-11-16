@@ -223,7 +223,7 @@ define_diagnostic_codes! {
 		CyclicImport => "E2094",
 		PrivateReexport => "E2095",
 		CyclicTypeAlias => "E2096",
-		DuplicateFunctionParameter => "E2097",
+		DuplicateParameter => "E2097",
 		SelfParamPosition => "E2098",
 		MissingGlobalType => "E2100",
 		CyclicAssociatedType => "E2102",
@@ -265,6 +265,7 @@ define_diagnostic_codes! {
 		MutableEnumRepr => "E2141",
 		EnumConstructedFromRepr => "E2142",
 		TestInEnumRepr => "E2143",
+		NamedListWithoutNames => "E2144",
 	}
 }
 

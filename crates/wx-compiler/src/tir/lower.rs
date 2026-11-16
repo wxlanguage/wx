@@ -47,7 +47,7 @@ use string_interner::symbol::{Symbol, SymbolU32};
 
 use super::body::{
 	Body, ElementOrder, ExprIdx, ExprKind, FunctionImplementation, PatIdx,
-	ScopeIdx,
+	ScopeIdx, ScopeKind,
 };
 use super::bounds::AssumptionEnvIdx;
 use super::decls::{
@@ -142,6 +142,49 @@ impl LocalRun {
 	}
 }
 
+/// What a source local is bound to in MIR: its locals, or, for an immutable
+/// slot of a loop's state, the loop's parameters, read where they are used.
+#[derive(Clone, Copy)]
+enum Binding {
+	Locals(LocalRun),
+	LoopParams {
+		label: mir::LabelId,
+		range: ScalarRange,
+	},
+}
+
+impl Binding {
+	const EMPTY: Self = Self::Locals(LocalRun::EMPTY);
+
+	/// The scalars in `range`, a field's.
+	fn slice(self, range: ScalarRange) -> Self {
+		match self {
+			Self::Locals(run) => Self::Locals(run.slice(range)),
+			Self::LoopParams { label, range: all } => {
+				assert!(
+					range.start + range.len <= all.len,
+					"a field is inside its value"
+				);
+				Self::LoopParams {
+					label,
+					range: ScalarRange::new(all.start + range.start, range.len),
+				}
+			}
+		}
+	}
+
+	/// The locals a write stores in. A loop's parameters are immutable: the
+	/// checker lets no write reach one.
+	fn locals(self) -> LocalRun {
+		match self {
+			Self::Locals(run) => run,
+			Self::LoopParams { .. } => {
+				unreachable!("a loop's parameter is never written")
+			}
+		}
+	}
+}
+
 /// What one function's lowering keeps outside the shared [`Lowerer`].
 struct FunctionState {
 	file_id: FileId,
@@ -154,8 +197,8 @@ struct FunctionState {
 	/// The instance being lowered, which a call in its body records as the
 	/// callee's caller.
 	instance: FunctionInstance,
-	/// `body.locals()[i]` in the MIR locals it was assigned.
-	local_map: Vec<LocalRun>,
+	/// What `body.locals()[i]` is bound to.
+	bindings: Vec<Binding>,
 	/// MIR locals, each one scalar: the declared parameters' first (an
 	/// unnamed one's too, so the parameters stay positional), then every
 	/// remaining source local's, then temporaries.
@@ -608,6 +651,7 @@ impl<'a> Lowerer<'a> {
 				root,
 				&state.locals,
 				state.label_count,
+				&self.signatures,
 			) {
 			panic!("lowering broke the MIR arena's invariants: {error:?}");
 		}
@@ -659,7 +703,7 @@ impl<'a> Lowerer<'a> {
 				.type_params,
 			args: Box::default(),
 			instance,
-			local_map: Vec::new(),
+			bindings: Vec::new(),
 			locals: Vec::new(),
 			mir_body: mir::Body::default(),
 			labels: Vec::new(),
@@ -683,9 +727,13 @@ impl<'a> Lowerer<'a> {
 			result_type,
 		)?;
 		if cfg!(debug_assertions)
-			&& let Err(error) =
-				mir::body::verify(&state.mir_body, root, &state.locals, 0)
-		{
+			&& let Err(error) = mir::body::verify(
+				&state.mir_body,
+				root,
+				&state.locals,
+				0,
+				&self.signatures,
+			) {
 			panic!("lowering broke the MIR arena's invariants: {error:?}");
 		}
 		debug_assert_eq!(usize::from(id), self.functions.len());
@@ -1057,7 +1105,7 @@ impl<'a> Lowerer<'a> {
 			env,
 			args,
 			instance,
-			local_map: vec![LocalRun::EMPTY; body.locals().len()],
+			bindings: vec![Binding::EMPTY; body.locals().len()],
 			locals: Vec::new(),
 			mir_body: mir::Body::default(),
 			labels: vec![None; body.scope_count()],
@@ -1076,16 +1124,40 @@ impl<'a> Lowerer<'a> {
 				mir::Mutability::Immutable,
 			);
 			if let Some(local) = binding {
-				state.local_map[usize::from(*local)] = run;
+				state.bindings[usize::from(*local)] = Binding::Locals(run);
 			}
 		}
-		// Every non-parameter local, in declaration order.
+		// An immutable slot of a loop's state is the loop's parameters; a
+		// `mut` one is a local of its own, set from them.
+		let mut in_params = vec![false; body.locals().len()];
+		for scope in (0..body.scope_count() as u32).map(ScopeIdx::new) {
+			if body.scope(scope).kind != ScopeKind::Loop {
+				continue;
+			}
+			let mut start = 0;
+			for slot in body.scope_locals(scope) {
+				let local = body.local(slot);
+				let ty = self.substitute(local.ty, env, &state.args);
+				let ty = self.lower_type(ty, file_id, local.name.span)?;
+				let len = self.signatures.scalars(&ty).len() as u32;
+				if local.mut_span.is_none() {
+					let label = state.label(scope);
+					let range = ScalarRange::new(start, len);
+					state.bindings[usize::from(slot)] =
+						Binding::LoopParams { label, range };
+					in_params[usize::from(slot)] = true;
+				}
+				start += len;
+			}
+		}
+		// Every other local, in declaration order.
 		for (tir_index, local) in body.locals().iter().enumerate() {
-			if body
-				.params()
-				.iter()
-				.flatten()
-				.any(|&p| usize::from(p) == tir_index)
+			if in_params[tir_index]
+				|| body
+					.params()
+					.iter()
+					.flatten()
+					.any(|&p| usize::from(p) == tir_index)
 			{
 				continue;
 			}
@@ -1096,8 +1168,8 @@ impl<'a> Lowerer<'a> {
 			} else {
 				mir::Mutability::Immutable
 			};
-			state.local_map[tir_index] =
-				self.push_locals(&mut state, ty, mutability);
+			state.bindings[tir_index] =
+				Binding::Locals(self.push_locals(&mut state, ty, mutability));
 		}
 
 		let root = self.lower_expr(body, &mut state, body.root())?;
@@ -1153,8 +1225,8 @@ impl<'a> Lowerer<'a> {
 				Ok(state.push(mir::ExprKind::Float { value }, ty))
 			}
 			ExprKind::Local(local) => {
-				let run = state.local_map[usize::from(local)];
-				Ok(self.read_locals(state, run, ty))
+				let binding = state.bindings[usize::from(local)];
+				Ok(self.read_binding(state, binding, ty))
 			}
 			ExprKind::PrimitiveUnary { op, operand } => {
 				if ty == mir::ValueType::Never {
@@ -1305,29 +1377,11 @@ impl<'a> Lowerer<'a> {
 				// scope its label if it needs one.
 				Ok(state.block(scope, lowered, ty))
 			}
-			ExprKind::Loop { scope, statements } => {
-				// A loop always owns a label: `opt` builds it as a loop
-				// block, which `break` leaves and `continue` restarts.
-				let label = state.label(scope);
-				let mut lowered = Vec::new();
-				for &statement in body.args(statements) {
-					lowered.push(self.lower_expr(body, state, statement)?);
-				}
-				// A body runs repeatedly and yields nothing; only a `break`
-				// leaves the loop with a value.
-				let statements = state.list(lowered);
-				let loop_body = state.push(
-					mir::ExprKind::Sequence { statements },
-					mir::ValueType::Unit,
-				);
-				Ok(state.push(
-					mir::ExprKind::Loop {
-						label,
-						body: loop_body,
-					},
-					ty,
-				))
-			}
+			ExprKind::Loop {
+				scope,
+				first,
+				body: loop_body,
+			} => self.lower_loop(body, state, scope, first, loop_body, ty),
 			ExprKind::Break { scope, value } => {
 				let value = match value {
 					Some(value) => Some(self.lower_expr(body, state, value)?),
@@ -1336,9 +1390,19 @@ impl<'a> Lowerer<'a> {
 				let label = state.label(scope);
 				Ok(state.push(mir::ExprKind::Break { label, value }, ty))
 			}
-			ExprKind::Continue { scope } => {
+			ExprKind::Continue { scope, value } => {
+				let value = match value {
+					Some(value) => {
+						let value = self.lower_expr(body, state, value)?;
+						if state.ty(value) == mir::ValueType::Never {
+							return Ok(value);
+						}
+						Some(value)
+					}
+					None => None,
+				};
 				let label = state.label(scope);
-				Ok(state.push(mir::ExprKind::Continue { label }, ty))
+				Ok(state.push(mir::ExprKind::Continue { label, value }, ty))
 			}
 			ExprKind::IfElse {
 				condition,
@@ -1678,6 +1742,34 @@ impl<'a> Lowerer<'a> {
 		}
 	}
 
+	/// The value of type `ty` a local is bound to: its locals', or its
+	/// loop's parameters', each a `LoopParam`.
+	fn read_binding(
+		&self,
+		state: &mut FunctionState,
+		binding: Binding,
+		ty: mir::ValueType,
+	) -> mir::ExprId {
+		let (label, range) = match binding {
+			Binding::Locals(run) => return self.read_locals(state, run, ty),
+			Binding::LoopParams { label, range } => (label, range),
+		};
+		let params: Vec<_> = (range.start..range.start + range.len)
+			.zip(self.signatures.scalars(&ty))
+			.map(|(index, &scalar)| {
+				state.push(mir::ExprKind::LoopParam { label, index }, scalar)
+			})
+			.collect();
+		match *params {
+			[] => state.push(mir::ExprKind::Noop, ty),
+			[param] => param,
+			_ => {
+				let values = state.list(params);
+				state.push(mir::ExprKind::Values { values }, ty)
+			}
+		}
+	}
+
 	/// Store `value` in `run`, one result per local: a `LocalSet` of its
 	/// one local, or a `SetLocals` of each. A zero-sized value is only
 	/// evaluated.
@@ -1705,6 +1797,80 @@ impl<'a> Lowerer<'a> {
 				)
 			}
 		}
+	}
+
+	/// `loop (slots) = first { body }` as a Wasm `loop` taking the state as
+	/// its parameters: `first` is its entry, and the body's result, the next
+	/// state, what it restarts with. An immutable slot is read as the
+	/// parameters where it is used; a `mut` one is set from them first.
+	fn lower_loop(
+		&mut self,
+		body: &Body,
+		state: &mut FunctionState,
+		scope: ScopeIdx,
+		first: Option<ExprIdx>,
+		loop_body: ExprIdx,
+		ty: mir::ValueType,
+	) -> Result<mir::ExprId, ()> {
+		let entry = match first {
+			Some(first) => {
+				let entry = self.lower_expr(body, state, first)?;
+				// A first state that never arrives never starts the loop.
+				if state.ty(entry) == mir::ValueType::Never {
+					return Ok(entry);
+				}
+				Some(entry)
+			}
+			None => None,
+		};
+		let params =
+			entry.map_or(mir::ValueType::Unit, |entry| state.ty(entry));
+		let params = self.signatures.scalars(&params).to_vec();
+		let signature = self.signatures.intern(&params, &[]);
+		let label = state.label(scope);
+		let ExprKind::Block {
+			statements, result, ..
+		} = body.kind(loop_body)
+		else {
+			unreachable!("a loop's body is a block");
+		};
+		let body_ty = self.expr_ty(body, state, loop_body);
+		let body_ty =
+			self.lower_type(body_ty, state.file_id, body.span(loop_body))?;
+		let mut lowered = Vec::new();
+		let mut start = 0;
+		for slot in body.scope_locals(scope) {
+			let local = body.local(slot);
+			let slot_ty = self.substitute(local.ty, state.env, &state.args);
+			let slot_ty =
+				self.lower_type(slot_ty, state.file_id, local.name.span)?;
+			let len = self.signatures.scalars(&slot_ty).len() as u32;
+			if let Binding::Locals(run) = state.bindings[usize::from(slot)] {
+				let range = ScalarRange::new(start, len);
+				let params = Binding::LoopParams { label, range };
+				let value = self.read_binding(state, params, slot_ty);
+				lowered.push(self.write_locals(state, run, value));
+			}
+			start += len;
+		}
+		for &statement in body.args(statements) {
+			lowered.push(self.lower_expr(body, state, statement)?);
+		}
+		if let Some(result) = result {
+			lowered.push(self.lower_expr(body, state, result)?);
+		}
+		let statements = state.list(lowered);
+		let loop_body =
+			state.push(mir::ExprKind::Sequence { statements }, body_ty);
+		Ok(state.push(
+			mir::ExprKind::Loop {
+				label,
+				signature,
+				entry,
+				body: loop_body,
+			},
+			ty,
+		))
 	}
 
 	/// Lower a call's argument value into one MIR argument per parameter, in
@@ -1902,8 +2068,8 @@ impl<'a> Lowerer<'a> {
 			root = object;
 		}
 		if matches!(body.kind(root), ExprKind::Local(_)) {
-			let run = self.local_projection(body, state, expr)?;
-			return Ok(self.read_locals(state, run, ty));
+			let binding = self.local_projection(body, state, expr)?;
+			return Ok(self.read_binding(state, binding, ty));
 		}
 		let object_value = self.lower_expr(body, state, object)?;
 		if state.ty(object_value) == mir::ValueType::Never {
@@ -1926,15 +2092,15 @@ impl<'a> Lowerer<'a> {
 	}
 
 	/// A local field path has no address computation or runtime receiver:
-	/// it is the locals of the field's scalars.
+	/// it is where the field's scalars are.
 	fn local_projection(
 		&mut self,
 		body: &Body,
 		state: &FunctionState,
 		target: ExprIdx,
-	) -> Result<LocalRun, ()> {
+	) -> Result<Binding, ()> {
 		match body.kind(target) {
-			ExprKind::Local(local) => Ok(state.local_map[usize::from(local)]),
+			ExprKind::Local(local) => Ok(state.bindings[usize::from(local)]),
 			ExprKind::FieldAccess { object, field } => {
 				let parent = self.local_projection(body, state, object)?;
 				let object_ty = self.expr_ty(body, state, object);
@@ -1967,8 +2133,8 @@ impl<'a> Lowerer<'a> {
 		target: ExprIdx,
 		ty: mir::ValueType,
 	) -> Result<mir::ExprId, ()> {
-		let run = self.local_projection(body, state, target)?;
-		Ok(self.read_locals(state, run, ty))
+		let binding = self.local_projection(body, state, target)?;
+		Ok(self.read_binding(state, binding, ty))
 	}
 
 	/// Store `value`, already evaluated, into an assignment target. The
@@ -1980,7 +2146,7 @@ impl<'a> Lowerer<'a> {
 		target: ExprIdx,
 		value: mir::ExprId,
 	) -> Result<mir::ExprId, ()> {
-		let run = self.local_projection(body, state, target)?;
+		let run = self.local_projection(body, state, target)?.locals();
 		Ok(self.write_locals(state, run, value))
 	}
 
@@ -7290,6 +7456,163 @@ mod tests {
 		assert_eq!(run.call(&mut store, 0).unwrap(), 7);
 	}
 
+	// ── loop state ───────────────────────────────────────────────────────
+
+	/// Lowered MIR for `source`, which must check.
+	fn lowered(source: &str) -> (mir::MIR, crate::ast::StringInterner) {
+		let mut strings = crate::symbols::Keyword::create_interner();
+		let graph =
+			crate::tir::signatures::tests::source_graph(source, &mut strings);
+		let mut sema = crate::tir::check(&graph, &mut strings);
+		let mir = crate::tir::lower(&mut sema, &strings);
+		let messages: Vec<_> = sema
+			.diagnostics()
+			.iter()
+			.map(|d| d.message.clone())
+			.collect();
+		(
+			mir.unwrap_or_else(|()| panic!("must lower: {messages:?}")),
+			strings,
+		)
+	}
+
+	/// `export`ed `name: fn(u32) -> u32` of `source`, run on each input,
+	/// both as `wx build` emits it and linearized directly from lowering,
+	/// where a loop's state is its Wasm parameters.
+	fn assert_runs(source: &str, name: &str, cases: &[(u32, u32)]) {
+		let (direct, strings) = lowered(source);
+		let direct =
+			crate::codegen::Builder::build_linearized(&direct, &strings)
+				.expect("lowered MIR must encode")
+				.encode();
+		let (mut built, strings) = lowered(source);
+		let built = crate::backend::emit(
+			&mut built,
+			&strings,
+			Some(mir::inline::Policy::DEFAULT),
+		)
+		.expect("lowered MIR must encode")
+		.encode();
+		for bytes in [direct, built] {
+			let engine = engine();
+			let module = wasmtime::Module::new(&engine, &bytes)
+				.expect("lowered MIR must be valid Wasm");
+			let mut store = wasmtime::Store::new(&engine, ());
+			let instance =
+				wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+			let function = instance
+				.get_typed_func::<u32, u32>(&mut store, name)
+				.unwrap();
+			for &(input, output) in cases {
+				assert_eq!(function.call(&mut store, input).unwrap(), output);
+			}
+		}
+	}
+
+	/// An immutable slot is the loop's parameter, read where it is used: it
+	/// has no local of its own.
+	#[test]
+	fn a_loop_state_is_the_loops_parameters() {
+		let source = r#"
+            func count(n: u32) -> u32 {
+                loop i: u32 = 0 {
+                    if i == n { break i * 2 };
+                    i + 1
+                }
+            }
+            export { count as "count" }
+        "#;
+		let (mir, _) = lowered(source);
+		let code = mir.code(mir::FunctionId::new(0));
+		assert_eq!(code.locals.len(), 1, "only `n` is a local");
+		assert_runs(source, "count", &[(0, 0), (5, 10)]);
+	}
+
+	#[test]
+	fn a_named_state_sums_and_a_continue_skips() {
+		let source = r#"
+            func sum(n: u32) -> u32 {
+                loop (i: u32, total: u32) = (0, 0) {
+                    if i == n { break total };
+                    if i == 2 { continue ({ total, i: i + 1 }) };
+                    ({ i: i + 1, total: total + i })
+                }
+            }
+            export { sum as "sum" }
+        "#;
+		// 0 + 1 + 3 + 4, skipping 2.
+		assert_runs(source, "sum", &[(0, 0), (2, 1), (5, 8)]);
+	}
+
+	/// The next state is computed whole before the loop restarts with it.
+	#[test]
+	fn a_next_state_is_given_at_once() {
+		let source = r#"
+            func fib(n: u32) -> u32 {
+                loop (a: u32, b: u32, k) = (0, 1, n) {
+                    if k == 0 { break a };
+                    (b, a + b, k - 1)
+                }
+            }
+            export { fib as "fib" }
+        "#;
+		assert_runs(source, "fib", &[(0, 0), (1, 1), (2, 1), (10, 55)]);
+	}
+
+	/// A `mut` slot is a local set from the parameters, assigned within the
+	/// iteration and handed on.
+	#[test]
+	fn a_mut_slot_is_assigned_within_an_iteration() {
+		let source = r#"
+            func steps(n: u32) -> u32 {
+                loop (mut at: u32, taken: u32) = (0, 0) {
+                    if at >= n { break taken };
+                    at += 1;
+                    if at % 3 == 0 { at += 1 };
+                    ({ at, taken: taken + 1 })
+                }
+            }
+            export { steps as "steps" }
+        "#;
+		assert_runs(source, "steps", &[(0, 0), (2, 2), (7, 5)]);
+	}
+
+	/// A labelled `continue` restarts the loop it names with that loop's
+	/// state, and the inner loop's header runs again on each outer iteration.
+	#[test]
+	fn nested_loops_restart_with_their_own_state() {
+		let source = r#"
+            func cells(n: u32) -> u32 {
+                loop :rows (row: u32, seen: u32) = (0, 0) {
+                    if row == n { break seen };
+                    loop (col: u32, here: u32) = (0, seen) {
+                        if col == row { continue :rows (row + 1, here) };
+                        (col + 1, here + 1)
+                    }
+                }
+            }
+            export { cells as "cells" }
+        "#;
+		// 0 + 1 + .. + (n - 1) cells under the diagonal.
+		assert_runs(source, "cells", &[(0, 0), (1, 0), (4, 6)]);
+	}
+
+	/// A slot of a struct type is several parameters; its fields read them.
+	#[test]
+	fn a_struct_slot_is_read_by_its_fields() {
+		let source = r#"
+            struct Range(start: u32, end: u32);
+            func width(n: u32) -> u32 {
+                loop (r: Range, steps: u32) = (Range(0, n), 0) {
+                    if r.start == r.end { break steps };
+                    (Range(r.start + 1, r.end), steps + 1)
+                }
+            }
+            export { width as "width" }
+        "#;
+		assert_runs(source, "width", &[(0, 0), (3, 3)]);
+	}
+
 	// ── short-circuiting ─────────────────────────────────────────────────
 
 	/// A false left operand decides `&&`, so a right one that would trap is
@@ -7823,6 +8146,7 @@ mod tests {
 		let mir::ExprKind::Loop {
 			label: outer,
 			body: outer_body,
+			..
 		} = body.kind(at)
 		else {
 			panic!("the body must contain the outer loop")
@@ -7834,6 +8158,7 @@ mod tests {
 		let mir::ExprKind::Loop {
 			label: inner,
 			body: inner_body,
+			..
 		} = body.kind(only(statements))
 		else {
 			panic!("the outer loop must contain the inner loop")
@@ -7842,7 +8167,7 @@ mod tests {
 		else {
 			panic!("a loop's body is a sequence")
 		};
-		let mir::ExprKind::Continue { label } = body.kind(only(statements))
+		let mir::ExprKind::Continue { label, .. } = body.kind(only(statements))
 		else {
 			panic!("the inner loop must contain the continue")
 		};

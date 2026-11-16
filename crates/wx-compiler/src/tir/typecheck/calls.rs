@@ -22,7 +22,7 @@ use super::members::Expected;
 use super::{ArgumentList, Arguments, BodyBuilder};
 use crate::ast::{self, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
-use crate::tir::body::{ElementOrder, ExprIdx, ExprKind, ParamIdx};
+use crate::tir::body::{ElementOrder, ExprIdx, ExprKind, ParamIdx, ScopeIdx};
 use crate::tir::decls::{
 	AssocTypeIdx, DeclKind, Declarations, FieldIdx, FunctionIdx, MemberKind,
 	MemberOwner, StructIdx,
@@ -104,6 +104,22 @@ pub(super) struct GivenArgument {
 	pub(super) expected: TypeIndex,
 }
 
+/// What declares the names a named list gives: a call's target, or a
+/// loop, whose parameters are its scope's first locals.
+#[derive(Clone, Copy)]
+pub(super) enum NamedOwner {
+	Call(CallTargetKind),
+	Loop(ScopeIdx),
+}
+
+/// A named argument and the parameter its name gives: indices into the
+/// written list and into the names it is matched against.
+#[derive(Clone, Copy)]
+pub(super) struct NamedMatch {
+	pub(super) argument: u32,
+	pub(super) param: u32,
+}
+
 /// What a call calls, read once per call: a function, or a struct's
 /// constructor, whose parameters are the struct's fields. A call's arguments
 /// are checked against either the same way, by position or by name.
@@ -138,6 +154,21 @@ impl CallTarget {
 		}
 	}
 
+	/// What the name of `param` refers to.
+	fn reference(&self, param: ParamIdx) -> Reference {
+		match self.kind {
+			CallTargetKind::Function(function) => Reference::Parameter {
+				function,
+				parameter: param,
+			},
+			CallTargetKind::StructConstructor(owner) => Reference::Field {
+				owner: crate::tir::decls::FieldOwner::Struct(owner),
+				field: FieldIdx::new(u32::from(param)),
+				access: AccessKind::Initialize,
+			},
+		}
+	}
+
 	/// Each parameter's name as a call by name spells it, `None` for a name
 	/// the parser reported missing.
 	pub(super) fn param_names<'d>(
@@ -152,22 +183,6 @@ impl CallTarget {
 				.fields
 				.names(decls.structs[usize::from(struct_index)].fields),
 		}
-	}
-
-	/// The first parameter from `from` on named `name`: a later one of the
-	/// same name was reported on the declaration.
-	fn find_param(
-		&self,
-		decls: &Declarations,
-		name: SymbolU32,
-		from: usize,
-	) -> Option<ParamIdx> {
-		self.param_names(decls)
-			.iter()
-			.enumerate()
-			.skip(from)
-			.find(|(_, param)| **param == Some(name))
-			.map(|(at, _)| ParamIdx::new(at as u32))
 	}
 }
 
@@ -797,11 +812,8 @@ impl BodyBuilder<'_, '_> {
 		false
 	}
 
-	/// `f({ b: 2, a })`: each argument gives the parameter of its name, in
-	/// written order. An argument naming no parameter, or one already given,
-	/// is built and dropped. A target with a name the parser reported missing
-	/// is not matched: its arguments are built, and nothing more is
-	/// reported.
+	/// `f({ b: 2, a })`: each argument gives the parameter of its name, after
+	/// those `given` holds (`match_names`).
 	fn named_arguments(
 		&mut self,
 		target: &CallTarget,
@@ -811,79 +823,90 @@ impl BodyBuilder<'_, '_> {
 		span: TextSpan,
 	) -> bool {
 		let skipped = given.len();
-		let param_names = target.param_names(&self.sema.decls);
-		let count = param_names.len();
-		if param_names[skipped..].iter().any(Option::is_none) {
-			for argument in arguments {
-				self.build_named_argument(argument, TypeIndex::INFER);
-			}
-			return true;
+		let names = target.param_names(&self.sema.decls)[skipped..].to_vec();
+		let owner = NamedOwner::Call(target.kind);
+		let matches = self.match_names(&names, arguments, owner, span);
+		for NamedMatch { argument, param } in &matches {
+			let argument = &arguments[*argument as usize];
+			let param = ParamIdx::new(skipped as u32 + param);
+			self.sema.resolutions.record(
+				Site::Label(SourceSpan::new(
+					self.scope.file_id,
+					argument.name.span,
+				)),
+				target.reference(param),
+			);
+			let declared =
+				self.sema.types.list(target.param_types)[usize::from(param)];
+			let hint =
+				self.instantiate(declared, target.generic_env, type_args);
+			let value = self.build_named_argument(argument, hint);
+			self.learn_argument(target, type_args, declared, value);
+			given.push(GivenArgument {
+				param: Some(param),
+				declared,
+				value,
+				expected: hint,
+			});
 		}
-		given.reserve_exact(arguments.len().min(count - skipped));
-		let mut reported = false;
-		// Each parameter given by name, with its name as written.
-		let mut named: Vec<(ParamIdx, TextSpan)> =
-			Vec::with_capacity(arguments.len());
-		for argument in arguments {
+		matches.len() != arguments.len() || matches.len() != names.len()
+	}
+
+	/// The arguments of `{ b: 2, a }` that give a parameter of `names`, in
+	/// written order. One naming none, or a parameter given already, is
+	/// reported and built against nothing, and so is every parameter not
+	/// given. A name missing or repeated, reported where `names` are
+	/// declared, is never given; a repeat's first is. The list matched
+	/// exactly when there are as many matches as arguments and names.
+	pub(super) fn match_names(
+		&mut self,
+		names: &[Option<SymbolU32>],
+		arguments: &[ast::NamedArgument],
+		owner: NamedOwner,
+		span: TextSpan,
+	) -> Vec<NamedMatch> {
+		let mut matches: Vec<NamedMatch> = Vec::with_capacity(arguments.len());
+		for (at, argument) in arguments.iter().enumerate() {
 			let name = argument.name;
 			let param =
-				target.find_param(&self.sema.decls, name.inner, skipped);
-			let hint = match param {
-				Some(param) => {
-					let declared = self.sema.types.list(target.param_types)
-						[usize::from(param)];
-					self.instantiate(declared, target.generic_env, type_args)
+				names.iter().position(|&named| named == Some(name.inner));
+			let first = param.and_then(|param| {
+				matches.iter().find(|given| given.param as usize == param)
+			});
+			let diagnostic = match (param, first) {
+				(Some(param), None) => {
+					matches.push(NamedMatch {
+						argument: at as u32,
+						param: param as u32,
+					});
+					continue;
 				}
-				None => TypeIndex::INFER,
-			};
-			let value = self.build_named_argument(argument, hint);
-			let param_name = self.builder.strings.resolve(name.inner).unwrap();
-			let Some(param) = param else {
-				let (kind, target_name) = (
-					target.kind.describe(),
-					target.kind.name(self.builder.strings, self.sema),
-				);
-				self.sema.diagnostics.push(
-					Diagnostic::error()
+				(None, _) => {
+					let text =
+						self.builder.strings.resolve(name.inner).unwrap();
+					let owner_text = self.describe_owner(owner);
+					let mut diagnostic = Diagnostic::error()
 						.with_code(DiagnosticCode::UnknownParameterName.code())
 						.with_message(format!(
-							"{kind} `{target_name}` has no parameter named \
-							 `{param_name}`"
+							"{owner_text} has no parameter named `{text}`"
 						))
 						.with_label(Label::primary(
 							self.scope.file_id,
 							name.span,
-						))
-						.with_label(target.kind.declared_here(self.sema)),
-				);
-				reported = true;
-				continue;
-			};
-			let label = match target.kind {
-				CallTargetKind::Function(function) => Reference::Parameter {
-					function,
-					parameter: param,
-				},
-				CallTargetKind::StructConstructor(owner) => Reference::Field {
-					owner: crate::tir::decls::FieldOwner::Struct(owner),
-					field: FieldIdx::new(u32::from(param)),
-					access: AccessKind::Initialize,
-				},
-			};
-			self.sema.resolutions.record(
-				Site::Label(SourceSpan::new(self.scope.file_id, name.span)),
-				label,
-			);
-			if let Some(&(_, first)) =
-				named.iter().find(|&&(named, _)| named == param)
-			{
-				self.sema.diagnostics.push(
+						));
+					diagnostic.labels.extend(self.declared_here(owner));
+					diagnostic
+				}
+				(Some(_), Some(first)) => {
+					let first = arguments[first.argument as usize].name.span;
+					let text =
+						self.builder.strings.resolve(name.inner).unwrap();
 					Diagnostic::error()
 						.with_code(
 							DiagnosticCode::DuplicateNamedArgument.code(),
 						)
 						.with_message(format!(
-							"argument `{param_name}` given more than once"
+							"argument `{text}` given more than once"
 						))
 						.with_label(Label::primary(
 							self.scope.file_id,
@@ -892,61 +915,75 @@ impl BodyBuilder<'_, '_> {
 						.with_label(
 							Label::secondary(self.scope.file_id, first)
 								.with_message("first given here"),
-						),
-				);
-				reported = true;
-				continue;
-			}
-			let declared =
-				self.sema.types.list(target.param_types)[usize::from(param)];
-			self.learn_argument(target, type_args, declared, value);
-			named.push((param, name.span));
-			given.push(GivenArgument {
-				param: Some(param),
-				declared,
-				value,
-				expected: hint,
-			});
+						)
+				}
+			};
+			self.sema.diagnostics.push(diagnostic);
+			self.build_named_argument(argument, TypeIndex::INFER);
 		}
-		// A later parameter of a name declared twice is one no argument can
-		// name; the duplicate was reported on the declaration.
-		let missing: Vec<String> = (skipped..count)
-			.map(|at| ParamIdx::new(at as u32))
-			.filter(|&param| !named.iter().any(|&(named, _)| named == param))
-			.filter_map(|param| {
-				let name =
-					target.param_names(&self.sema.decls)[usize::from(param)]?;
-				(target.find_param(&self.sema.decls, name, skipped)
-					== Some(param))
-				.then(|| {
-					format!("`{}`", self.builder.strings.resolve(name).unwrap())
-				})
+		let missing: Vec<String> = (names.iter().enumerate())
+			.filter(|&(at, name)| {
+				name.is_some()
+					&& !names[..at].contains(name)
+					&& !matches.iter().any(|given| given.param as usize == at)
+			})
+			.filter_map(|(_, &name)| {
+				let name = self.builder.strings.resolve(name?).unwrap();
+				Some(format!("`{name}`"))
 			})
 			.collect();
 		if !missing.is_empty() {
-			reported = true;
-			let (kind, target_name) = (
-				target.kind.describe(),
-				target.kind.name(self.builder.strings, self.sema),
-			);
-			self.sema.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::MissingArguments.code())
-					.with_message(format!(
-						"missing argument{} {} in call to {kind} \
-						 `{target_name}`",
-						if missing.len() == 1 { "" } else { "s" },
-						missing.join(", ")
-					))
-					.with_label(Label::primary(self.scope.file_id, span))
-					.with_label(target.kind.declared_here(self.sema)),
-			);
+			let owner_text = self.describe_owner(owner);
+			let mut diagnostic = Diagnostic::error()
+				.with_code(DiagnosticCode::MissingArguments.code())
+				.with_message(format!(
+					"missing argument{} {} for {owner_text}",
+					if missing.len() == 1 { "" } else { "s" },
+					missing.join(", "),
+				))
+				.with_label(Label::primary(self.scope.file_id, span));
+			diagnostic.labels.extend(self.declared_here(owner));
+			self.sema.diagnostics.push(diagnostic);
 		}
-		reported
+		matches
+	}
+
+	/// How a diagnostic names `owner`: "function `f`", "the loop".
+	fn describe_owner(&self, owner: NamedOwner) -> String {
+		match owner {
+			NamedOwner::Call(kind) => format!(
+				"{} `{}`",
+				kind.describe(),
+				kind.name(self.builder.strings, self.sema)
+			),
+			NamedOwner::Loop(_) => "the loop".to_string(),
+		}
+	}
+
+	/// A label at where `owner` declares its names: a call target's
+	/// declaration, a loop's parameters (none for a loop without any).
+	fn declared_here(&self, owner: NamedOwner) -> Option<Label<FileId>> {
+		let span = match owner {
+			NamedOwner::Call(kind) => {
+				return Some(kind.declared_here(self.sema));
+			}
+			NamedOwner::Loop(scope) => {
+				let mut slots = self.body.scope_locals(scope);
+				let first = self.body.local(slots.next()?).name.span;
+				let last = slots
+					.last()
+					.map_or(first, |slot| self.body.local(slot).name.span);
+				TextSpan::new(first.start, last.end)
+			}
+		};
+		Some(
+			Label::secondary(self.scope.file_id, span)
+				.with_message("declared here"),
+		)
 	}
 
 	/// A named argument's value: written, or for `{ x }` the value `x` names.
-	fn build_named_argument(
+	pub(super) fn build_named_argument(
 		&mut self,
 		argument: &ast::NamedArgument,
 		hint: TypeIndex,

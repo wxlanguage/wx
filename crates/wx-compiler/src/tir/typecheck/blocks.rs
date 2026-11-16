@@ -9,6 +9,7 @@
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
+use super::calls::{NamedMatch, NamedOwner};
 use super::patterns::PatternContext;
 use super::{BodyBuilder, ScopeType};
 use crate::ast::{self, Spanned};
@@ -16,12 +17,12 @@ use crate::diagnostics::{DiagnosticCode, SourceSpan, TextOffset, TextSpan};
 use crate::symbols::Keyword;
 use crate::tir::body::{
 	self, Body, ExprIdx, ExprKind, ExprObligation, LabelIdx, LocalIdx,
-	Obligations, Scope, ScopeIdx, ScopeKind,
+	Obligations, ParamIdx, Scope, ScopeIdx, ScopeKind,
 };
-use crate::tir::decls::FunctionIdx;
-use crate::tir::resolutions::{Reference, Site};
+use crate::tir::decls::{FunctionIdx, report_duplicate_parameter};
+use crate::tir::resolutions::{AccessKind, Reference, Site};
 use crate::tir::signatures::InferPolicy;
-use crate::tir::types::TypeIndex;
+use crate::tir::types::{Type, TypeIndex};
 
 impl BodyBuilder<'_, '_> {
 	/// Checks a function's block as its body. Its named parameters are the
@@ -129,7 +130,10 @@ impl BodyBuilder<'_, '_> {
 		let (built, flow) = self.build_statements(statements, result, span.end);
 		let result = result.map(|result| {
 			let hint = self.scope_hint(scope);
-			let value = self.build(result, hint);
+			let value = match self.loop_of_body(scope) {
+				Some(target) => self.build_state(target, result, hint),
+				None => self.build(result, hint),
+			};
 			self.give(scope, value, true)
 		});
 		if result.is_none() {
@@ -296,50 +300,15 @@ impl BodyBuilder<'_, '_> {
 		span: TextSpan,
 		block_end: TextOffset,
 	) -> ExprIdx {
-		let declared = ty.map(|ty| {
-			let ty = self.builder.resolve_value_type(
-				self.sema,
-				&mut self.obligations.types,
-				self.scope,
-				ty,
-				InferPolicy::Allow,
-			);
-			self.context().normalized(ty)
-		});
-		let value = match declared {
-			Some(declared) => self.check(value, declared),
-			None => self.build(value, TypeIndex::INFER),
-		};
-		let value_ty = self.body.ty(value);
-		// A written `_` in the type is learned from the value.
-		let mut local_ty = match declared {
-			Some(declared) => {
-				self.sema.types.meet(declared, value_ty).unwrap_or(declared)
-			}
-			None => value_ty,
-		};
-		// A written slice or array is reported as held by value.
-		let unplaced =
-			declared.is_none() && self.sema.types.needs_context(local_ty);
-		if unplaced
-			|| self.sema.types.has_const_kind(local_ty)
-			|| self.sema.types.has_infer(local_ty)
-		{
-			self.sema.diagnostics.push(
-				Diagnostic::error()
-					.with_code(DiagnosticCode::TypeAnnotationRequired.code())
-					.with_message("type annotation required")
-					.with_label(
-						Label::primary(
-							self.scope.file_id,
-							self.ast().pattern_span(pattern),
-						)
-						.with_message("cannot infer the type of this local"),
-					),
-			);
+		let declared = self.declared_type(ty);
+		let value = self.build(value, declared);
+		let (value, mut local_ty) = self.complete(value, declared);
+		if !self.is_known(local_ty, declared) {
+			let span = self.ast().pattern_span(pattern);
+			self.report_uninferred(span, "local");
 			local_ty = TypeIndex::ERROR;
 		}
-		let ty = if value_ty == TypeIndex::NEVER {
+		let ty = if self.body.ty(value) == TypeIndex::NEVER {
 			TypeIndex::NEVER
 		} else {
 			TypeIndex::UNIT
@@ -354,6 +323,61 @@ impl BodyBuilder<'_, '_> {
 			self.check_pattern(pattern, local_ty, &mut PatternContext::local());
 		self.body
 			.push(ExprKind::LocalDeclaration { pattern, value }, ty, span)
+	}
+
+	/// The type a binding is declared with: as written, its `_` parts
+	/// `INFER`, or all of it `INFER` when none is written.
+	fn declared_type(&mut self, ty: Option<ast::TypeId>) -> TypeIndex {
+		let Some(ty) = ty else {
+			return TypeIndex::INFER;
+		};
+		let ty = self.builder.resolve_value_type(
+			self.sema,
+			&mut self.obligations.types,
+			self.scope,
+			ty,
+			InferPolicy::Allow,
+		);
+		self.context().normalized(ty)
+	}
+
+	/// Holds `value`, built with `declared` as its hint, to `declared`, and
+	/// completes `declared` with its type: what the bindings it is given to
+	/// are, as far as `is_known` says.
+	fn complete(
+		&mut self,
+		value: ExprIdx,
+		declared: TypeIndex,
+	) -> (ExprIdx, TypeIndex) {
+		let value = self.expect(value, declared);
+		let actual = self.body.ty(value);
+		let ty = self.sema.types.meet(declared, actual).unwrap_or(declared);
+		(value, ty)
+	}
+
+	/// Whether `ty`, `declared` completed by a value, is known enough for a
+	/// binding: no part left unknown or untyped (a literal), and no data in
+	/// no memory that the value brought. A written slice or array is
+	/// reported where it is written, as held by value.
+	fn is_known(&self, ty: TypeIndex, declared: TypeIndex) -> bool {
+		let types = &self.sema.types;
+		!types.has_infer(ty)
+			&& !types.has_const_kind(ty)
+			&& (!types.has_unplaced(ty) || types.has_unplaced(declared))
+	}
+
+	/// E2002 at `span`, a binding (`what`) whose type is not known.
+	fn report_uninferred(&mut self, span: TextSpan, what: &str) {
+		self.sema.diagnostics.push(
+			Diagnostic::error()
+				.with_code(DiagnosticCode::TypeAnnotationRequired.code())
+				.with_message("type annotation required")
+				.with_label(
+					Label::primary(self.scope.file_id, span).with_message(
+						format!("cannot infer the type of this {what}"),
+					),
+				),
+		);
 	}
 
 	/// `match scrutinee { pattern => expr | { .. }, .. }`. Each arm's bindings
@@ -594,31 +618,233 @@ impl BodyBuilder<'_, '_> {
 		}
 	}
 
-	/// `loop { .. }`: its statements are checked as statements, its tail
-	/// included. Its type is what its `break`s give it.
+	/// `loop :l (a: A, b) = first { body }`, or `loop { body }` with the
+	/// state `()`. The slots are the loop scope's locals, in order, declared
+	/// before `first` is built outside the loop (it sees neither them nor the
+	/// loop's label) and typed by it: a slot without a written type takes its
+	/// part of `first`'s. The body is a block of its own, whose result is the
+	/// next state. The loop's type is what its `break`s give it.
 	pub(super) fn build_loop(
 		&mut self,
+		header: Option<ast::LoopHeaderId>,
 		block: ast::BlockId,
 		expected: TypeIndex,
 		label: Option<LabelIdx>,
 		span: TextSpan,
 	) -> ExprIdx {
-		let scope = self.enter_scope(ScopeKind::Loop, label, span, expected);
 		let ast = self.ast();
-		let ast::Block { statements, tail } = ast.block(block);
-		let (mut built, _) = self.build_statements(
-			ast.list(statements),
-			tail,
-			ast.block_span(block).end,
+		let header = header.map(|header| ast.loop_header(header));
+		// The slots are in scope after the first state, up to the loop's end.
+		let start = header
+			.map_or(span.start, |header| ast.expr_span(header.initializer).end);
+		let outer = self.current;
+		let scope = self.enter_scope(
+			ScopeKind::Loop,
+			label,
+			TextSpan::new(start, span.end),
+			expected,
 		);
-		if let Some(tail) = tail {
-			built.push(self.build_expression_statement(tail));
-		}
+		let first = header.map(|header| {
+			self.declare_slots(ast.list(header.state));
+			self.current = outer;
+			let first = self.build_first_state(scope, header.initializer);
+			self.current = scope;
+			first
+		});
+		let state = self.state_type(scope);
+		let block_span = ast.block_span(block);
+		let body =
+			self.build_block(ScopeKind::Body, block, state, None, block_span);
 		self.leave_scope(scope);
-		let ty = self.scope_type(scope);
-		let statements = self.body.push_args(built);
+		// A first state that never arrives never starts the loop.
+		let ty = match first {
+			Some(first) if self.body.ty(first) == TypeIndex::NEVER => {
+				TypeIndex::NEVER
+			}
+			_ => self.scope_type(scope),
+		};
 		self.body
-			.push(ExprKind::Loop { scope, statements }, ty, span)
+			.push(ExprKind::Loop { scope, first, body }, ty, span)
+	}
+
+	/// Declares a loop's slots in the current scope, the loop's, each of its
+	/// written type or `INFER` until the first state gives it one. A slot
+	/// whose name the parser reported missing keeps its position, an `ERROR`
+	/// that no name finds, so the state is one too. A repeated name is
+	/// reported, and finds the first.
+	fn declare_slots(&mut self, slots: &[ast::FunctionParam]) {
+		for slot in slots {
+			let ty = self.declared_type(slot.ty);
+			let binding = slot.binding;
+			if binding.is_missing() {
+				let local = body::Local {
+					name: binding.name,
+					ty: TypeIndex::ERROR,
+					mut_span: None,
+				};
+				self.body.push_local(self.current, local);
+				continue;
+			}
+			let mut_span = binding.mut_at.map(|at| Keyword::Mut.span_at(at));
+			let first = (self.body.scope_locals(self.current))
+				.map(|slot| self.body.local(slot).name)
+				.find(|first| first.inner == binding.name.inner);
+			let Some(first) = first else {
+				self.declare_local(binding.name, ty, mut_span);
+				continue;
+			};
+			self.sema.diagnostics.push(report_duplicate_parameter(
+				self.builder.strings,
+				self.scope.file_id,
+				binding.name,
+				first,
+			));
+			let local = body::Local {
+				name: binding.name,
+				ty,
+				mut_span,
+			};
+			self.body.push_local(self.current, local);
+		}
+	}
+
+	/// The first state, completing the slots' types as a `local`'s value
+	/// does its type: a slot whose part is still not known is reported, and
+	/// is `ERROR`. One that never arrives completes nothing, silently.
+	fn build_first_state(
+		&mut self,
+		scope: ScopeIdx,
+		initializer: ast::ExprId,
+	) -> ExprIdx {
+		let declared = self.state_type(scope);
+		let value = self.build_state(scope, initializer, declared);
+		let (value, state) = self.complete(value, declared);
+		let arrives = self.body.ty(value) != TypeIndex::NEVER;
+		let slots: Vec<LocalIdx> = self.body.scope_locals(scope).collect();
+		let parts = match (slots.len(), *self.sema.types.resolve(state)) {
+			(1, _) => vec![state],
+			(count, Type::Tuple { elements }) if elements.len() == count => {
+				self.sema.types.list(elements).to_vec()
+			}
+			_ => vec![TypeIndex::ERROR; slots.len()],
+		};
+		for (slot, mut ty) in slots.into_iter().zip(parts) {
+			let local = *self.body.local(slot);
+			if !arrives || !self.is_known(ty, local.ty) {
+				if arrives {
+					self.report_uninferred(local.name.span, "slot");
+				}
+				ty = TypeIndex::ERROR;
+			}
+			self.body.set_local_ty(slot, ty);
+		}
+		value
+	}
+
+	/// The type of a loop's state, from its slots: `()` for none, a slot's
+	/// type for one, else the tuple of them. `ERROR` once a part is.
+	fn state_type(&mut self, scope: ScopeIdx) -> TypeIndex {
+		let types: Vec<TypeIndex> = (self.body.scope_locals(scope))
+			.map(|slot| self.body.local(slot).ty)
+			.collect();
+		let ty = match *types {
+			[ty] => ty,
+			_ => self.sema.types.intern_tuple(&types),
+		};
+		self.sema.types.collapse_error(ty)
+	}
+
+	/// The loop whose next state `scope`'s result is: its body's.
+	fn loop_of_body(&self, scope: ScopeIdx) -> Option<ScopeIdx> {
+		let Scope { kind, parent, .. } = *self.body.scope(scope);
+		let parent = parent.filter(|_| kind == ScopeKind::Body)?;
+		(self.body.scope(parent).kind == ScopeKind::Loop).then_some(parent)
+	}
+
+	/// A state given to the loop `target`: its first, its body's result or a
+	/// `continue`'s value, positionally (`expected` hints it) or by name. The
+	/// caller holds it to the state.
+	fn build_state(
+		&mut self,
+		target: ScopeIdx,
+		value: ast::ExprId,
+		expected: TypeIndex,
+	) -> ExprIdx {
+		let ast = self.ast();
+		match ast.expr(value) {
+			ast::Expression::NamedList { arguments, .. } => self
+				.build_named_state(
+					target,
+					ast.list(arguments),
+					ast.expr_span(value),
+				),
+			_ => self.build(value, expected),
+		}
+	}
+
+	/// `({ b: 2, a })` as the state of the loop `target`: each value gives the
+	/// parameter of its name (`match_names`), held to its type.
+	fn build_named_state(
+		&mut self,
+		target: ScopeIdx,
+		arguments: &[ast::NamedArgument],
+		span: TextSpan,
+	) -> ExprIdx {
+		let slots: Vec<LocalIdx> = self.body.scope_locals(target).collect();
+		let names: Vec<Option<SymbolU32>> = (slots.iter())
+			.map(|&slot| self.body.local(slot).name.inner)
+			.map(|name| (name != Keyword::Error.symbol()).then_some(name))
+			.collect();
+		let owner = NamedOwner::Loop(target);
+		let matches = self.match_names(&names, arguments, owner, span);
+		let mut types = vec![TypeIndex::ERROR; slots.len()];
+		let mut values = Vec::with_capacity(matches.len());
+		for &NamedMatch { argument, param } in &matches {
+			let argument = &arguments[argument as usize];
+			let slot = slots[param as usize];
+			self.sema.resolutions.record(
+				Site::Label(SourceSpan::new(
+					self.scope.file_id,
+					argument.name.span,
+				)),
+				Reference::Local {
+					owner: self.owner,
+					local: slot,
+					access: AccessKind::Write,
+				},
+			);
+			let ty = self.body.local(slot).ty;
+			let value = self.build_named_argument(argument, ty);
+			let value = self.expect(value, ty);
+			types[param as usize] = self.body.ty(value);
+			values.push(value);
+		}
+		if matches.len() != arguments.len() || matches.len() != slots.len() {
+			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
+		}
+		// One parameter's state is its value.
+		if let [value] = *values {
+			return value;
+		}
+		let ty = self.sema.types.intern_tuple(&types);
+		let ty = self.sema.types.collapse_error(ty);
+		let order = self.body.push_permutation(
+			matches.iter().map(|given| ParamIdx::new(given.param)),
+		);
+		self.pack(values, order, ty, span)
+	}
+
+	/// The values of a named list whose names mean nothing here, each built
+	/// against nothing, standing in an error node for the list.
+	pub(super) fn build_named_values(
+		&mut self,
+		arguments: &[ast::NamedArgument],
+		span: TextSpan,
+	) -> ExprIdx {
+		for argument in arguments {
+			self.build_named_argument(argument, TypeIndex::ERROR);
+		}
+		self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 	}
 
 	/// `break`, leaving the nearest loop, or the scope `label` names, with
@@ -648,17 +874,47 @@ impl BodyBuilder<'_, '_> {
 			.push(ExprKind::Break { scope, value }, TypeIndex::NEVER, span)
 	}
 
-	/// `continue`, restarting the nearest loop, or the loop `label` names.
+	/// `continue`, restarting the nearest loop, or the loop `label` names,
+	/// with `value` as its next state (`()` without one).
 	pub(super) fn build_continue(
 		&mut self,
 		label: Option<Spanned<SymbolU32>>,
+		value: Option<ast::ExprId>,
 		span: TextSpan,
 	) -> ExprIdx {
 		let Some(scope) = self.jump_target(label, span, Jump::Continue) else {
+			// Its value is still checked, against nothing.
+			if let Some(value) = value {
+				let ast = self.ast();
+				match ast.expr(value) {
+					ast::Expression::NamedList { arguments, .. } => self
+						.build_named_values(
+							ast.list(arguments),
+							ast.expr_span(value),
+						),
+					_ => self.build(value, TypeIndex::ERROR),
+				};
+			}
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
-		self.body
-			.push(ExprKind::Continue { scope }, TypeIndex::NEVER, span)
+		let state = self.state_type(scope);
+		let value = value.map(|value| {
+			let value = self.build_state(scope, value, state);
+			self.expect(value, state)
+		});
+		if value.is_none()
+			&& state != TypeIndex::UNIT
+			&& state != TypeIndex::ERROR
+		{
+			let diagnostic =
+				self.context().mismatch_at(state, TypeIndex::UNIT, span);
+			self.sema.diagnostics.push(diagnostic);
+		}
+		self.body.push(
+			ExprKind::Continue { scope, value },
+			TypeIndex::NEVER,
+			span,
+		)
 	}
 
 	/// `return`, leaving the body with `value` (`()` without one).
@@ -775,7 +1031,8 @@ impl BodyBuilder<'_, '_> {
 	/// What a value given to `scope` is expected to be: the type an earlier
 	/// value settled on, else the context's expectation.
 	fn scope_hint(&self, scope: ScopeIdx) -> TypeIndex {
-		let ScopeType { expected, ty } = self.scope_types[usize::from(scope)];
+		let ScopeType { expected, ty, .. } =
+			self.scope_types[usize::from(scope)];
 		if ty != TypeIndex::INFER { ty } else { expected }
 	}
 

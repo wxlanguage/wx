@@ -5364,7 +5364,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						inner: name.inner,
 						span: self.params.name_span(before, first),
 					};
-					self.diagnostics.push(report_duplicate_function_parameter(
+					self.diagnostics.push(report_duplicate_parameter(
 						self.strings,
 						file_id,
 						name,
@@ -5408,7 +5408,7 @@ fn report_duplicate_struct_field(
 		)
 }
 
-fn report_duplicate_function_parameter(
+pub(super) fn report_duplicate_parameter(
 	strings: &StringInterner,
 	file_id: FileId,
 	name: Spanned<SymbolU32>,
@@ -5416,7 +5416,7 @@ fn report_duplicate_function_parameter(
 ) -> Diagnostic<FileId> {
 	let name_str = strings.resolve(name.inner).unwrap();
 	Diagnostic::error()
-		.with_code(DiagnosticCode::DuplicateFunctionParameter.code())
+		.with_code(DiagnosticCode::DuplicateParameter.code())
 		.with_message(format!(
 			"identifier `{name_str}` is bound more than once in this parameter list"
 		))
@@ -5825,7 +5825,7 @@ mod tests {
 	{
 		let mut case = TestCase::new("func f(x: i32, x: i32) {}");
 		case.diagnostics()
-			.assert_error(DiagnosticCode::DuplicateFunctionParameter);
+			.assert_error(DiagnosticCode::DuplicateParameter);
 
 		let missing = case.resolve(Tier::Value, "missing");
 		missing
@@ -6899,7 +6899,7 @@ mod tests {
 		] {
 			let mut case = TestCase::new(source);
 			case.diagnostics()
-				.assert_error(DiagnosticCode::DuplicateFunctionParameter);
+				.assert_error(DiagnosticCode::DuplicateParameter);
 
 			// Duplicate names still keep their positional slots.
 			let DeclKind::Function(index) =
@@ -6948,7 +6948,7 @@ mod tests {
 		] {
 			let case = TestCase::new_core(source);
 			case.diagnostics()
-				.assert_codes(&[DiagnosticCode::DuplicateFunctionParameter]);
+				.assert_codes(&[DiagnosticCode::DuplicateParameter]);
 			let function = &case.decls.functions[0];
 			let names: Vec<_> = case
 				.decls
@@ -6959,7 +6959,7 @@ mod tests {
 				.collect();
 			assert_eq!(names, ["x", "x", "tail"]);
 			case.diagnostics().assert_error_with(
-				DiagnosticCode::DuplicateFunctionParameter,
+				DiagnosticCode::DuplicateParameter,
 				|diagnostic| {
 					let first = source.find("x:").unwrap();
 					let second = source.rfind("x:").unwrap();
@@ -6995,7 +6995,7 @@ mod tests {
 		let source = "trait T { func f(self: Self, self: Self); }";
 		let case = TestCase::new_core(source);
 		case.diagnostics().assert_codes(&[
-			DiagnosticCode::DuplicateFunctionParameter,
+			DiagnosticCode::DuplicateParameter,
 			DiagnosticCode::SelfParamPosition,
 		]);
 		let params = &case.decls.functions[0].params;
@@ -7003,7 +7003,7 @@ mod tests {
 		let first = source.find("self").unwrap();
 		let second = source.rfind("self").unwrap();
 		case.diagnostics().assert_error_with(
-			DiagnosticCode::DuplicateFunctionParameter,
+			DiagnosticCode::DuplicateParameter,
 			|diagnostic| {
 				assert_eq!(diagnostic.labels[0].range, second..second + 4);
 				assert_eq!(diagnostic.labels[1].range, first..first + 4);

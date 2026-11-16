@@ -218,9 +218,10 @@ impl<'a> BodyContext<'a> {
 		}
 	}
 
-	/// Whether two types are equal once `facts` have rewritten both. `Err`
-	/// means one does not normalize and that is explained: by its owner, or
-	/// here, at `site`.
+	/// Whether two types are equal once `facts` have rewritten both, where a
+	/// part of `expected` not known yet (`INFER`, a written `_`) fits any
+	/// part. `Err` means one does not normalize and that is explained: by
+	/// its owner, or here, at `site`.
 	fn equality(
 		&mut self,
 		expected: TypeIndex,
@@ -228,7 +229,7 @@ impl<'a> BodyContext<'a> {
 		facts: RewriteFlags,
 		site: TextSpan,
 	) -> Result<TypeEquality, ()> {
-		if expected == actual {
+		if self.fits(expected, actual) {
 			return Ok(TypeEquality::Equal);
 		}
 		if !self.sema.types.has_projection(expected)
@@ -238,7 +239,7 @@ impl<'a> BodyContext<'a> {
 		}
 		let expected = self.normalize_at(expected, facts, site)?;
 		let actual = self.normalize_at(actual, facts, site)?;
-		Ok(if expected == actual {
+		Ok(if self.fits(expected, actual) {
 			TypeEquality::Equal
 		} else if !facts.contains(RewriteFlags::VALUES)
 			&& (self.sema.types.has_const_ref(expected)
@@ -248,6 +249,14 @@ impl<'a> BodyContext<'a> {
 		} else {
 			TypeEquality::Diff
 		})
+	}
+
+	/// Whether `actual` is `expected` as it is written: the same type, or
+	/// one that fills its parts not known yet.
+	fn fits(&mut self, expected: TypeIndex, actual: TypeIndex) -> bool {
+		expected == actual
+			|| self.sema.types.has_infer(expected)
+				&& self.sema.types.meet(expected, actual).is_some()
 	}
 
 	/// A field's type, as expected of the value given for it: as declared,
@@ -696,46 +705,35 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				header,
 				block,
 			} => {
-				if let Some(header) = header {
-					let ast = self.ast();
-					self.report_unsupported(
-						ast.loop_header_span(header),
-						"a loop's state",
-					);
-					self.build(
-						ast.loop_header(header).initializer,
-						TypeIndex::ERROR,
-					);
-				}
 				// A name not written yet (`block : {`) declares nothing.
 				let label = label
 					.filter(|name| name.inner != Keyword::Error.symbol())
 					.map(|name| {
 						self.body.push_label(super::body::Label { name })
 					});
-				self.build_loop(block, expected, label, span)
+				self.build_loop(header, block, expected, label, span)
 			}
 			ast::Expression::Break { label, value } => {
 				self.build_break(label, value, span)
 			}
 			ast::Expression::Continue { label, value } => {
-				if let Some(value) = value {
-					let ast = self.ast();
-					self.report_unsupported(
-						ast.expr_span(value),
-						"a `continue` value",
-					);
-					self.build(value, TypeIndex::ERROR);
-				}
-				self.build_continue(label, span)
+				self.build_continue(label, value, span)
 			}
 			ast::Expression::NamedList { arguments, .. } => {
-				for argument in ast.list(arguments) {
-					if let Some(value) = argument.value {
-						self.build(value, TypeIndex::ERROR);
-					}
-				}
-				self.unsupported(span, "a named list")
+				self.sema.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::NamedListWithoutNames.code())
+						.with_message("a named list needs names to give")
+						.with_label(
+							Label::primary(self.scope.file_id, span)
+								.with_message("nothing here has these names"),
+						)
+						.with_note(
+							"a named list gives a loop's next state: the \
+							 body's result, or `continue`'s value",
+						),
+				);
+				self.build_named_values(ast.list(arguments), span)
 			}
 			ast::Expression::Return { value } => self.build_return(value, span),
 			ast::Expression::Deref { .. }
@@ -846,12 +844,10 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				Some(hints) => self.sema.types.list(hints)[at],
 				None => TypeIndex::INFER,
 			};
-			let mut value = self.build(element, hint);
-			// An element whose part is known is held to it here, before the
-			// tuple holding it exists; the rest wait for their context.
-			if !self.sema.types.has_infer(hint) {
-				value = self.expect(value, hint);
-			}
+			// Held to its part here, before the tuple holding it exists; a
+			// part not known yet holds it to nothing.
+			let value = self.build(element, hint);
+			let value = self.expect(value, hint);
 			values.push(value);
 			types.push(self.body.ty(value));
 		}
@@ -3573,15 +3569,37 @@ mod tests {
 					items.extend(else_block);
 					list("if", &items)
 				}
-				ExprKind::Loop { statements, .. } => {
-					list("loop", body.args(statements))
+				// `(loop (i#1 total#2) = first .. => next)`: the body's block
+				// inline, after the slots and the first state.
+				ExprKind::Loop {
+					scope,
+					first,
+					body: loop_body,
+				} => {
+					let inner = self.render(body, loop_body);
+					let inner = inner.strip_prefix("(block").unwrap();
+					let head = match first {
+						Some(first) => {
+							let slots: Vec<String> = (body.scope_locals(scope))
+								.map(|slot| self.local_name(body, slot))
+								.collect();
+							format!(
+								"(loop ({}) = {}",
+								slots.join(" "),
+								self.render(body, first)
+							)
+						}
+						None => "(loop".to_string(),
+					};
+					head + inner
 				}
 				ExprKind::Break { scope, value } => {
 					let target = self.scope_name(body, scope);
 					list(&format!("break {target}"), value.as_slice())
 				}
-				ExprKind::Continue { scope } => {
-					format!("(continue {})", self.scope_name(body, scope))
+				ExprKind::Continue { scope, value } => {
+					let target = self.scope_name(body, scope);
+					list(&format!("continue {target}"), value.as_slice())
 				}
 				ExprKind::Return { value } => list("return", value.as_slice()),
 				ExprKind::Drop { value } => list("drop", &[value]),
@@ -4156,6 +4174,260 @@ mod tests {
 		]);
 	}
 
+	/// A written `_` in a `local`'s type is learned from its value; the
+	/// parts written are still held to it.
+	#[test]
+	fn a_partly_written_local_type_is_completed_by_its_value() {
+		let case = TestCase::new(indoc! {"
+				struct Pair<T>(a: T, b: T);
+				func f(n: u32) {
+					local x: (u32, _) = (0, n);
+					local y: (_, _) = (n, n);
+					local p: Pair<_> = Pair(n, n);
+				}
+			"});
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.locals("f"),
+			[
+				("n".into(), "u32".into()),
+				("x".into(), "(u32, u32)".into()),
+				("y".into(), "(u32, u32)".into()),
+				("p".into(), "Pair<u32>".into())
+			]
+		);
+
+		// A literal takes its written part; one under a `_` stays untyped.
+		let case = TestCase::new(indoc! {"
+				func f(n: u32) {
+					local x: (_, u8) = (n, 1);
+				}
+			"});
+		case.diagnostics().assert_none();
+		assert_eq!(case.locals("f")[1], ("x".into(), "(u32, u8)".into()));
+		let case = TestCase::new(indoc! {"
+				func f() {
+					local x: (u32, _) = (0, 0);
+				}
+			"});
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeAnnotationRequired]);
+
+		let case = TestCase::new(indoc! {"
+				func f(n: u32) {
+					local x: (u8, _) = (n, n);
+				}
+			"});
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+	}
+
+	/// A slot's type is written, or its part of the first state's; the body's
+	/// result and each `continue`'s value are the next state, positionally or
+	/// by name.
+	#[test]
+	fn a_loop_state_is_typed_by_its_slots_and_first_state() {
+		let case = TestCase::new(indoc! {"
+				func sum(n: u32) -> u32 {
+					loop (i: u32, total) = (0, n) {
+						if i == n { break total };
+						if i == 7 { continue (i + 2, total) };
+						({ total: total + i, i: i + 1 })
+					}
+				}
+				func count() -> u32 {
+					loop mut i: u32 = 0 {
+						i += 1;
+						if i > 3 { break i };
+						({ i })
+					}
+				}
+				func by_name(n: u32) -> u32 {
+					local zero: u32 = 0;
+					loop (a, b) = ({ b: n, a: zero }) {
+						if a == b { break a };
+						(a + 1, b)
+					}
+				}
+			"});
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.locals("sum"),
+			[
+				("n".into(), "u32".into()),
+				("i".into(), "u32".into()),
+				("total".into(), "u32".into())
+			]
+		);
+		assert_eq!(
+			case.shape("sum"),
+			"(block => (loop (i#1 total#2) = (tuple 0 n#0) \
+			 (if (== i#1 n#0) (block => (break loop total#2))) \
+			 (if (== i#1 7) (block => (continue loop (tuple (+ i#1 2) total#2)))) \
+			 => (tuple 1=(+ total#2 i#1) 0=(+ i#1 1))))"
+		);
+		assert_eq!(
+			case.locals("by_name"),
+			[
+				("n".into(), "u32".into()),
+				("zero".into(), "u32".into()),
+				("a".into(), "u32".into()),
+				("b".into(), "u32".into())
+			]
+		);
+	}
+
+	/// The first state is built outside the loop: it reads the names around
+	/// the loop, and cannot jump to it.
+	#[test]
+	fn a_loop_state_is_first_given_outside_the_loop() {
+		let case = TestCase::new(indoc! {"
+				func f(i: u32) -> u32 {
+					loop i: u32 = i + 1 { break i }
+				}
+			"});
+		case.diagnostics().assert_none();
+		assert_eq!(
+			case.shape("f"),
+			"(block => (loop (i#1) = (+ i#0 1) => (break loop i#1)))"
+		);
+
+		let case = TestCase::new(indoc! {"
+				func f() {
+					loop :l i: u32 = block { break :l 0 } { break }
+				}
+			"});
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UndeclaredLabel]);
+	}
+
+	/// A slot left to the first state needs a typed part of it, as a `local`
+	/// does; the state's type is fixed there, so nothing later reports it
+	/// again.
+	#[test]
+	fn an_untyped_slot_needs_a_typed_first_state() {
+		let case = TestCase::new(indoc! {"
+				func f() -> u32 {
+					loop (i, j: u32) = (0, 0) {
+						if j == 0 { break 1 };
+						(i + 1: u32, j)
+					}
+				}
+			"});
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::TypeAnnotationRequired]);
+	}
+
+	/// The next state is the whole state: a body that ends in a statement,
+	/// a bare `continue` and a value of another type are mismatches.
+	#[test]
+	fn a_loop_body_gives_the_whole_next_state() {
+		let case = TestCase::new(indoc! {"
+				func f(c: Bool) {
+					loop i: u32 = 0 {
+						if c { continue };
+						if c { continue c };
+						if c { break };
+					}
+				}
+			"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+			DiagnosticCode::TypeMistmatch,
+		]);
+
+		// A body whose every path leaves gives nothing, and fits.
+		let case = TestCase::new(indoc! {"
+				func f() -> u32 {
+					loop i: u32 = 0 { break i }
+				}
+			"});
+		case.diagnostics().assert_none();
+	}
+
+	/// A named next state follows a call by name's rules: every slot once,
+	/// and nothing else.
+	#[test]
+	fn a_named_state_gives_every_slot_once() {
+		let case = TestCase::new(indoc! {"
+				func f(c: Bool) {
+					loop (a: u32, b: u32) = (0, 0) {
+						if c { continue ({ a: 1, x: 2, b }) };
+						if c { continue ({ a: 1, a: 2, b }) };
+						({ a: 1 })
+					}
+				}
+			"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnknownParameterName,
+			DiagnosticCode::DuplicateNamedArgument,
+			DiagnosticCode::MissingArguments,
+		]);
+		case.diagnostics()
+			.assert_error_saying("the loop has no parameter named `x`");
+		case.diagnostics()
+			.assert_error_saying("missing argument `b` for the loop");
+	}
+
+	/// A repeated slot name is reported where it is declared, as a
+	/// function's is. The slot keeps its place in the state, but the name
+	/// finds the first, in the body and in a named state.
+	#[test]
+	fn a_repeated_slot_name_finds_the_first() {
+		let case = TestCase::new(indoc! {"
+				func positional() -> u32 {
+					loop (a: u32, a: u64) = (1, 2) { break a }
+				}
+				func named() -> u32 {
+					loop (a: u32, a: u64) = ({ a: 1 }) { break a }
+				}
+			"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::DuplicateParameter,
+			DiagnosticCode::DuplicateParameter,
+		]);
+	}
+
+	/// A labelled `continue` gives the state of the loop it names, by its
+	/// names.
+	#[test]
+	fn a_labelled_continue_gives_the_named_loops_state() {
+		let case = TestCase::new(indoc! {"
+				func f(n: u32) -> u32 {
+					loop :rows row: u32 = 0 {
+						if row == n { break row };
+						loop col: u32 = 0 {
+							if col == n { continue :rows ({ row: row + 1 }) };
+							col + 1
+						}
+					}
+				}
+			"});
+		case.diagnostics().assert_none();
+	}
+
+	/// Outside a loop's next state, a named list's names mean nothing: it
+	/// is reported once, and its values are still checked.
+	#[test]
+	fn a_named_list_elsewhere_is_reported_once() {
+		let case = TestCase::new(indoc! {"
+				func f(x: u32) -> u32 {
+					local y = ({ a: x, b: missing });
+					loop i: u32 = 0 {
+						if i == 0 { break ({ i }) };
+						if i == 1 { ({ i }) } else { i }
+					}
+				}
+			"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::NamedListWithoutNames,
+			DiagnosticCode::UndeclaredIdentifier,
+			DiagnosticCode::NamedListWithoutNames,
+			DiagnosticCode::NamedListWithoutNames,
+		]);
+	}
+
 	#[test]
 	fn a_label_names_the_scope_a_jump_leaves() {
 		let case = TestCase::new(indoc! {"
@@ -4177,7 +4449,7 @@ mod tests {
 		case.diagnostics().assert_none();
 		assert_eq!(
 			case.shape("f"),
-			"(block => (loop (loop (if c#0 (block (break outer 1))) \
+			"(block => (loop => (loop (if c#0 (block (break outer 1))) \
 			 (continue outer))))"
 		);
 		assert_eq!(case.body_type("f"), "u32");
@@ -4282,12 +4554,12 @@ mod tests {
 		// An arm's braces are not a target; a `block` written in an arm is.
 		assert_eq!(
 			case.shape("arm"),
-			"(block => (loop (match o#0 (Less => (block => (break loop 4))) \
+			"(block => (loop => (match o#0 (Less => (block => (break loop 4))) \
 			 (_ => (block => (break block))))))"
 		);
 		assert_eq!(
 			case.shape("past"),
-			"(block => (loop (block (if c#0 (block => (break outer 5))))))"
+			"(block => (loop => (block (if c#0 (block => (break outer 5))))))"
 		);
 	}
 
@@ -6717,7 +6989,7 @@ mod tests {
 				func twice() { d({ a: 1, a: 2 }) }
 			"});
 		case.diagnostics().assert_codes(&[
-			DiagnosticCode::DuplicateFunctionParameter,
+			DiagnosticCode::DuplicateParameter,
 			DiagnosticCode::DuplicateNamedArgument,
 		]);
 		assert_eq!(case.shape("once"), "(block => (call d 1))");
@@ -6761,9 +7033,8 @@ mod tests {
 			.assert_error_saying("function `f` has no parameter named `c`");
 		case.diagnostics()
 			.assert_error_saying("argument `a` given more than once");
-		case.diagnostics().assert_error_saying(
-			"missing argument `a` in call to function `f`",
-		);
+		case.diagnostics()
+			.assert_error_saying("missing argument `a` for function `f`");
 		case.diagnostics()
 			.assert_error_saying("function `m` has no parameter named `self`");
 		assert_eq!(case.shape("missing"), "(block => (call f 1=2))");
@@ -6796,7 +7067,7 @@ mod tests {
 			"struct constructor `W` takes 2 arguments but 1 was supplied",
 		);
 		case.diagnostics().assert_error_saying(
-			"missing argument `y` in call to struct constructor `W`",
+			"missing argument `y` for struct constructor `W`",
 		);
 	}
 
@@ -8630,21 +8901,6 @@ mod tests {
 		DiagnosticView::new("parse", &parser, &case.files)
 			.assert_codes(&[DiagnosticCode::UnexpectedToken]);
 		case.diagnostics().assert_none();
-	}
-
-	/// A named list has no type of its own: until a loop's state gives its
-	/// names a meaning, it is reported once, and its values are still checked.
-	#[test]
-	fn a_named_list_is_not_checked_yet() {
-		let case = TestCase::new(indoc! {"
-			func f(x: u32) {
-			    local y = ({ a: x, b: missing });
-			}
-		"});
-		case.diagnostics().assert_codes(&[
-			DiagnosticCode::UndeclaredIdentifier,
-			DiagnosticCode::UnsupportedExpression,
-		]);
 	}
 
 	/// A named argument whose value is not written yet still names its

@@ -417,20 +417,26 @@ pub(super) enum ExprKind {
 		then_block: ExprIdx,
 		else_block: Option<ExprIdx>,
 	},
-	/// `loop { statements }`, owning `scope`. Its type comes from the
+	/// `loop (slots) = first { body }`, owning `scope`, which declares the
+	/// slots, in order. `first` is the first state, built outside the loop;
+	/// `body` is a `Block` whose result is the next state. A loop without a
+	/// header has no slots and the state `()`. Its type comes from the
 	/// `break`s that leave it; with none, it never ends and is `!`.
 	Loop {
 		scope: ScopeIdx,
-		statements: ExprRange,
+		first: Option<ExprIdx>,
+		body: ExprIdx,
 	},
 	/// Leaves `scope`, a loop or a labelled block, giving it `value`.
 	Break {
 		scope: ScopeIdx,
 		value: Option<ExprIdx>,
 	},
-	/// Starts the next iteration of `scope`, a loop.
+	/// Starts the next iteration of `scope`, a loop, with `value` as its
+	/// state (`()` without one).
 	Continue {
 		scope: ScopeIdx,
+		value: Option<ExprIdx>,
 	},
 	Return {
 		value: Option<ExprIdx>,
@@ -748,6 +754,15 @@ impl Body {
 
 	pub(super) fn scope(&self, scope: ScopeIdx) -> &Scope {
 		&self.scopes[usize::from(scope)]
+	}
+
+	/// The locals `scope` declares, in order.
+	pub(super) fn scope_locals(
+		&self,
+		scope: ScopeIdx,
+	) -> impl ExactSizeIterator<Item = LocalIdx> + use<> {
+		let LocalRange { start, len } = self.scope(scope).locals;
+		(start..start + len).map(LocalIdx::new)
 	}
 
 	/// How many scopes there are; every `ScopeIdx` is below it.
@@ -1087,6 +1102,12 @@ impl Body {
 
 	pub(super) fn set_ty(&mut self, expr: ExprIdx, ty: TypeIndex) {
 		self.types[usize::from(expr)] = ty;
+	}
+
+	/// Settles the type of a local declared before what gives it was built:
+	/// a loop's slot, typed by the first state.
+	pub(super) fn set_local_ty(&mut self, local: LocalIdx, ty: TypeIndex) {
+		self.locals[usize::from(local)].ty = ty;
 	}
 }
 

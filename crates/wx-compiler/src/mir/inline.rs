@@ -75,6 +75,7 @@ pub fn run(mir: &mut MIR, policy: Policy) {
 				code.root,
 				&code.locals,
 				code.label_count,
+				&mir.signatures,
 			) {
 			panic!("inlining broke the MIR arena's invariants: {error:?}");
 		}

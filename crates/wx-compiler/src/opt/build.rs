@@ -87,6 +87,9 @@ enum Label {
 		header: JoinId,
 		exit: JoinId,
 		writes: Run,
+		/// The placeholder phi of its first parameter column; the rest
+		/// follow it.
+		params: NodeId,
 	},
 }
 
@@ -280,7 +283,18 @@ impl Builder<'_> {
 			ExprKind::Block { label, statements } => {
 				self.block(expr, label, statements, ty)
 			}
-			ExprKind::Loop { label, body } => self.lp(expr, label, body, ty),
+			ExprKind::Loop {
+				label, entry, body, ..
+			} => self.lp(expr, label, entry, body, ty),
+			ExprKind::LoopParam { label, index } => {
+				let Some(Label::Loop { params, .. }) =
+					self.labels[usize::from(label)]
+				else {
+					unreachable!("a loop parameter of a block's label")
+				};
+				self.built.push(NodeId::new(u32::from(params) + index));
+				true
+			}
 			ExprKind::Break { label, value } => {
 				let base = self.built.len();
 				if let Some(value) = value
@@ -298,13 +312,20 @@ impl Builder<'_> {
 				self.effect(Effect::Branch { join, row });
 				false
 			}
-			ExprKind::Continue { label } => {
+			ExprKind::Continue { label, value } => {
+				let base = self.built.len();
+				if let Some(value) = value
+					&& !self.expr(value)
+				{
+					return false;
+				}
 				let Some(Label::Loop { header, writes, .. }) =
 					self.labels[usize::from(label)]
 				else {
 					unreachable!("a continue of a block's label")
 				};
-				let row = self.add_row(header, writes, self.built.len());
+				let row = self.add_row(header, writes, base);
+				self.built.truncate(base);
 				self.effect(Effect::Branch { join: header, row });
 				false
 			}
@@ -485,21 +506,31 @@ impl Builder<'_> {
 		self.close_join(exit, writes)
 	}
 
-	/// A loop's header gets a placeholder phi per column before its body
-	/// is built, since the body reads them before the back edges exist;
-	/// once they do, a placeholder whose rows are itself or one value is
-	/// that value.
+	/// A loop's header has a column per local its subtree writes, then one
+	/// per parameter: the entry's values come in on its first row, the
+	/// body's and each `Continue`'s on the back edges. Each column gets a
+	/// placeholder phi before the body is built, since the body reads them
+	/// before the back edges exist; once they do, a placeholder whose rows
+	/// are itself or one value is that value.
 	fn lp(
 		&mut self,
 		expr: ExprId,
 		label: LabelId,
+		entry: Option<ExprId>,
 		body: ExprId,
 		ty: ValueType,
 	) -> bool {
+		let base = self.built.len();
+		if let Some(entry) = entry
+			&& !self.expr(entry)
+		{
+			return false;
+		}
+		let params = self.built.len() - base;
 		let writes = self.writes.of(expr);
 		let exit = self.open_join(writes, scalars(self.mir, ty).len());
-		let header = self.open_join(writes, 0);
-		self.add_row(header, writes, self.built.len());
+		let header = self.open_join(writes, params);
+		self.add_row(header, writes, base);
 		let placeholders = self.function.kinds.len();
 		for (column, &local) in
 			self.writes.locals[writes.range()].iter().enumerate()
@@ -511,15 +542,25 @@ impl Builder<'_> {
 			};
 			self.bindings[usize::from(local)] = self.function.push(phi, ty);
 		}
+		let first_param = NodeId::new(self.function.kinds.len() as u32);
+		for at in 0..params {
+			let ty = self.function.ty(self.built[base + at]);
+			let phi = NodeKind::Phi {
+				join: header,
+				column: (writes.len() + at) as u32,
+			};
+			self.function.push(phi, ty);
+		}
+		self.built.truncate(base);
 		self.labels[usize::from(label)] = Some(Label::Loop {
 			header,
 			exit,
 			writes,
+			params: first_param,
 		});
 		let start = self.sequence.len();
-		let base = self.built.len();
+		// The body's value is the next iteration's parameters.
 		if self.expr(body) {
-			self.built.truncate(base);
 			let row = self.add_row(header, writes, base);
 			self.effect(Effect::Branch { join: header, row });
 		}

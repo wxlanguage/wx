@@ -52,10 +52,16 @@ index_newtype!(
 	ImportIdx
 );
 index_newtype!(
-	/// Index into [`MIR::signatures`]: a function's signature, or a
-	/// multi-result type.
+	/// Index into [`MIR::signatures`]: a function's signature, a
+	/// multi-result type, or a loop's.
 	SignatureIndex
 );
+
+impl SignatureIndex {
+	/// `[] -> []`, every table's first entry: the type of a loop without
+	/// parameters.
+	pub const EMPTY: Self = Self(0);
+}
 
 // `Debug` is gated on `debug_assertions` as well as `test`, so that panics in
 // a debug build can name the offending type and a release test build can

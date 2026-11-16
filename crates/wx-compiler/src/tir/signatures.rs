@@ -10109,7 +10109,7 @@ pub(super) mod tests {
 		);
 		assert_eq!(
 			case.sema.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::DuplicateFunctionParameter.code())
+			Some(DiagnosticCode::DuplicateParameter.code())
 		);
 	}
 
