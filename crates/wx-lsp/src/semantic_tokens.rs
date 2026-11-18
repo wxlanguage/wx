@@ -15,10 +15,9 @@
 //!
 //! The legend is standard LSP only, so every theme colours it.
 
-use std::collections::BTreeMap;
-
+use codespan_reporting::files::Files as _;
 use tower_lsp_server::ls_types::{
-	Range, SemanticToken, SemanticTokenModifier, SemanticTokenType,
+	Position, Range, SemanticToken, SemanticTokenModifier, SemanticTokenType,
 	SemanticTokensLegend,
 };
 use wx_compiler::diagnostics::TextSpan;
@@ -27,11 +26,9 @@ use wx_compiler::tir::{
 	AccessKind, BodyOwner, DeclKind, Definition, FunctionIdx, MemberKind,
 	Reference,
 };
-use wx_compiler::vfs::FileId;
+use wx_compiler::vfs::{FileId, Files};
 
-use crate::convert::{
-	byte_offset_to_utf16_offset, byte_to_position, position_to_offset,
-};
+use crate::convert::{byte_offset_to_utf16_offset, position_to_offset};
 use crate::query;
 use crate::snapshot::Snapshot;
 
@@ -124,51 +121,64 @@ pub(crate) fn tokens(
 			.unwrap_or("")
 	};
 
-	// Each name's token, or `None` for a name that is not coloured. A
-	// declaration is inserted after the uses, so it wins at a shared name,
-	// even when it is not coloured itself.
-	let mut tokens: BTreeMap<TextSpan, Option<(TokenType, u32)>> =
-		BTreeMap::new();
-	for (span, reference) in query::resolutions_in(&snapshot.sema, file) {
-		let span = span.span;
-		if !wanted(span) {
-			continue;
+	// The uses and the declarations, each in source order, merged into one
+	// stream; a declaration wins at a name that is both.
+	let mut uses = query::resolutions_in(&snapshot.sema, file)
+		.map(|(span, reference)| (span.span, reference))
+		.peekable();
+	let mut declarations = snapshot
+		.definitions_in(file)
+		.map(|(span, definition)| (span.span, definition))
+		.peekable();
+	let names = std::iter::from_fn(|| {
+		let declared = declarations.peek().map(|&(span, _)| span);
+		if uses.peek().is_some_and(|&(at, _)| {
+			declared.is_none_or(|declared| at < declared)
+		}) {
+			let (span, reference) = uses.next()?;
+			return Some((span, Name::Use(reference)));
 		}
-		let modification = match reference {
-			Reference::Local {
-				access: AccessKind::Write | AccessKind::ReadWrite,
-				..
-			}
-			| Reference::Field {
-				access: AccessKind::Write | AccessKind::ReadWrite,
-				..
-			} => MODIFICATION,
-			_ => 0,
-		};
-		let token = token(
-			snapshot,
-			reference.definition(),
-			written(span),
-			modification,
-		);
-		tokens.insert(span, token);
-	}
-	for (span, definition) in snapshot.definitions_in(file) {
-		let span = span.span;
-		if !wanted(span) {
-			continue;
-		}
-		let token = token(snapshot, definition, written(span), DECLARATION);
-		tokens.insert(span, token);
-	}
+		let (span, definition) = declarations.next()?;
+		uses.next_if(|&(at, _)| at == span);
+		Some((span, Name::Declaration(definition)))
+	});
 
 	let mut data = Vec::new();
+	let mut cursor = Cursor::default();
 	let (mut line, mut character) = (0, 0);
-	for (span, token) in tokens {
+	for (span, name) in names {
+		if !wanted(span) {
+			continue;
+		}
+		let token = match name {
+			Name::Use(reference) => {
+				let modification = match reference {
+					Reference::Local {
+						access: AccessKind::Write | AccessKind::ReadWrite,
+						..
+					}
+					| Reference::Field {
+						access: AccessKind::Write | AccessKind::ReadWrite,
+						..
+					} => MODIFICATION,
+					_ => 0,
+				};
+				token(
+					snapshot,
+					reference.definition(),
+					written(span),
+					modification,
+				)
+			}
+			Name::Declaration(definition) => {
+				token(snapshot, definition, written(span), DECLARATION)
+			}
+		};
 		let Some((kind, modifiers)) = token else {
 			continue;
 		};
-		let position = byte_to_position(files, file, usize::from(span.start))?;
+		let position =
+			cursor.advance(files, file, source, usize::from(span.start))?;
 		let delta_line = position.line - line;
 		data.push(SemanticToken {
 			delta_line,
@@ -186,6 +196,51 @@ pub(crate) fn tokens(
 		(line, character) = (position.line, position.character);
 	}
 	Some(data)
+}
+
+/// A written name: a use the compiler resolved, or a declaration.
+enum Name {
+	Use(Reference),
+	Declaration(Definition),
+}
+
+/// The position of the last token, carried forward: tokens come in source
+/// order, so each counts only the text since the one before it, and looks
+/// its line up only when it starts on a later one.
+#[derive(Default)]
+struct Cursor {
+	/// The byte offset of the last token's start.
+	at: usize,
+	line: u32,
+	/// The byte offset its line ends at, where the next one starts.
+	line_end: usize,
+	character: u32,
+}
+
+impl Cursor {
+	fn advance(
+		&mut self,
+		files: &Files,
+		file: FileId,
+		source: &str,
+		offset: usize,
+	) -> Option<Position> {
+		if offset >= self.line_end {
+			let line = files.line_index(file, offset).ok()?;
+			let range = files.line_range(file, line).ok()?;
+			self.line = line as u32;
+			self.line_end = range.end;
+			self.at = range.start;
+			self.character = 0;
+		}
+		self.character +=
+			byte_offset_to_utf16_offset(source.get(self.at..offset)?) as u32;
+		self.at = offset;
+		Some(Position {
+			line: self.line,
+			character: self.character,
+		})
+	}
 }
 
 /// The token of a name of `definition` written as `written`, with
