@@ -10,7 +10,7 @@
 //   └──────────────┴───────────┴─────────────┴─────────────────┴──── ·· ─┘
 //   0          DATA_END                                     next    heap end
 
-#[memory_limits({ min_pages: 1 })]
+#[memory_limits{ min_pages: 1 }]
 memory heap: u32;
 
 // A monotonic bump allocator over `heap`: it only ever moves `next` forward,
@@ -20,7 +20,7 @@ struct BumpAllocator(next: RawPtr<heap, u8>);
 
 impl BumpAllocator {
     pub func from_addr(start: u32) -> Self {
-        Self({ next: RawPtr::from_addr(start) })
+        Self{ next: RawPtr::from_addr(start) }
     }
 }
 
@@ -44,7 +44,7 @@ pub struct Vec<T>(
 impl<T: StackValue> Vec<T> {
     #[inline]
     pub func new(alloc: heap::*BumpAllocator) -> Self {
-        Self({ buf: RawPtr::null(), len: 0, cap: 0, alloc })
+        Self{ buf: RawPtr::null(), len: 0, cap: 0, alloc }
     }
 
     // Allocates the header itself through `alloc`, then hands back a pointer to
@@ -56,8 +56,8 @@ impl<T: StackValue> Vec<T> {
     }
 
     pub func push(self: heap::*Self, value: T) {
-        if self.len == self.cap {
-            local new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
+        if (self.len == self.cap) {
+            local new_cap = if (self.cap == 0) { 4 } else { self.cap * 2 };
             local new_buf = self.alloc.allocate(Layout::array::<T>(new_cap));
             memory_copy(
                 new_buf,
@@ -111,13 +111,13 @@ pub func demo() -> i32 {
     local v = Vec::<i32>::new_in(alloc);
 
     loop (n: i32 = 1) {
-        if n > 10 { break };
+        if (n > 10) { break };
         v.push(n);
         continue(n + 1);
     }
 
     loop (sum: i32 = 0, i: u32 = 0) {
-        if i == v.len() { break sum };
+        if (i == v.len()) { break sum };
         (sum + v.get(i), i + 1)
     }
 }

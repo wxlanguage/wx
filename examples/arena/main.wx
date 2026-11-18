@@ -2,11 +2,11 @@ struct Arena<Mem: Memory>(start: Mem::&u8, end: Mem::&u8, cursor: Mem::&u8);
 
 impl<Mem: Memory> Arena<Mem> {
     func new(buffer: Mem::&[u8]) -> Self {
-        Self({
+        Self{
             start: buffer.ptr(),
             end: ptr::add(buffer.ptr(), buffer.len()),
             cursor: buffer.ptr(),
-        })
+        }
     }
 }
 
@@ -41,7 +41,7 @@ impl<Idx> IntoIterator for Range<Idx> {
     type IntoIter = RangeIter<Self::Item>;
 
     func into_iter(self: Self) -> Self::IntoIter {
-        RangeIter({ start: self.start, end: self.end })
+        RangeIter{ start: self.start, end: self.end }
     }
 }
 
@@ -78,7 +78,7 @@ struct BumpAllocator(next: RawPtr<heap, u8>);
 
 impl BumpAllocator {
     pub func from_addr(start: u32) -> Self {
-        Self({ next: RawPtr::from_addr(start) })
+        Self{ next: RawPtr::from_addr(start) }
     }
 }
 
@@ -93,11 +93,11 @@ impl Allocator for BumpAllocator {
 }
 
 func test() {
-    local range: Range<u32> = Range({ start: 0, end: 10 });
+    local range: Range<u32> = Range{ start: 0, end: 10 };
     local range_iter = range.into_iter();
     loop (i: u32 = 0) {
         local x = range_iter.next();
-        if i > 10 { break };
+        if (i > 10) { break };
         continue(i + 1);
     };
 }

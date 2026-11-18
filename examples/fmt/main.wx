@@ -18,7 +18,7 @@ pub func decimal<M: Memory>(buffer: M::*[u8], value: u32) -> M::&[u8] {
         at -= 1;
         buffer[at] = transmute('0' + value % 10);
         local rest = value / 10;
-        if rest == 0 { break at };
+        if (rest == 0) { break at };
         (at, rest)
     };
     slices::slice_at(buffer, at, buffer.len() - at)
@@ -27,7 +27,7 @@ pub func decimal<M: Memory>(buffer: M::*[u8], value: u32) -> M::&[u8] {
 /// `value` in decimal with a minus sign when negative, written at the end of
 /// `buffer`, which must hold `SIGNED_LEN` bytes.
 pub func signed<M: Memory>(buffer: M::*[u8], value: i32) -> M::&[u8] {
-    if value >= 0 { return decimal::<M>(buffer, transmute(value)) };
+    if (value >= 0) { return decimal::<M>(buffer, transmute(value)) };
     // The magnitude as a `u32`, which also holds that of the smallest `i32`.
     local digits = decimal::<M>(buffer, 0 - transmute::<i32, u32>(value));
     local at = buffer.len() - digits.len() - 1;
@@ -42,13 +42,13 @@ pub func hex<M: Memory>(buffer: M::*[u8], value: u32) -> M::&[u8] {
         at -= 1;
         local digit = value % 16;
         buffer[at]
-            = transmute(if digit < 10 {
+            = transmute(if (digit < 10) {
                 '0' + digit
             } else {
                 'a' + digit - 10
             });
         local rest = value / 16;
-        if rest == 0 { break at };
+        if (rest == 0) { break at };
         (at, rest)
     };
     slices::slice_at(buffer, at, buffer.len() - at)

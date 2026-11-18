@@ -562,10 +562,10 @@ fn a_jump_keyword_and_its_label_lead_to_different_declarations() {
 	let source = indoc::indoc! {"
 		func f(c: Bool) -> u32 {
 			local x: u32 = block { break 2; };
-			if c { return x; }
+			if (c) { return x; }
 			loop :outer {
 				loop {
-					if c { continue :outer; }
+					if (c) { continue :outer; }
 					break;
 				}
 				break :outer x;
@@ -757,8 +757,8 @@ fn references_keep_shorthand_field_and_value_roles_separate() {
 		struct S(value: u32);
 		func take(value: u32) -> u32 { value }
 		func f(value: u32) -> u32 {
-			local s = S({ value });
-			_ = take({ value: s.value });
+			local s = S{ value };
+			_ = take{ value: s.value };
 			value
 		}
 	"};
@@ -781,16 +781,16 @@ fn references_keep_shorthand_field_and_value_roles_separate() {
 	// The field and caller's local each include the shorthand, but are not
 	// the same symbol. The shorthand cursor chooses the value, as hover does.
 	let field = vec![
-		position_of(source, "value });", 0),
-		position_of(source, "value });", 1),
+		position_of(source, "value };", 0),
+		position_of(source, "value };", 1),
 	];
 	assert_eq!(refs("value:", 0), field);
 	let local = vec![
-		position_of(source, "value });", 0),
+		position_of(source, "value };", 0),
 		position_of(source, "value\n", 0),
 	];
 	assert_eq!(refs("value:", 2), local);
-	assert_eq!(refs("value });", 0), local);
+	assert_eq!(refs("value };", 0), local);
 	// The callee's parameter includes both its body local and its call label.
 	assert_eq!(
 		refs("value:", 1),
@@ -1007,14 +1007,14 @@ fn hover_renders_a_jump_and_its_target_as_signatures() {
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
 		func f(n: u32) -> u32 {
-			local x: u32 = block :done { if n == 0 { break :done 1 }; 2 };
+			local x: u32 = block :done { if (n == 0) { break :done 1 }; 2 };
 			loop :outer (i: u32 = 0, mut total: u32 = x) {
-				if i == n { break total };
+				if (i == n) { break total };
 				loop {
-					if i == 1 { continue :outer(i + 1, total) };
+					if (i == 1) { continue :outer(i + 1, total) };
 					break;
 				}
-				continue({ i: i + 1, total: total + i })
+				continue { i: i + 1, total: total + i }
 			}
 		}
 		func pair() -> (u32, u32) {
@@ -1024,10 +1024,10 @@ fn hover_renders_a_jump_and_its_target_as_signatures() {
 			loop {}
 		}
 		func pick(c: Bool, d: Bool) -> u8 {
-			if c { 1 } else if d { 2 } else { 3 }
+			if (c) { 1 } else if (d) { 2 } else { 3 }
 		}
 		func split(a: u8, b: Bool) -> (u8, Bool) {
-			if b { return (a, b) };
+			if (b) { return (a, b) };
 			match (a, b) {
 				(0, _) => (1, b),
 				_ => return (0, b),
@@ -1071,8 +1071,8 @@ fn hover_renders_a_jump_and_its_target_as_signatures() {
 	// An `if` takes its condition and gives its branches' value; it is no
 	// target, and one without `else` gives `()`.
 	assert_eq!(hover("if", 0), wx("if(Bool) -> ()"));
-	assert_eq!(hover("if c", 0), wx("if(Bool) -> u8"));
-	assert_eq!(hover("if d", 0), wx("if(Bool) -> u8"));
+	assert_eq!(hover("if (c)", 0), wx("if(Bool) -> u8"));
+	assert_eq!(hover("if (d)", 0), wx("if(Bool) -> u8"));
 	// A `match` takes the value it matches, a tuple as its values.
 	assert_eq!(hover("match", 0), wx("match(u8, Bool) -> (u8, Bool)"));
 	// A `return` takes the values its body gives.
@@ -1904,7 +1904,7 @@ fn semantic_tokens_count_columns_in_utf16_and_honour_a_range() {
 		func main() -> u32 {
 		    local c: Char = '😀'; local d = c;
 		    _ = d;
-		    local Pair({ left, right }) = Pair(1, 2);
+		    local Pair{ left, right } = Pair(1, 2);
 		    left + right
 		}
 		export { main }
@@ -2089,9 +2089,9 @@ fn rename_expands_a_shorthand_to_keep_its_other_side() {
 		func take(left: u32) -> u32 { left }
 		func main() -> u32 {
 		    local left: u32 = 1;
-		    local pair = Pair({ left, right: 2 });
-		    local Pair({ right, .. }) = pair;
-		    take({ left }) + right
+		    local pair = Pair{ left, right: 2 };
+		    local Pair{ right, .. } = pair;
+		    take{ left } + right
 		}
 		export { main }
 	"};
@@ -2108,14 +2108,14 @@ fn rename_expands_a_shorthand_to_keep_its_other_side() {
 	// The caller's local is the value side of both argument shorthands.
 	let text = rename("left: u32 = 1", 0, "first").unwrap();
 	assert!(text.contains("local first: u32 = 1;"), "{text}");
-	assert!(text.contains("Pair({ left: first, right: 2 })"), "{text}");
-	assert!(text.contains("take({ left: first })"), "{text}");
+	assert!(text.contains("Pair{ left: first, right: 2 }"), "{text}");
+	assert!(text.contains("take{ left: first }"), "{text}");
 
 	// The field is the label side of the construction's shorthand.
 	let text = rename("left: u32, right", 0, "head").unwrap();
 	assert!(text.contains("struct Pair(head: u32"), "{text}");
-	assert!(text.contains("Pair({ head: left, right: 2 })"), "{text}");
-	assert!(text.contains("take({ left })"), "{text}");
+	assert!(text.contains("Pair{ head: left, right: 2 }"), "{text}");
+	assert!(text.contains("take{ left }"), "{text}");
 
 	// The callee's parameter is the label side of the call's shorthand.
 	let text = rename("left: u32) -> u32", 0, "value").unwrap();
@@ -2123,14 +2123,14 @@ fn rename_expands_a_shorthand_to_keep_its_other_side() {
 		text.contains("func take(value: u32) -> u32 { value }"),
 		"{text}"
 	);
-	assert!(text.contains("take({ value: left })"), "{text}");
+	assert!(text.contains("take{ value: left }"), "{text}");
 
 	// A pattern's shorthand names the field and binds the local.
 	let text = rename("right: u32", 0, "tail").unwrap();
-	assert!(text.contains("local Pair({ tail: right, .. })"), "{text}");
+	assert!(text.contains("local Pair{ tail: right, .. }"), "{text}");
 	assert!(text.contains("+ right"), "{text}");
 	let text = rename("right\n}", 0, "rest").unwrap();
-	assert!(text.contains("local Pair({ right: rest, .. })"), "{text}");
+	assert!(text.contains("local Pair{ right: rest, .. }"), "{text}");
 	assert!(text.contains("+ rest"), "{text}");
 }
 
@@ -2539,7 +2539,7 @@ fn completion_after_a_module_in_a_value_offers_its_modules() {
 #[test]
 fn completion_after_an_enum_offers_its_variants() {
 	let labels = completions(
-		"enum Kind(value: u8) { A = 0, B }\nfunc f(k: Kind) -> u8 {\n    match k {\n        Kind::$0 => 1,\n        _ => 2,\n    }\n}\n",
+		"enum Kind(value: u8) { A = 0, B }\nfunc f(k: Kind) -> u8 {\n    match (k) {\n        Kind::$0 => 1,\n        _ => 2,\n    }\n}\n",
 	)
 	.expect("a pattern path after an enum");
 	assert_eq!(labels, ["A", "B"]);
@@ -2771,9 +2771,9 @@ fn completion_in_a_struct_pattern_offers_its_fields() {
 	// In a destructuring and a match arm, the room after a comma, and a
 	// name being written: the fields not written yet.
 	for source in [
-		"func f(p: Point) {\n    local Point({ x, $0 }) = p;\n}\n",
-		"func f(p: Point) {\n    local Point({ x, y$0 }) = p;\n}\n",
-		"func f(p: Point) -> u32 {\n    match p {\n        Point({ y$0, x }) => 1,\n    }\n}\n",
+		"func f(p: Point) {\n    local Point{ x, $0 } = p;\n}\n",
+		"func f(p: Point) {\n    local Point{ x, y$0 } = p;\n}\n",
+		"func f(p: Point) -> u32 {\n    match (p) {\n        Point{ y$0, x } => 1,\n    }\n}\n",
 	] {
 		let labels = completions(&format!("{PATTERN_ITEMS}{source}"))
 			.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
@@ -2781,13 +2781,13 @@ fn completion_in_a_struct_pattern_offers_its_fields() {
 	}
 	// An enum's repr, read as a struct's fields are.
 	let labels = completions(&format!(
-		"{PATTERN_ITEMS}func f(s: Signal) {{\n    local Signal({{ $0 }}) = s;\n}}\n"
+		"{PATTERN_ITEMS}func f(s: Signal) {{\n    local Signal{{ $0 }} = s;\n}}\n"
 	))
 	.unwrap();
 	assert_eq!(labels, ["number"]);
 	// `Self` in an impl for the struct.
 	let labels = completions(&format!(
-		"{PATTERN_ITEMS}impl Point {{\n    func g(self: Self) {{\n        local Self({{ z, $0 }}) = self;\n    }}\n}}\n"
+		"{PATTERN_ITEMS}impl Point {{\n    func g(self: Self) {{\n        local Self{{ z, $0 }} = self;\n    }}\n}}\n"
 	))
 	.unwrap();
 	assert_eq!(labels, ["x", "y"]);
@@ -2797,8 +2797,8 @@ fn completion_in_a_struct_pattern_offers_its_fields() {
 fn completion_in_a_struct_pattern_offers_nothing_the_checker_would_refuse() {
 	for source in [
 		// After `..`, and outside the braces.
-		"func f(p: Point) {\n    local Point({ x, ..$0 }) = p;\n}\n",
-		"func f(p: Point) {\n    local Point({ x })$0 = p;\n}\n",
+		"func f(p: Point) {\n    local Point{ x, ..$0 } = p;\n}\n",
+		"func f(p: Point) {\n    local Point{ x }$0 = p;\n}\n",
 	] {
 		assert_eq!(
 			completions(&format!("{PATTERN_ITEMS}{source}")),
@@ -2811,7 +2811,7 @@ fn completion_in_a_struct_pattern_offers_nothing_the_checker_would_refuse() {
 #[test]
 fn completion_in_a_fields_pattern_reads_the_pattern_after_its_colon() {
 	let labels = completions(&format!(
-		"{PATTERN_ITEMS}func f(p: Point) -> u32 {{\n    match p {{\n        Point({{ x: const L$0, .. }}) => 1,\n        _ => 2,\n    }}\n}}\n"
+		"{PATTERN_ITEMS}func f(p: Point) -> u32 {{\n    match (p) {{\n        Point{{ x: const L$0, .. }} => 1,\n        _ => 2,\n    }}\n}}\n"
 	))
 	.expect("a constant in a field's pattern");
 	assert_offers(&labels, &["LIMIT"], &["x", "helper"]);
@@ -2820,12 +2820,12 @@ fn completion_in_a_fields_pattern_reads_the_pattern_after_its_colon() {
 #[test]
 fn completion_of_a_constant_pattern_offers_constants() {
 	let labels = completions(&format!(
-		"{PATTERN_ITEMS}func f(n: u32) -> u32 {{\n    match n {{\n        const L$0 => 1,\n        _ => 2,\n    }}\n}}\n"
+		"{PATTERN_ITEMS}func f(n: u32) -> u32 {{\n    match (n) {{\n        const L$0 => 1,\n        _ => 2,\n    }}\n}}\n"
 	))
 	.expect("a constant pattern");
 	assert_offers(&labels, &["LIMIT", "Signal"], &["helper", "n"]);
 	let labels = completions(&format!(
-		"{PATTERN_ITEMS}func f(s: Signal) -> u32 {{\n    match s {{\n        Signal::$0 => 1,\n        _ => 2,\n    }}\n}}\n"
+		"{PATTERN_ITEMS}func f(s: Signal) -> u32 {{\n    match (s) {{\n        Signal::$0 => 1,\n        _ => 2,\n    }}\n}}\n"
 	))
 	.expect("a variant pattern");
 	assert_eq!(labels, ["Off", "On"]);
@@ -3189,18 +3189,18 @@ func h(a: u32) {}
 fn completion_of_a_named_argument_offers_the_callees_names() {
 	for (source, expected, absent) in [
 		// The room in the braces, and a name being written (a shorthand).
-		("g({ $0 })", &["alpha", "beta"][..], &["helper"][..]),
-		("g({ al$0 })", &["alpha", "beta"], &[]),
+		("g{ $0 }", &["alpha", "beta"][..], &["helper"][..]),
+		("g{ al$0 }", &["alpha", "beta"], &[]),
 		// A name written already is reported if written again.
-		("g({ alpha: 1, $0 })", &["beta"], &["alpha"]),
+		("g{ alpha: 1, $0 }", &["beta"], &["alpha"]),
 		// A struct's fields.
-		("Point({ $0 })", &["x"], &[]),
+		("Point{ $0 }", &["x"], &[]),
 		// A method's receiver: named through its type, given by the object.
-		("W::own({ $0 })", &["self", "first"], &[]),
-		("W().own({ $0 })", &["first"], &["self"]),
+		("W::own{ $0 }", &["self", "first"], &[]),
+		("W().own{ $0 }", &["first"], &["self"]),
 		// A trait impl's function is named as the impl names it, even where
 		// its trait leaves the parameter unnamed.
-		("W().m({ $0 })", &["count"], &["self"]),
+		("W().m{ $0 }", &["count"], &["self"]),
 	] {
 		let labels = completions(&format!(
 			"{COMPLETION_ITEMS}{NAMED_CALLS}func f() {{\n    {source};\n}}\n"
@@ -3214,10 +3214,10 @@ fn completion_of_a_named_argument_offers_the_callees_names() {
 fn completion_of_a_named_argument_through_self_offers_the_structs_fields() {
 	const PAIR: &str = "struct Pair(first: u32, second: u32);\n";
 	for source in [
-		"impl Pair { func make() -> Self { Self({ $0 }) } }",
-		"impl Pair { func make() -> Self { Pair({ $0 }) } }",
-		"impl Pair { func make() -> Self { Self({ first: 1, $0 }) } }",
-		"trait Make { func make() -> Self; }\nimpl Make for Pair { func make() -> Self { Self({ $0 }) } }",
+		"impl Pair { func make() -> Self { Self{ $0 } } }",
+		"impl Pair { func make() -> Self { Pair{ $0 } } }",
+		"impl Pair { func make() -> Self { Self{ first: 1, $0 } } }",
+		"trait Make { func make() -> Self; }\nimpl Make for Pair { func make() -> Self { Self{ $0 } } }",
 	] {
 		let labels = completions(&format!("{PAIR}{source}\n"))
 			.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
@@ -3238,21 +3238,21 @@ fn completion_of_a_named_state_offers_the_loops_parameters() {
 	let source = |site: &str| {
 		format!(
 			"func f(n: u32) -> u32 {{\n    loop :outer (low: u32 = 0, high = n) {{\n        \
-			 if low == high {{ break low }};\n        loop (i: u32 = 0) {{\n            \
+			 if (low == high) {{ break low }};\n        loop (i: u32 = 0) {{\n            \
 			 {site}\n        }}\n    }}\n}}\n"
 		)
 	};
 	for (site, expected, absent) in [
-		("continue({ $0 })", &["i"][..], &["low", "high"][..]),
-		("continue :outer({ $0 })", &["low", "high"], &["i"]),
-		("continue :outer({ low: 1, $0 })", &["high"], &["low"]),
+		("continue { $0 }", &["i"][..], &["low", "high"][..]),
+		("continue :outer { $0 }", &["low", "high"], &["i"]),
+		("continue :outer { low: 1, $0 }", &["high"], &["low"]),
 	] {
 		let labels = completions(&source(site))
 			.unwrap_or_else(|| panic!("nothing offered in {site:?}"));
 		assert_offers(&labels, expected, absent);
 	}
 	let items =
-		completion_items(&source("continue :outer({ $0 })"), false).unwrap();
+		completion_items(&source("continue :outer { $0 }"), false).unwrap();
 	let mut details: Vec<_> =
 		items.iter().map(|item| item.detail.as_deref()).collect();
 	details.sort();
@@ -3269,7 +3269,7 @@ fn completion_of_a_named_state_offers_the_loops_parameters() {
 #[test]
 fn completion_after_a_named_arguments_colon_offers_values() {
 	let labels = completions(&format!(
-		"{COMPLETION_ITEMS}{NAMED_CALLS}func f(n: u32) {{\n    g({{ alpha: $0 }});\n}}\n"
+		"{COMPLETION_ITEMS}{NAMED_CALLS}func f(n: u32) {{\n    g{{ alpha: $0 }};\n}}\n"
 	))
 	.expect("a value not written yet");
 	assert_offers(&labels, &["n", "helper"], &["alpha", "beta"]);
@@ -3288,9 +3288,9 @@ fn completion_in_a_named_lists_value_offers_values() {
 fn completion_offers_no_argument_names_the_checker_would_refuse() {
 	for source in [
 		// After the list.
-		"func f() {\n    g({ alpha: 1, beta: 2 })$0;\n}\n",
+		"func f() {\n    g{ alpha: 1, beta: 2 }$0;\n}\n",
 		// Braces not closed yet.
-		"func f() {\n    g({ $0",
+		"func f() {\n    g{ $0",
 	] {
 		assert_eq!(
 			completions(&format!("{COMPLETION_ITEMS}{NAMED_CALLS}{source}")),
@@ -3529,9 +3529,9 @@ fn completion_after_a_method_call_offers_the_results_members() {
 	for object in [
 		"x.trunc()",
 		"x.trunc().abs()",
-		"x.trunc({})",
+		"x.trunc{}",
 		"x.trunc( /* arguments */ )",
-		"x.trunc({ /* arguments */ })",
+		"x.trunc{ /* arguments */ }",
 	] {
 		let labels = completions(&format!("func f(x: f32) {{ {object}.$0 }}"))
 			.expect("members of the call's f32 result");
@@ -3548,7 +3548,7 @@ fn completion_after_a_method_call_offers_the_results_members() {
 
 #[test]
 fn completion_after_a_call_of_a_value_uses_its_result() {
-	for object in ["g()", "g({})", "cb()", "c()", "consume_unit()"] {
+	for object in ["g()", "g{}", "cb()", "c()", "consume_unit()"] {
 		let labels = completions(&format!(
 			"struct Caller();
 			impl Call for Caller {{
@@ -3571,7 +3571,7 @@ fn completion_after_a_call_of_a_value_uses_its_result() {
 
 #[test]
 fn completion_after_an_empty_construction_uses_the_struct() {
-	for object in ["Empty()", "Empty({})"] {
+	for object in ["Empty()", "Empty{}"] {
 		assert_eq!(
 			completions(&format!(
 				"struct Empty();
@@ -3649,11 +3649,10 @@ fn signature_help_tracks_positional_arguments_and_incomplete_calls() {
 #[test]
 fn signature_help_tracks_named_arguments_by_name_and_recovers_the_call() {
 	for call in [
-		"pair({ second: $0 })",
-		"pair({ second: $0",
-		"pair({ second: $0 }",
-		"pair({ first: 1, second: $0",
-		"pair({ second$0 })",
+		"pair{ second: $0 }",
+		"pair{ second: $0",
+		"pair{ first: 1, second: $0",
+		"pair{ second$0 }",
 	] {
 		let help = signature_help(
 			&format!("{SIGNATURE_FUNCTIONS}func f() {{ {call}"),
@@ -3667,7 +3666,7 @@ fn signature_help_tracks_named_arguments_by_name_and_recovers_the_call() {
 		assert_eq!(help.active_parameter, Some(1), "{call}");
 	}
 	let help = signature_help(
-		&format!("{SIGNATURE_FUNCTIONS}func f() {{ pair({{ $0"),
+		&format!("{SIGNATURE_FUNCTIONS}func f() {{ pair{{ $0"),
 		true,
 	)
 	.unwrap();
@@ -3714,11 +3713,7 @@ fn signature_help_omits_only_an_implicit_method_receiver() {
 			"func get(self: S, count: u32) -> u32",
 			Some(1),
 		),
-		(
-			"s.get({ count: $0 })",
-			"func get(count: u32) -> u32",
-			Some(0),
-		),
+		("s.get{ count: $0 }", "func get(count: u32) -> u32", Some(0)),
 	] {
 		let help = signature_help(
 			&format!("{source}func f(s: S) {{ {call}; }}"),
@@ -3793,7 +3788,7 @@ fn signature_help_names_parameters_through_impls_and_bounds() {
 		"trait Get: StackValue { func get(self: Self, count: u32) -> u32; }
 	struct S(); impl Get for S { func get(self: Self, count: u32) -> u32 { 0 } }";
 	for function in [
-		"func f(s: S) { s.get({ count: $0 }); }",
+		"func f(s: S) { s.get{ count: $0 }; }",
 		"func f<T: Get>(s: T) { s.get($0); }",
 	] {
 		let help =
@@ -4068,7 +4063,7 @@ fn completion_documentation_does_not_use_a_functions_docs_for_its_parameters() {
 			"parameter",
 		),
 		(
-			"/// The function.\nfunc f(parameter: u32) {}\nfunc g() { f({ $0 }); }",
+			"/// The function.\nfunc f(parameter: u32) {}\nfunc g() { f{ $0 }; }",
 			"parameter",
 		),
 	] {
@@ -4160,7 +4155,7 @@ fn completion_displays_call_punctuation_for_functions_and_constructors() {
 
 #[test]
 fn named_argument_completion_instantiates_a_methods_self_type() {
-	for call in ["x.add({ $0 })", "x.add({ rh$0 })", "x.add({ rhs$0: 0.0 })"] {
+	for call in ["x.add{ $0 }", "x.add{ rh$0 }", "x.add{ rhs$0: 0.0 }"] {
 		let items =
 			completion_items(&format!("func f(x: f64) {{ {call}; }}"), false)
 				.unwrap();
@@ -4180,23 +4175,23 @@ fn named_argument_completion_uses_inferred_and_explicit_generic_arguments() {
 	let declarations = "func choose<T: StackValue>(first: T, second: T) -> T { first }\nstruct Pair<T: StackValue>(first: T, second: T);";
 	for (function, expected) in [
 		(
-			"func f(x: f64) { choose({ first: x, $0 }); }",
+			"func f(x: f64) { choose{ first: x, $0 }; }",
 			vec![("second", "second: f64")],
 		),
 		(
-			"func f() { choose::<u32>({ $0 }); }",
+			"func f() { choose::<u32>{ $0 }; }",
 			vec![("first", "first: u32"), ("second", "second: u32")],
 		),
 		(
-			"func f() { choose({ $0 }); }",
+			"func f() { choose{ $0 }; }",
 			vec![("first", "first: T"), ("second", "second: T")],
 		),
 		(
-			"func f<T: StackValue>(x: T) { choose({ first: x, $0 }); }",
+			"func f<T: StackValue>(x: T) { choose{ first: x, $0 }; }",
 			vec![("second", "second: T")],
 		),
 		(
-			"func f(x: u32) { Pair({ first: x, $0 }); }",
+			"func f(x: u32) { Pair{ first: x, $0 }; }",
 			vec![("second", "second: u32")],
 		),
 	] {
@@ -4225,9 +4220,9 @@ fn named_argument_completion_normalizes_associated_types_when_known() {
 	}
 	struct S(); impl Has for S { type Item = u32; }";
 	for (function, expected) in [
-		("func f(s: S) { s.put({ $0 }); }", "value: u32"),
+		("func f(s: S) { s.put{ $0 }; }", "value: u32"),
 		(
-			"func f<T: Has>(s: T) { s.put({ $0 }); }",
+			"func f<T: Has>(s: T) { s.put{ $0 }; }",
 			"value: <T as Has>::Item",
 		),
 	] {
@@ -4246,9 +4241,9 @@ fn named_argument_completion_uses_the_impls_parameter_names() {
 		"trait Tr: StackValue { func take(self: Self, a: Self); }
 	struct S(); impl Tr for S { func take(self: Self, rhs: Self) {} }";
 	for (call, expected) in [
-		("s.take({ $0 })", vec![("rhs", "rhs: S")]),
+		("s.take{ $0 }", vec![("rhs", "rhs: S")]),
 		(
-			"S::take({ $0 })",
+			"S::take{ $0 }",
 			vec![("rhs", "rhs: S"), ("self", "self: S")],
 		),
 	] {
@@ -4276,7 +4271,7 @@ fn named_argument_completion_keeps_declaration_types_without_a_checked_call() {
 	let items = completion_items(
 		"memory heap: u32;
 		trait Tr: StackValue { func take(self: Self, rhs: Self); }
-		func f<T: Tr>(p: heap::&T) { p.take({ $0 }); }",
+		func f<T: Tr>(p: heap::&T) { p.take{ $0 }; }",
 		false,
 	)
 	.unwrap();
@@ -4524,14 +4519,14 @@ fn semantic_tokens_survive_recovered_blocks_and_labels() {
 			    local
 
 			    loop (a: i32 = 0, k = n) {
-			        if k == 1 { break a };
+			        if (k == 1) { break a };
 			        (a + 1, k - 1)
 			    }
 			}
 		"},
 		indoc::indoc! {"
 			func f(c: Bool) -> u8 {
-			    if :l c { 1 } else { 2 }
+			    if :l (c) { 1 } else { 2 }
 			}
 		"},
 	] {

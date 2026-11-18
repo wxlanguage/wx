@@ -7,7 +7,7 @@ import "host" as host {
 // A slice pointer becomes two i32 parameters: byte offset and element count.
 func sum(bytes: host::buffer::&[u8]) -> u32 {
     loop (total: u32 = 0, i: u32 = 0) {
-        if i == bytes.len() { break total };
+        if (i == bytes.len()) { break total };
         (total + transmute::<u8, u32>(bytes[i]), i + 1)
     }
 }
@@ -16,9 +16,9 @@ func sum(bytes: host::buffer::&[u8]) -> u32 {
 // Only ASCII lowercase letters change; this is not Unicode case conversion.
 func uppercase(bytes: host::buffer::*[u8]) {
     loop (i: u32 = 0) {
-        if i == bytes.len() { break };
+        if (i == bytes.len()) { break };
         local byte = bytes[i];
-        if byte >= 97 && byte <= 122 { bytes[i] = byte - 32 };
+        if (byte >= 97 && byte <= 122) { bytes[i] = byte - 32 };
         continue(i + 1);
     }
 }

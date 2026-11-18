@@ -24,9 +24,9 @@ pub func sin(x: f64) -> f64 {
     // High 32 bits of `x` with the sign cleared — see `rem_pio2` on why this stays a `u64`.
     local ix = (x.to_bits() >> 32) & 0x7fffffff;
 
-    if ix <= 0x3fe921fb {
+    if (ix <= 0x3fe921fb) {
         // |x| ~<= pi/4
-        if ix < 0x3e500000 {
+        if (ix < 0x3e500000) {
             // |x| < 2**-26, where sin(x) rounds to x. The original raises the inexact and
             // underflow flags here; wasm has no floating-point exception flags to raise.
             return x;
@@ -35,11 +35,11 @@ pub func sin(x: f64) -> f64 {
     }
 
     // sin(Inf or NaN) is NaN
-    if ix >= 0x7ff00000 { return x - x };
+    if (ix >= 0x7ff00000) { return x - x };
 
     // argument reduction needed
     local (n, y0, y1) = rem_pio2(x);
-    match n & 3 {
+    match (n & 3) {
         0 => k_sin(y0, y1, 1),
         1 => k_cos(y0, y1),
         2 => -k_sin(y0, y1, 1),

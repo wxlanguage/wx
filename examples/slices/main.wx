@@ -7,8 +7,8 @@ pub func slice_at<M: Memory>(
     start: M::Size,
     length: M::Size,
 ) -> M::&[u8] {
-    if start > bytes.len() || length > bytes.len() - start { trap() };
+    if (start > bytes.len() || length > bytes.len() - start) { trap() };
     // The address of element `start` does not exist at the very end.
-    if length == 0 { return "" };
+    if (length == 0) { return "" };
     slice_from_parts(bytes[start].&, length)
 }

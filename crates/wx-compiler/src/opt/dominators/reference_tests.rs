@@ -259,14 +259,14 @@ fn check(graph: &Function) {
 #[test]
 fn path_removal_oracle_checks_nested_branches_loops_and_nonlocal_exits() {
 	let bodies = [
-		"if n == 0 { return 1; }; n + 2",
-		"if n == 0 { return 1; } else { return 2; }",
-		"local x = get(n); if n == 0 { x + 1 } else { x + 2 }",
-		"if n == 0 { n / 2 } else { 2 / n }",
-		"block :done { match n { 0 => { break :done 10; }, 1 => { 20 }, _ => { 30 } } }",
-		"local mut i: i32 = 0; loop { if i == n { break; }; if i == 2 { i += 1; continue; }; i += 1; }; i",
-		"block :done { local mut i: i32 = 0; loop { loop { if i == n { break :done i; }; if i == 2 { break; }; i += 1; }; if i > n { break; }; i += 1; }; i }",
-		"loop { if n == 0 { return 1; }; continue; }",
+		"if (n == 0) { return 1; }; n + 2",
+		"if (n == 0) { return 1; } else { return 2; }",
+		"local x = get(n); if (n == 0) { x + 1 } else { x + 2 }",
+		"if (n == 0) { n / 2 } else { 2 / n }",
+		"block :done { match (n) { 0 => { break :done 10; }, 1 => { 20 }, _ => { 30 } } }",
+		"local mut i: i32 = 0; loop { if (i == n) { break; }; if (i == 2) { i += 1; continue; }; i += 1; }; i",
+		"block :done { local mut i: i32 = 0; loop { loop { if (i == n) { break :done i; }; if (i == 2) { break; }; i += 1; }; if (i > n) { break; }; i += 1; }; i }",
+		"loop { if (n == 0) { return 1; }; continue; }",
 	];
 	for body in bodies {
 		let source = format!(
@@ -281,7 +281,7 @@ fn path_removal_oracle_checks_nested_branches_loops_and_nonlocal_exits() {
 		let mut body = "n + 7".to_owned();
 		for level in 0..depth {
 			body = format!(
-				"if n == {level} {{ return {level}; }} else {{ {body} }}"
+				"if (n == {level}) {{ return {level}; }} else {{ {body} }}"
 			);
 		}
 		let source = format!(

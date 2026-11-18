@@ -884,20 +884,17 @@ impl<'a> Printer<'a> {
 			Expression::Block { label, block } => {
 				self.block("block", label, block)
 			}
-			Expression::BareBlock(block) => self.block("braces", None, block),
 			Expression::Break { label, value } => Sexp::head(
 				"break",
 				self.label(label)
 					.into_iter()
 					.chain(value.map(|value| self.expr(value))),
 			),
-			Expression::Continue { label, arguments } => Sexp::head(
+			Expression::Continue { label, value } => Sexp::head(
 				"continue",
-				self.label(label).into_iter().chain(
-					arguments
-						.into_iter()
-						.flat_map(|arguments| self.arguments(arguments)),
-				),
+				self.label(label)
+					.into_iter()
+					.chain(value.map(|value| self.expr(value))),
 			),
 			Expression::IfElse {
 				condition,
@@ -964,7 +961,7 @@ impl<'a> Printer<'a> {
 	}
 
 	/// A named list's entries: `(x value)`, or `x` for the shorthand.
-	/// A call's or a `continue`'s argument list: each positional argument,
+	/// A call's argument list: each positional argument,
 	/// or the named list as one.
 	fn arguments(&self, arguments: ExprId) -> Vec<Sexp> {
 		match self.ast.expr(arguments) {

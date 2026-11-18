@@ -236,7 +236,7 @@ mod tests {
 				local mut i: i32 = 0;
 				local mut dead: i32 = 0;
 				loop {
-					if i == n { break };
+					if (i == n) { break };
 					i += 1;
 					dead += 2;
 				};
@@ -288,8 +288,8 @@ mod tests {
 			r#"
 			func f(c: Bool, x: i32, y: i32) -> i32 {
 				local mut dead: i32 = 0;
-				if c { dead = x + 10 } else { dead = y + 20 };
-				if c { x } else { y }
+				if (c) { dead = x + 10 } else { dead = y + 20 };
+				if (c) { x } else { y }
 			}
 			export { f as "f" }
 		"#,

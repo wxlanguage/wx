@@ -707,9 +707,6 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			ast::Expression::Tuple { elements } => {
 				self.build_tuple(ast.list(elements), expected, span)
 			}
-			ast::Expression::BareBlock(block) => {
-				self.build_block(block, expected, span)
-			}
 			ast::Expression::Block { label, block } => {
 				// A name not written yet (`block : {`) declares nothing.
 				let label =
@@ -736,18 +733,16 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			ast::Expression::Break { label, value } => {
 				self.build_break(label, value, span)
 			}
-			ast::Expression::Continue { label, arguments } => {
-				let arguments =
-					arguments.map(|arguments| Arguments::of(ast, arguments));
-				self.build_continue(label, arguments, span)
+			ast::Expression::Continue { label, value } => {
+				self.build_continue(label, value, span)
 			}
-			ast::Expression::NamedList { arguments, braces } => {
+			ast::Expression::NamedList { arguments } => {
 				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::NamedListWithoutNames.code())
 						.with_message("a named list needs names to give")
 						.with_label(
-							Label::primary(self.scope.file_id, braces)
+							Label::primary(self.scope.file_id, span)
 								.with_message(
 									"nothing here declares these names",
 								),
@@ -3999,12 +3994,12 @@ mod tests {
 	#[test]
 	fn a_character_pattern_compares_an_integer_by_code_point() {
 		let case = TestCase::new(indoc! {"
-				func f(b: u8) -> u32 { match b { 'a' => { 1 }, _ => { 0 } } }
-				func g(c: Char) -> u32 { match c { 'a' => { 1 }, _ => { 0 } } }
+				func f(b: u8) -> u32 { match (b) { 'a' => { 1 }, _ => { 0 } } }
+				func g(c: Char) -> u32 { match (c) { 'a' => { 1 }, _ => { 0 } } }
 			"});
 		case.diagnostics().assert_none();
 		let case = TestCase::new(
-			"func f(b: u8) -> u32 { match b { '€' => { 1 }, _ => { 0 } } }",
+			"func f(b: u8) -> u32 { match (b) { '€' => { 1 }, _ => { 0 } } }",
 		);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
@@ -4094,11 +4089,11 @@ mod tests {
 	#[test]
 	fn if_branches_share_a_type() {
 		let case = TestCase::new(indoc! {"
-				func pick(c: Bool, a: u8) -> u8 { if c { a } else { 1 } }
-				func nested(c: Bool) -> u16 { if c { 1 } else { if !c { 2 } else { 3 } } }
-				func diverging(c: Bool, a: u8) -> u8 { if c { return a; } else { a } }
-				func statement(c: Bool) { if c { pick(c, 1); } }
-				func untyped(c: Bool) { local x: i64 = if c { 1 } else { 2 }; }
+				func pick(c: Bool, a: u8) -> u8 { if (c) { a } else { 1 } }
+				func nested(c: Bool) -> u16 { if (c) { 1 } else { if (!c) { 2 } else { 3 } } }
+				func diverging(c: Bool, a: u8) -> u8 { if (c) { return a; } else { a } }
+				func statement(c: Bool) { if (c) { pick(c, 1); } }
+				func untyped(c: Bool) { local x: i64 = if (c) { 1 } else { 2 }; }
 			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnusedValue]);
@@ -4135,7 +4130,7 @@ mod tests {
 	#[test]
 	fn an_untyped_branch_takes_the_other_branchs_type() {
 		let case = TestCase::new(
-			"func f(c: Bool, a: u8) { local x = if c { 1 } else { a }; }",
+			"func f(c: Bool, a: u8) { local x = if (c) { 1 } else { a }; }",
 		);
 		case.diagnostics().assert_none();
 		assert_eq!(case.locals("f")[2], ("x".into(), "u8".into()));
@@ -4144,9 +4139,9 @@ mod tests {
 	#[test]
 	fn if_errors_are_reported_where_they_are_written() {
 		let case = TestCase::new(indoc! {"
-				func condition(a: u8) { if a { } }
-				func mismatch(c: Bool, a: u8, b: u16) { local x = if c { a } else { b }; }
-				func missing_else(c: Bool, a: u8) -> u8 { if c { a } }
+				func condition(a: u8) { if (a) { } }
+				func mismatch(c: Bool, a: u8, b: u16) { local x = if (c) { a } else { b }; }
+				func missing_else(c: Bool, a: u8) -> u8 { if (c) { a } }
 			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::TypeMistmatch,
@@ -4161,7 +4156,7 @@ mod tests {
 				func first(n: u32) -> u32 {
 					local mut i: u32 = 0;
 					loop {
-						if i == n { break i; }
+						if (i == n) { break i; }
 						i += 1;
 					}
 				}
@@ -4189,7 +4184,7 @@ mod tests {
 	fn break_values_must_agree() {
 		let case = TestCase::new(indoc! {"
 				func f(c: Bool, a: u8, b: u16) {
-					local x = loop { if c { break a; } break b; };
+					local x = loop { if (c) { break a; } break b; };
 				}
 				func untyped() { local x = loop { break 1; }; }
 			"});
@@ -4255,16 +4250,16 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 				func sum(n: u32) -> u32 {
 					loop (i: u32 = 0, total = n) {
-						if i == n { break total };
-						if i == 7 { continue(i + 2, total) };
-						continue({ total: total + i, i: i + 1 })
+						if (i == n) { break total };
+						if (i == 7) { continue(i + 2, total) };
+						continue { total: total + i, i: i + 1 }
 					}
 				}
 				func count() -> u32 {
 					loop (mut i: u32 = 0) {
 						i += 1;
-						if i > 3 { break i };
-						continue({ i })
+						if (i > 3) { break i };
+						continue { i }
 					}
 				}
 			"});
@@ -4318,7 +4313,7 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 				func f() -> u32 {
 					loop (i = 0, j: u32 = 0) {
-						if j == 0 { break 1 };
+						if (j == 0) { break 1 };
 						(i + 1: u32, j)
 					}
 				}
@@ -4334,9 +4329,9 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 				func f(c: Bool) {
 					loop (i: u32 = 0) {
-						if c { continue };
-						if c { continue(c) };
-						if c { break };
+						if (c) { continue };
+						if (c) { continue(c) };
+						if (c) { break };
 					}
 				}
 			"});
@@ -4362,9 +4357,9 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 				func f(c: Bool) {
 					loop (a: u32 = 0, b: u32 = 0) {
-						if c { continue({ a: 1, x: 2, b }) };
-						if c { continue({ a: 1, a: 2, b }) };
-						continue({ a: 1 })
+						if (c) { continue { a: 1, x: 2, b } };
+						if (c) { continue { a: 1, a: 2, b } };
+						continue { a: 1 }
 					}
 				}
 			"});
@@ -4390,8 +4385,8 @@ mod tests {
 				}
 				func named() -> u32 {
 					loop (a: u32 = 1, a: u64 = 2) {
-						if a == 1 { break a };
-						continue({ a: a + 1 })
+						if (a == 1) { break a };
+						continue { a: a + 1 }
 					}
 				}
 			"});
@@ -4408,9 +4403,9 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 				func f(n: u32) -> u32 {
 					loop :rows (row: u32 = 0) {
-						if row == n { break row };
+						if (row == n) { break row };
 						loop (col: u32 = 0) {
-							if col == n { continue :rows({ row: row + 1 }) };
+							if (col == n) { continue :rows { row: row + 1 } };
 							col + 1
 						}
 					}
@@ -4427,11 +4422,11 @@ mod tests {
 	fn a_named_list_outside_arguments_is_reported_once() {
 		let case = TestCase::new(indoc! {"
 				func f(x: u32) -> u32 {
-					local y = ({ a: x, b: missing });
+					local y = { a: x, b: missing };
 					loop (i: u32 = 0) {
-						if i == 0 { break ({ i }) };
-						if i == 1 { continue(({ i: i + 2 })) };
-						({ i })
+						if (i == 0) { break { i } };
+						if (i == 1) { continue({ i: i + 2 }) };
+						{ i }
 					}
 				}
 			"});
@@ -4451,16 +4446,16 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 				func f() -> u32 {
 					loop (i: u32 = 0, total: u32 = 0) {
-						if i == 3 { break total };
-						if i == 1 { continue(i + 2, total) };
-						if i == 2 { continue({ total: total + i, i: i + 1 }) };
+						if (i == 3) { break total };
+						if (i == 1) { continue(i + 2, total) };
+						if (i == 2) { continue { total: total + i, i: i + 1 } };
 						(i + 1, total + i)
 					}
 				}
 				func pair() -> u32 {
 					loop (p: (u32, u32) = (0, 0)) {
 						local (a, b) = p;
-						if a == 3 { break b };
+						if (a == 3) { break b };
 						continue(a + 1, b + 2)
 					}
 				}
@@ -4473,20 +4468,17 @@ mod tests {
 		case.diagnostics().assert_none();
 	}
 
-	/// `continue` takes its arguments as a call does, in parentheses: one
-	/// written without them is reported, and read as the one argument.
+	/// A positional next state is a complete expression, grouped or not.
 	#[test]
-	fn continue_without_parentheses_is_reported() {
-		let (case, parser) = TestCase::recovered(indoc! {"
+	fn continue_accepts_an_unparenthesized_next_state() {
+		let case = TestCase::new(indoc! {"
 				func f() -> u32 {
 					loop (i: u32 = 0) {
-						if i == 3 { break i };
+						if (i == 3) { break i };
 						continue i + 1
 					}
 				}
 			"});
-		DiagnosticView::new("parse", &parser, &case.files)
-			.assert_codes(&[DiagnosticCode::ContinueArgumentsNeedParentheses]);
 		case.diagnostics().assert_none();
 	}
 
@@ -4496,14 +4488,14 @@ mod tests {
 				func f(c: Bool) -> u32 {
 					loop :outer {
 						loop {
-							if c { break :outer 1; }
+							if (c) { break :outer 1; }
 							continue :outer;
 						}
 					}
 				}
 				func labelled_block(c: Bool) -> u8 {
 					block :found {
-						if c { break :found 1; }
+						if (c) { break :found 1; }
 						2
 					}
 				}
@@ -4573,21 +4565,21 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 				func early(c: Bool) -> u32 {
 					block {
-						if c { break 1 };
+						if (c) { break 1 };
 						2
 					}
 				}
 				func scoped(c: Bool) -> u32 {
 					loop {
 						block {
-							if c { break };
+							if (c) { break };
 						}
 						break 3;
 					}
 				}
 				func arm(o: Ordering) -> u32 {
 					loop {
-						match o {
+						match (o) {
 							Ordering::Less => { break 4 },
 							_ => block { break },
 						}
@@ -4596,7 +4588,7 @@ mod tests {
 				func past(c: Bool) -> u32 {
 					loop :outer {
 						block {
-							if c { break :outer 5 };
+							if (c) { break :outer 5 };
 						}
 					}
 				}
@@ -4631,7 +4623,7 @@ mod tests {
 				func f(c: Bool) {
 					loop {
 						block {
-							if c { continue };
+							if (c) { continue };
 						}
 						break;
 					}
@@ -4648,8 +4640,8 @@ mod tests {
 		// its value is still checked.
 		let case = TestCase::new(indoc! {"
 				func f(c: Bool) -> u32 {
-					local x: u32 = if c { break 0; } else { 1 };
-					local y: u32 = if c { continue; } else { 2 };
+					local x: u32 = if (c) { break 0; } else { 1 };
+					local y: u32 = if (c) { continue; } else { 2 };
 					x
 				}
 				func g() { break missing; }
@@ -4719,7 +4711,7 @@ mod tests {
 	#[test]
 	fn return_gives_the_function_its_value() {
 		let case = TestCase::new(indoc! {"
-				func early(c: Bool) -> u8 { if c { return 1; } 2 }
+				func early(c: Bool) -> u8 { if (c) { return 1; } 2 }
 				func bare() { return; }
 				func wrong() -> u8 { return; }
 				func mismatch(a: u16) -> u8 { return a; }
@@ -5037,12 +5029,12 @@ mod tests {
 				func id<T: StackValue>(x: T) -> T { x }
 				func pair(a: u8, b: u16) {}
 				func positional() -> u8 { local g = id::<u8>; g(1) }
-				func named() { local g = pair; g({ b: 2, a: 1 }); }
+				func named() { local g = pair; g{ b: 2, a: 1 }; }
 				func shadowed(id: pair) { id(1, 2); }
 				func counted() { local g = pair; g(1); }
 				struct V(x: u32);
 				impl V { func area(self: Self, k: u32) -> u32 { k } }
-				func method(v: V) -> u32 { local m = V::area; m({ k: 1, self: v }) }
+				func method(v: V) -> u32 { local m = V::area; m{ k: 1, self: v } }
 				trait Make: StackValue { func make(n: u32) -> Self; }
 				func declared<T: StackValue + Make>() -> T { local g = T::make; g(1) }
 			"});
@@ -5135,7 +5127,7 @@ mod tests {
 					func call(self: Self, args: (u32, u32)) -> u32 { 0 }
 				}
 				func number(x: u32) { x(1); }
-				func named(a: Adder) { a({ args: (1, 2) }); }
+				func named(a: Adder) { a{ args: (1, 2) }; }
 				func too_many(a: Adder) { _ = a(1, 2, 3); }
 			"});
 		case.diagnostics().assert_codes(&[
@@ -5158,7 +5150,7 @@ mod tests {
 				impl V { func m(self: Self, p: (u8, u16)) {} }
 				func spread(a: u8, b: u16) { g(a, b); }
 				func whole(a: u8, b: u16) { g((a, b)); }
-				func named(a: u8, b: u16) { g({ p: (a, b) }); }
+				func named(a: u8, b: u16) { g{ p: (a, b) }; }
 				func learned() -> (u8, u16) { id(1, 2) }
 				func empty() { unit(); }
 				func construct(a: u8, b: u16) -> W { W(a, b) }
@@ -5312,7 +5304,7 @@ mod tests {
 	#[test]
 	fn a_function_reference_is_called_by_position_with_its_parameter() {
 		let case = TestCase::new(indoc! {"
-				func named(f: func(u32) -> u32) { _ = f({ x: 1 }); }
+				func named(f: func(u32) -> u32) { _ = f{ x: 1 }; }
 				func too_many(f: func(u32, u8) -> u8) { _ = f(1, 2, 3); }
 				func wrong(f: func(u32) -> u32) { _ = f(True); }
 			"});
@@ -5328,7 +5320,7 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 				func pair(a: u8, b: u16) {}
 				func make() -> pair { pair }
-				func f() { make()({ b: 2, a: 1 }); }
+				func f() { make(){ b: 2, a: 1 }; }
 			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
@@ -5364,7 +5356,7 @@ mod tests {
 				func array() -> heap::&[u8; 5] { "hello" }
 				func escaped() -> heap::&[u8; 2] { "a\n" }
 				func annotated() { local s: heap::&[u8; 3] = "abc"; }
-				func branches(c: Bool) -> heap::&[u8] { if c { "yes" } else { "no" } }
+				func branches(c: Bool) -> heap::&[u8] { if (c) { "yes" } else { "no" } }
 				func tuple() -> (heap::&[u8], u8) { ("a", 1) }
 				func any_memory<Mem: Memory>() -> Mem::&[u8] { "abstract" }
 			"#});
@@ -5510,7 +5502,7 @@ mod tests {
 	fn a_body_records_its_string_literals_as_static_data() {
 		let case = TestCase::new(indoc! {r#"
 				memory heap: u32;
-				func branches(c: Bool) -> heap::&[u8] { if c { "yes" } else { "no" } }
+				func branches(c: Bool) -> heap::&[u8] { if (c) { "yes" } else { "no" } }
 				func none() -> u32 { 1 }
 			"#});
 		case.diagnostics().assert_none();
@@ -5549,8 +5541,8 @@ mod tests {
 				func untyped() { local s = "abc"; }
 				func operator() -> heap::&[u8] { "a" + "b" }
 				func negate() -> heap::&[u8] { -"a" }
-				func expected(c: Bool) -> heap::&[u8] { if c { "a" } else { 1 } }
-				func joined(c: Bool) { local x = if c { "a" } else { 1 }; }
+				func expected(c: Bool) -> heap::&[u8] { if (c) { "a" } else { 1 } }
+				func joined(c: Bool) { local x = if (c) { "a" } else { 1 }; }
 				func escape() -> heap::&[u8] { "\q" }
 			"#});
 		case.diagnostics().assert_codes(&[
@@ -6332,14 +6324,14 @@ mod tests {
 	#[test]
 	fn a_match_in_a_constant_reads_later_constants() {
 		let case = TestCase::new(indoc! {r#"
-				const PICK: u8 = match ON {
+				const PICK: u8 = match (ON) {
 					const YES => { 1 },
 					const NO => { 0 },
 				};
 				const ON: Bool = True;
 				const YES: Bool = True;
 				const NO: Bool = False;
-				const SIDE: u8 = match Side::Left {
+				const SIDE: u8 = match (Side::Left) {
 					Side::Left => { 1 },
 					Side::Right => { 2 },
 				};
@@ -6677,7 +6669,7 @@ mod tests {
 				memory heap: u32;
 				struct P<M: Memory, T>(addr: M::Size);
 				impl<M: Memory, T: StackValue> P<M, T> {
-					pub func at(addr: M::Size) -> Self { Self({ addr }) }
+					pub func at(addr: M::Size) -> Self { Self{ addr } }
 					pub func get(self: Self) -> M::*T { transmute(self.addr) }
 					pub func peek(self: heap::&Self) -> M::&T { loop {} }
 				}
@@ -6773,7 +6765,7 @@ mod tests {
 				struct W<T>(x: T);
 				impl<T: StackValue> W<T> {
 					func positional(x: T) -> W<T> { Self(x) }
-					func named(x: T) -> Self { Self({ x }) }
+					func named(x: T) -> Self { Self{ x } }
 				}
 				struct P();
 				trait Make: StackValue { func make() -> Self; }
@@ -6956,11 +6948,11 @@ mod tests {
 				func id<T: StackValue>(value: T, flag: Bool) -> T { value }
 				func by_name() -> u32 {
 					local a: u32 = 1;
-					f({ b: 2, a })
+					f{ b: 2, a }
 				}
-				func in_order() -> u32 { f({ a: 1, b: 2 }) }
+				func in_order() -> u32 { f{ a: 1, b: 2 } }
 				func positional() -> u32 { f(1, 2) }
-				func generic(x: u8) -> u8 { id({ flag: True, value: x }) }
+				func generic(x: u8) -> u8 { id{ flag: True, value: x } }
 			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
@@ -6982,8 +6974,8 @@ mod tests {
 				impl S {
 					pub func pick(self: Self, n: u32, m: u32) -> u32 { n }
 				}
-				func method(s: S) -> u32 { s.pick({ m: 1, n: 2 }) }
-				func path(s: S) -> u32 { S::pick({ n: 2, self: s, m: 1 }) }
+				func method(s: S) -> u32 { s.pick{ m: 1, n: 2 } }
+				func path(s: S) -> u32 { S::pick{ n: 2, self: s, m: 1 } }
 			"});
 		case.diagnostics().assert_none();
 		assert_eq!(case.shape("method"), "(block => (call pick s#0 1=1 0=2))");
@@ -7013,10 +7005,10 @@ mod tests {
 				impl Add for P {
 					func add(self: Self, other: Self) -> Self { other }
 				}
-				func impl_name(p: P, q: P) -> P { p.add({ other: q }) }
-				func path(p: P, q: P) -> P { P::add({ other: q, self: p }) }
-				func trait_name(p: P, q: P) -> P { p.add({ rhs: q }) }
-				func generic<T: Add>(a: T, b: T) -> T { a.add({ rhs: b }) }
+				func impl_name(p: P, q: P) -> P { p.add{ other: q } }
+				func path(p: P, q: P) -> P { P::add{ other: q, self: p } }
+				func trait_name(p: P, q: P) -> P { p.add{ rhs: q } }
+				func generic<T: Add>(a: T, b: T) -> T { a.add{ rhs: b } }
 			"});
 		// Renaming breaks the trait's contract; a concrete call still reads
 		// the impl as written, and a call through the trait the declaration.
@@ -7048,7 +7040,7 @@ mod tests {
 				impl S {
 					pub func twice(self: Self, by: u32) -> u32 { by }
 					pub func again(self: Self) -> u32 {
-						Self::twice({ by: 2, self })
+						Self::twice{ by: 2, self }
 					}
 				}
 				struct W<T>(x: T);
@@ -7056,10 +7048,10 @@ mod tests {
 					pub func new(x: T, flag: Bool) -> W<T> { W(x) }
 				}
 				func qualified() -> S {
-					<S as Make>::make({ scale: 1, value: 2 })
+					<S as Make>::make{ scale: 1, value: 2 }
 				}
-				func generic<T: StackValue + Make>() -> T { T::make({ scale: 1, value: 2 }) }
-				func learned(a: u8) -> W<u8> { W::new({ flag: True, x: a }) }
+				func generic<T: StackValue + Make>() -> T { T::make{ scale: 1, value: 2 } }
+				func learned(a: u8) -> W<u8> { W::new{ flag: True, x: a } }
 			"});
 		case.diagnostics().assert_none();
 		assert_eq!(
@@ -7081,8 +7073,8 @@ mod tests {
 	fn a_call_by_name_reaches_the_first_parameter_of_a_name_declared_twice() {
 		let case = TestCase::new(indoc! {"
 				func d(a: u32, a: u32) {}
-				func once() { d({ a: 1 }) }
-				func twice() { d({ a: 1, a: 2 }) }
+				func once() { d{ a: 1 } }
+				func twice() { d{ a: 1, a: 2 } }
 			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::DuplicateParameter,
@@ -7096,8 +7088,8 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 				func none() {}
 				func some(a: u32) {}
-				func empty() { none({}) }
-				func missing() { some({}) }
+				func empty() { none{} }
+				func missing() { some{} }
 			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::MissingArguments]);
@@ -7112,11 +7104,11 @@ mod tests {
 					pub func m(self: Self, n: u32) {}
 				}
 				func f(a: u32, b: i64) {}
-				func unknown() { f({ a: 1, b: 2, c: 3 }) }
-				func twice() { f({ a: 1, a: 2, b: 3 }) }
-				func missing() { f({ b: 2 }) }
-				func receiver(s: S) { s.m({ self: s, n: 1 }) }
-				func mismatch(x: i64) { f({ a: x, b: x }) }
+				func unknown() { f{ a: 1, b: 2, c: 3 } }
+				func twice() { f{ a: 1, a: 2, b: 3 } }
+				func missing() { f{ b: 2 } }
+				func receiver(s: S) { s.m{ self: s, n: 1 } }
+				func mismatch(x: i64) { f{ a: x, b: x } }
 			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UnknownParameterName,
@@ -7143,11 +7135,11 @@ mod tests {
 				func none<T: StackValue>(flag: Bool) -> T { loop {} }
 				struct W<T>(x: T, y: T);
 				func missing() { pair(1); }
-				func missing_by_name() { pair({ a: 1 }); }
+				func missing_by_name() { pair{ a: 1 }; }
 				func extra() { none(True, 1); }
-				func unknown_name() { none({ flag: True, other: 1 }); }
+				func unknown_name() { none{ flag: True, other: 1 }; }
 				func construction() { W(1); }
-				func construction_by_name() { W({ x: 1 }); }
+				func construction_by_name() { W{ x: 1 }; }
 				func uninferred() { none(True); }
 			"});
 		case.diagnostics().assert_codes(&[
@@ -7188,7 +7180,7 @@ mod tests {
 				struct W<T>(a: T, b: Bool);
 				func f(p: Point, t: (u8, (u16, u32)), w: W<u8>) {
 					local Point(x, y) = p;
-					local Point({ y: py, .. }) = p;
+					local Point{ y: py, .. } = p;
 					local (a, (_, c)) = t;
 					local (.., (d, ..)) = t;
 					local W(e, mut g) = w;
@@ -7222,8 +7214,8 @@ mod tests {
 				func f(p: Point, t: (u32, u32), q: Pair) {
 					local (a, b, c) = t;
 					local Point(x, .., ..) = p;
-					local Point({ x }) = p;
-					local Point({ z, .. }) = p;
+					local Point{ x } = p;
+					local Point{ z, .. } = p;
 					local (n, n) = t;
 					local (m, k) = p;
 					local Pair(r, s) = p;
@@ -7265,7 +7257,7 @@ mod tests {
 	fn a_match_checks_each_arm_against_the_scrutinee() {
 		let case = TestCase::new(indoc! {"
 				func sign(x: i32) -> i32 {
-					match x {
+					match (x) {
 						0 => { 0 },
 						-1 | -128 => { 1 },
 						n => { n },
@@ -7293,7 +7285,7 @@ mod tests {
 				struct S();
 				impl S { const ZERO: u8 = 0; }
 				func f<T: Lim>(p: P) -> u8 {
-					match p {
+					match (p) {
 						P(0, Dir::North) => { 1 },
 						P(const LIMIT, d) => { 2 },
 						P(x, Dir::South) => { x },
@@ -7373,7 +7365,7 @@ mod tests {
 			"{errno}{eq}{}",
 			indoc! {"
 				func describe(e: Errno) -> u16 {
-					match e { Errno::SUCCESS => 0, Errno::BADF => 1, Errno(code) => code }
+					match (e) { Errno::SUCCESS => 0, Errno::BADF => 1, Errno(code) => code }
 				}
 				func any(n: u16) -> Errno { Errno(n) }
 			"}
@@ -7384,7 +7376,7 @@ mod tests {
 			"{errno}{eq}{}",
 			indoc! {"
 				func describe(e: Errno) -> u16 {
-					match e { Errno::SUCCESS => 0, Errno::BADF => 1 }
+					match (e) { Errno::SUCCESS => 0, Errno::BADF => 1 }
 				}
 			"}
 		));
@@ -7395,7 +7387,7 @@ mod tests {
 			"{errno}{}",
 			indoc! {"
 				func describe(e: Errno) -> u16 {
-					match e { Errno::SUCCESS => 0, _ => 1 }
+					match (e) { Errno::SUCCESS => 0, _ => 1 }
 				}
 			"}
 		));
@@ -7411,7 +7403,7 @@ mod tests {
 				enum Ordering2(value: i8) { Less = -1, Equal = 0, Greater = 1 }
 				func f(s: Signal, o: Ordering2) -> i32 {
 					local Signal(a) = s;
-					local Signal({ number }) = s;
+					local Signal{ number } = s;
 					local Signal(_) = s;
 					local Ordering2(b): Ordering2 = o;
 					local c: i8 = b;
@@ -7428,7 +7420,7 @@ mod tests {
 				enum Signal(pub number: i32) { Hangup = 1, Interrupt = 2 }
 				func f() {
 					local a = Signal(5);
-					local b = Signal({ number: 5 });
+					local b = Signal{ number: 5 };
 					local c = Signal;
 				}
 		"});
@@ -7468,7 +7460,7 @@ mod tests {
 		let source = |arms: &str| {
 			format!(
 				"enum Ordering2(value: i8) {{ Less = -1, Equal = 0, Greater = 1 }}\n\
-				 func f(o: Ordering2) -> i8 {{ match o {{ {arms} }} }}\n"
+				 func f(o: Ordering2) -> i8 {{ match (o) {{ {arms} }} }}\n"
 			)
 		};
 		let case = TestCase::new(&source(
@@ -7529,13 +7521,13 @@ mod tests {
 				struct P(x: u8, y: u16);
 				struct W(x: (u8, u16));
 				func covered(p: P) -> u8 {
-					match p { P(0, _) => { 1 }, P(t) => { 2 } }
+					match (p) { P(0, _) => { 1 }, P(t) => { 2 } }
 				}
 				func missing(p: P) -> u8 {
-					match p { P((0, _) | (1, _)) => { 1 } }
+					match (p) { P((0, _) | (1, _)) => { 1 } }
 				}
 				func unreachable(w: W) -> u8 {
-					match w { W(0, _) => { 1 }, W(_) => { 2 }, W(a, b) => { 3 } }
+					match (w) { W(0, _) => { 1 }, W(_) => { 2 }, W(a, b) => { 3 } }
 				}
 				func count(p: P) { local P(a, b, c) = p; }
 				func lone(w: W) { local W(a, b, c) = w; }
@@ -7568,7 +7560,7 @@ mod tests {
 					Dir::South => { Dir::South },
 				};
 				func f(d: Dir) {
-					match d {
+					match (d) {
 						const N => {},
 						Dir::North => {},
 						_ => {},
@@ -7592,7 +7584,7 @@ mod tests {
 		// the first arm does: the alternative is reported, not the arm.
 		let source = indoc! {"
 				func f(n: u32) -> u32 {
-					match n {
+					match (n) {
 						0 => 1,
 						1 => 2,
 						3 | 0 => 3,
@@ -7635,7 +7627,7 @@ mod tests {
 				}
 				impl Eq for Errno {}
 				func f(e: Errno) {
-					match e {
+					match (e) {
 						Errno::BADF => {},
 						Errno::BADF => {},
 						Errno::ALSO_BADF => {},
@@ -7670,15 +7662,15 @@ mod tests {
 				}
 				impl Eq for Errno {}
 				func f(e: Errno) {
-					match e {
+					match (e) {
 						Errno(_) => {},
 						Errno::BADF => {},
 					}
-					match e {
+					match (e) {
 						Errno(code) => {},
 						Errno::BADF => {},
 					}
-					match e {
+					match (e) {
 						Errno(8) => {},
 						Errno::BADF => {},
 						_ => {},
@@ -7699,7 +7691,7 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 				trait Limit: Eq { const MAX: Self; }
 				func f<T: Limit, U: Limit>(x: T, y: U) {
-					match x {
+					match (x) {
 						T::MAX => {},
 						T::MAX => {},
 						_ => {},
@@ -7742,8 +7734,8 @@ mod tests {
 		// string has no equality at all.
 		let case = TestCase::new(indoc! {r#"
 				func f(x: f32, s: u8) {
-					match x { 1.5 => {}, _ => {} }
-					match s { "hi" => {}, _ => {} }
+					match (x) { 1.5 => {}, _ => {} }
+					match (s) { "hi" => {}, _ => {} }
 				}
 			"#});
 		case.diagnostics().assert_codes(&[
@@ -7763,10 +7755,10 @@ mod tests {
 				const F: f32 = 1.0;
 				const ORIGIN: P = P(0);
 				func floats(x: f32) {
-					match x { const F => {}, _ => {} }
+					match (x) { const F => {}, _ => {} }
 				}
 				func points(p: P) {
-					match p { const ORIGIN => {}, _ => {} }
+					match (p) { const ORIGIN => {}, _ => {} }
 				}
 			"});
 		case.diagnostics().assert_codes(&[
@@ -7798,10 +7790,10 @@ mod tests {
 		let case = TestCase::new(indoc! {"
 				struct P(x: u8);
 				func floats(x: f32) -> f32 {
-					match x { whole => { whole + 1.0 } }
+					match (x) { whole => { whole + 1.0 } }
 				}
 				func points(p: P) -> P {
-					match p { whole => { whole }, }
+					match (p) { whole => { whole }, }
 				}
 			"});
 		case.diagnostics().assert_none();
@@ -7840,7 +7832,7 @@ mod tests {
 		// two bindings are of different types, and that is said too.
 		let case = TestCase::new(indoc! {"
 				func f(x: (i32, i32, i64)) {
-					match x { (a, 5, 6) | (a, b, a) => { local _ = a; }, _ => {} }
+					match (x) { (a, 5, 6) | (a, b, a) => { local _ = a; }, _ => {} }
 				}
 			"});
 		case.diagnostics().assert_codes(&[
@@ -7862,7 +7854,7 @@ mod tests {
 		// body reads.
 		let case = TestCase::new(indoc! {"
 				func f(x: (i32, i64)) {
-					match x { (a, 5) | (a, 10) => { local _ = a; }, _ => {} }
+					match (x) { (a, 5) | (a, 10) => { local _ = a; }, _ => {} }
 				}
 			"});
 		case.diagnostics().assert_none();
@@ -7877,7 +7869,7 @@ mod tests {
 	fn a_binding_bound_differently_in_two_alternatives_is_an_error() {
 		let case = TestCase::new(indoc! {"
 				func f(x: (i32, i64)) {
-					match x { (mut a, 5) | (a, 10) => {}, _ => {} }
+					match (x) { (mut a, 5) | (a, 10) => {}, _ => {} }
 				}
 			"});
 		case.diagnostics()
@@ -7894,7 +7886,7 @@ mod tests {
 		// neither can be one local of one type.
 		let case = TestCase::new(indoc! {"
 				func f(x: (i32, i64)) {
-					match x { (a, b) | (b, a) => {} }
+					match (x) { (a, b) | (b, a) => {} }
 				}
 			"});
 		// `(b, a)` also matches only what `(a, b)` does.
@@ -7915,9 +7907,9 @@ mod tests {
 		// alternative and `b` in the other, and the outer one sees both.
 		let case = TestCase::new(indoc! {"
 				func f(x: ((i32, i32), i32)) {
-					match x { ((a, 1) | (a, 2), 3) => {}, _ => {} }
-					match x { ((a, 1) | (b, 2), 3) => {}, _ => {} }
-					match x { ((a, 1) | (b, 2), 3) | ((a, 1), 3) => {}, _ => {} }
+					match (x) { ((a, 1) | (a, 2), 3) => {}, _ => {} }
+					match (x) { ((a, 1) | (b, 2), 3) => {}, _ => {} }
+					match (x) { ((a, 1) | (b, 2), 3) | ((a, 1), 3) => {}, _ => {} }
 				}
 			"});
 		// In the third, `((a, 1), 3)` matches only what the first
@@ -7938,10 +7930,10 @@ mod tests {
 		// of a `|` share a name, but two groups in one pattern do not.
 		let case = TestCase::new(indoc! {"
 				func f(x: ((i32, i32), (i32, i32))) {
-					match x { ((a, 1) | (a, 2), (a, 3) | (a, 4)) => {}, _ => {} }
+					match (x) { ((a, 1) | (a, 2), (a, 3) | (a, 4)) => {}, _ => {} }
 				}
 				func g(x: ((i32, i32), i32)) {
-					match x { ((a, 1) | (a, 2), a) => {}, _ => {} }
+					match (x) { ((a, 1) | (a, 2), a) => {}, _ => {} }
 				}
 			"});
 		case.diagnostics().assert_codes(&[
@@ -7978,12 +7970,12 @@ mod tests {
 				func g() {}
 				func f(x: u8, b: Bool) {
 					local y: u8 = 1;
-					match x { const y => {}, _ => {} }
-					match x { const g => {}, _ => {} }
-					match x { 300 => {}, -1 => {}, _ => {} }
-					match x { const True => {}, _ => {} }
-					match b { const C => {}, _ => {} }
-					match x { 1 | z => {}, _ => {} }
+					match (x) { const y => {}, _ => {} }
+					match (x) { const g => {}, _ => {} }
+					match (x) { 300 => {}, -1 => {}, _ => {} }
+					match (x) { const True => {}, _ => {} }
+					match (b) { const C => {}, _ => {} }
+					match (x) { 1 | z => {}, _ => {} }
 				}
 			"});
 		case.diagnostics().assert_codes(&[
@@ -8025,11 +8017,11 @@ mod tests {
 	#[test]
 	fn match_arms_share_a_type() {
 		let case = TestCase::new(indoc! {"
-				func f(x: u8) -> u64 { match x { 0 => { 1 }, _ => { 2 } } }
+				func f(x: u8) -> u64 { match (x) { 0 => { 1 }, _ => { 2 } } }
 				func g(x: u8) -> u8 {
-					match x { 0 => { return 0 }, _ => { x } }
+					match (x) { 0 => { return 0 }, _ => { x } }
 				}
-				func h(x: u8) { local v = match x { 0 => { 1 }, _ => { True } }; }
+				func h(x: u8) { local v = match (x) { 0 => { 1 }, _ => { True } }; }
 			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnableToCoerce]);
@@ -8043,8 +8035,8 @@ mod tests {
 		// coerced too, so `300` is held to `u8` like the others.
 		let case = TestCase::new(indoc! {"
 				func g() -> u8 { 5 }
-				func f(x: u32) -> u8 { match x { 0 => 1, 1 => 2, _ => g() } }
-				func h(x: u32) -> u8 { local v = match x { 0 => 1, 1 => 300, _ => g() }; v }
+				func f(x: u32) -> u8 { match (x) { 0 => 1, 1 => 2, _ => g() } }
+				func h(x: u32) -> u8 { local v = match (x) { 0 => 1, 1 => 300, _ => g() }; v }
 			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
@@ -8057,7 +8049,7 @@ mod tests {
 	fn match_arm_bodies_may_be_expressions() {
 		let case = TestCase::new(indoc! {"
 				func f(x: u8) -> u8 {
-					match x {
+					match (x) {
 						0 => 1,
 						n => n + 1,
 					}
@@ -8088,10 +8080,10 @@ mod tests {
 				enum Dir(value: u8) { North = 0, East, South, West }
 				struct P(x: Bool, y: Bool);
 				func a(d: Dir) -> u8 {
-					match d { Dir::North => { 0 }, Dir::East => { 1 } }
+					match (d) { Dir::North => { 0 }, Dir::East => { 1 } }
 				}
 				func b(d: Dir) -> u8 {
-					match d {
+					match (d) {
 						Dir::North | Dir::East => { 0 },
 						Dir::South | Dir::West => { 1 },
 					}
@@ -8099,9 +8091,9 @@ mod tests {
 				func c(x: Bool, d: Dir) {
 					match (x, d) { (const True, _) => {}, (_, Dir::North) => {} }
 				}
-				func i(x: u8) -> u8 { match x { 0 => { 0 }, 1 => { 1 } } }
+				func i(x: u8) -> u8 { match (x) { 0 => { 0 }, 1 => { 1 } } }
 				func s(p: P) {
-					match p { P(const True, _) => {}, P(const False, const True) => {} }
+					match (p) { P(const True, _) => {}, P(const False, const True) => {} }
 				}
 			"});
 		case.diagnostics().assert_codes(&[
@@ -8132,12 +8124,12 @@ mod tests {
 	fn an_arm_the_arms_before_it_cover_is_unreachable() {
 		let case = TestCase::new(indoc! {"
 				const ZERO: u8 = 0;
-				func u(x: u8) { match x { _ => {}, 0 => {} } }
+				func u(x: u8) { match (x) { _ => {}, 0 => {} } }
 				func v(b: Bool) {
-					match b { const True => {}, const False => {}, _ => {} }
+					match (b) { const True => {}, const False => {}, _ => {} }
 				}
-				func w(x: u8) { match x { 0 | 1 => {}, 1 => {}, _ => {} } }
-				func z(x: u8) { match x { const ZERO => {}, 0 => {}, _ => {} } }
+				func w(x: u8) { match (x) { 0 | 1 => {}, 1 => {}, _ => {} } }
+				func z(x: u8) { match (x) { const ZERO => {}, 0 => {}, _ => {} } }
 			"});
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UnreachableMatchArm,
@@ -8156,10 +8148,10 @@ mod tests {
 				const N: Dir = Dir::North;
 				trait Lim { const MAX: u8; }
 				func k(d: Dir) {
-					match d { const N => {}, Dir::East | Dir::South => {} }
+					match (d) { const N => {}, Dir::East | Dir::South => {} }
 				}
-				func l<T: Lim>(x: u8) { match x { T::MAX => {} } }
-				func m<T: Lim>(x: u8) { match x { T::MAX => {}, _ => {} } }
+				func l<T: Lim>(x: u8) { match (x) { T::MAX => {} } }
+				func m<T: Lim>(x: u8) { match (x) { T::MAX => {}, _ => {} } }
 			"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::NonExhaustiveMatch]);
@@ -8171,7 +8163,7 @@ mod tests {
 	#[test]
 	fn a_match_with_a_failed_pattern_is_not_checked_for_coverage() {
 		let case =
-			TestCase::new("func f(x: u8) { match x { const nope => {} } }");
+			TestCase::new("func f(x: u8) { match (x) { const nope => {} } }");
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
 	}
@@ -8672,10 +8664,10 @@ mod tests {
 					s: heap::*[u8],
 					t: heap::&[u8],
 				) -> heap::&[u8] {
-					if c { s } else { t }
+					if (c) { s } else { t }
 				}
 				func arms(o: Ordering, s: heap::*[u8], t: heap::&[u8]) -> heap::&[u8] {
-					match o {
+					match (o) {
 						Ordering::Less => s,
 						Ordering::Equal => { s }
 						Ordering::Greater => t,
@@ -8683,7 +8675,7 @@ mod tests {
 				}
 				func early(c: Bool, s: heap::*[u8]) -> heap::&[u8] {
 					local r: heap::&[u8] = block :b {
-						if c { break :b s };
+						if (c) { break :b s };
 						return s;
 					};
 					r
@@ -8888,7 +8880,7 @@ mod tests {
 		assert_recovered(
 			indoc! {"
 				func f(o: Ordering) {
-				    match o {
+				    match (o) {
 				        Ordering:: => (),
 				        _ => (),
 				    }
@@ -9006,7 +8998,7 @@ mod tests {
 		let (case, parser) = TestCase::recovered(indoc! {"
 			func g(a: u32, b: u32) {}
 			func f() {
-			    g({ a: , b: 1 });
+			    g{ a: , b: 1 };
 			}
 		"});
 		DiagnosticView::new("parse", &parser, &case.files)

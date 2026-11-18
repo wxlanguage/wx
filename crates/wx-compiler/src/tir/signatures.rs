@@ -6905,9 +6905,9 @@ pub(super) mod tests {
 					struct Point(x: i32, y: i32);
 					struct Line(from: Point, to: Point);
 					const M: Meters = Meters(5);
-					const P: Point = Point({ y: 2, x: 1 });
+					const P: Point = Point{ y: 2, x: 1 };
 					const x: i32 = 3;
-					const Q: Point = Point({ x, y: -x });
+					const Q: Point = Point{ x, y: -x };
 					const L: Line = Line(Point(0, 0), P);",
 			);
 			case.diagnostics().assert_none();
@@ -6939,13 +6939,13 @@ pub(super) mod tests {
 				("const P: Point = Point(1);", ArgumentCountMismatch),
 				("const P: Point = Point(1, 2, 3);", ArgumentCountMismatch),
 				("const P: Point = Point(1, True);", TypeMistmatch),
-				("const P: Point = Point({ x: 1 });", MissingArguments),
+				("const P: Point = Point{ x: 1 };", MissingArguments),
 				(
-					"const P: Point = Point({ x: 1, y: 2, z: 3 });",
+					"const P: Point = Point{ x: 1, y: 2, z: 3 };",
 					UnknownParameterName,
 				),
 				(
-					"const P: Point = Point({ x: 1, x: 2, y: 3 });",
+					"const P: Point = Point{ x: 1, x: 2, y: 3 };",
 					DuplicateNamedArgument,
 				),
 				(
@@ -6969,7 +6969,7 @@ pub(super) mod tests {
 				"struct Wrapper<T>(a: T);
 					struct Pair<A, B>(first: A, second: B);
 					const W: Wrapper<u32> = Wrapper(5);
-					const P: Pair<u8, i64> = Pair({ second: -1, first: 2 });
+					const P: Pair<u8, i64> = Pair{ second: -1, first: 2 };
 					const N: Pair<Wrapper<u8>, u8> = Pair(Wrapper(1), 2);",
 			);
 			case.diagnostics().assert_none();
@@ -19279,11 +19279,11 @@ pub(super) mod tests {
 	#[test]
 	fn memory_limits_within_the_memorys_size_are_accepted() {
 		let case = TestCase::new(indoc! {"
-				#[memory_limits({ min_pages: 2, max_pages: 65536 })]
+				#[memory_limits{ min_pages: 2, max_pages: 65536 }]
 				memory full: u32;
-				#[memory_limits({ min_pages: 70000 })]
+				#[memory_limits{ min_pages: 70000 }]
 				memory wide: u64;
-				#[memory_limits({ min_pages: 4, max_pages: 4 })]
+				#[memory_limits{ min_pages: 4, max_pages: 4 }]
 				memory fixed: u32;
 			"});
 		case.diagnostics().assert_none();
@@ -19293,15 +19293,15 @@ pub(super) mod tests {
 	fn memory_limits_beyond_the_memorys_size_or_crossed_are_reported() {
 		for (source, message) in [
 			(
-				"#[memory_limits({ max_pages: 65537 })] memory heap: u32;",
+				"#[memory_limits{ max_pages: 65537 }] memory heap: u32;",
 				"`max_pages` must be a number of pages",
 			),
 			(
-				"#[memory_limits({ min_pages: 281474976710657 })] memory heap: u64;",
+				"#[memory_limits{ min_pages: 281474976710657 }] memory heap: u64;",
 				"`min_pages` must be a number of pages",
 			),
 			(
-				"#[memory_limits({ min_pages: 3, max_pages: 2 })] memory heap: u32;",
+				"#[memory_limits{ min_pages: 3, max_pages: 2 }] memory heap: u32;",
 				"the memory's minimum (3 pages) is above its maximum (2 pages)",
 			),
 		] {

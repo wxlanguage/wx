@@ -19,7 +19,7 @@ import "wasi_snapshot_preview1" as wasi {
     ) -> i32;
 }
 
-#[memory_limits({ min_pages: 1 })]
+#[memory_limits{ min_pages: 1 }]
 memory heap: u32;
 
 /// The shared bump allocator for `heap`. `bootstrap` places it right after

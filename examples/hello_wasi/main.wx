@@ -61,7 +61,7 @@ func main() {
     // fd_write reports how many bytes it wrote through a pointer, so it needs
     // a writable u32: the first word after the static data.
     local written = heap::DATA_END;
-    match wasi::fd_write(FileDescriptor::StdOut, io_vecs, transmute(written)) {
+    match (wasi::fd_write(FileDescriptor::StdOut, io_vecs, transmute(written))) {
         Errno::SUCCESS => (),
         _ => trap(),
     }

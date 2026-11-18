@@ -591,7 +591,7 @@ fn loop_swaps_read_all_sources_before_writing_any_destination() {
 		func run(n: i32, x: i32, y: i32) -> i32 {
 			local mut a = x; local mut b = y; local mut i: i32 = 0;
 			loop {
-				if i == n { break; };
+				if (i == n) { break; };
 				local old = a; a = b; b = old;
 				i += 1;
 			};
@@ -622,9 +622,9 @@ fn loop_rotations_on_distinct_back_edges_and_post_loop_computations() {
 			local mut a: i32 = 2; local mut b: i32 = 3; local mut c: i32 = 7;
 			local mut i: i32 = 0;
 			loop {
-				if i == n { break; };
+				if (i == n) { break; };
 				local old = a;
-				if i == 2 {
+				if (i == 2) {
 					a = c; c = b; b = old; i += 1; continue;
 				};
 				a = b; b = c; c = old; i += 1;
@@ -656,14 +656,14 @@ fn nested_loop_entry_and_nonlocal_continue_and_break_keep_join_values() {
 		func run(n: i32) -> i32 {
 			local mut a: i32 = 2; local mut b: i32 = 7; local mut i: i32 = 0;
 			loop :outer {
-				if i == n { break; };
+				if (i == n) { break; };
 				local mut j: i32 = 0;
 				loop {
 					local old = a; a = b; b = old;
 					j += 1;
-					if j == 2 {
+					if (j == 2) {
 						i += 1;
-						if i == n { break :outer; };
+						if (i == n) { break :outer; };
 						continue :outer;
 					};
 				};
@@ -692,11 +692,11 @@ fn block_exits_switches_and_early_returns_execute_only_selected_arms() {
 	let source = r#"
 		func run(n: i32) -> i32 {
 			local value: i32 = block :done {
-				match n {
+				match (n) {
 					0 => { return 11; },
 					1 => { local answer: i32 = 20; break :done answer; },
 					2 => { 30 },
-					_ => { if n < 0 { return 99; }; 40 }
+					_ => { if (n < 0) { return 99; }; 40 }
 				}
 			};
 			value + 1
@@ -724,8 +724,8 @@ fn block_exits_switches_and_early_returns_execute_only_selected_arms() {
 fn exhaustive_and_sparse_switches_preserve_results() {
 	let source = r#"
 		func run(n: i32, flag: Bool) -> i32 {
-			local a: i32 = match flag { const True => { 2 }, const False => { 7 } };
-			local b: i32 = match n { -100 => { 10 }, 10000 => { 20 }, _ => { 30 } };
+			local a: i32 = match (flag) { const True => { 2 }, const False => { 7 } };
+			local b: i32 = match (n) { -100 => { 10 }, 10000 => { 20 }, _ => { 30 } };
 			a + b
 		}
 		export { run as "run" }
@@ -874,7 +874,7 @@ fn call_results_and_shared_computations_remain_available_across_branches() {
 		func tick(x: i32) -> i32 { counter.set(counter.get() + 1); x + 1 }
 		func run(n: i32, flag: Bool) -> i32 {
 			local x = tick(n);
-			local result: i32 = if flag { tick(x + 2) } else { x + 2 };
+			local result: i32 = if (flag) { tick(x + 2) } else { x + 2 };
 			result + (x + 2)
 		}
 		export { run as "run", counter as "counter" }
@@ -898,7 +898,7 @@ fn computations_shared_by_back_edges_and_post_loop_reads_stay_inside_loop() {
 		func run(n: i32) -> i32 {
 			local mut i: i32 = 0;
 			loop {
-				if i == n { break; };
+				if (i == n) { break; };
 				i = i + 1;
 			};
 			i + 1
@@ -945,8 +945,8 @@ fn untargeted_blocks_fall_through_without_labels_or_transfers() {
 fn falling_through_if_and_switch_arms_keep_computations_and_carry_their_values()
 {
 	for body in [
-		"if n == 0 { block { x + 1 } } else { block { x * 2 } }",
-		"match n { 0 => block { x + 1 }, 1 => block { x * 2 }, 2 => block { x * 2 }, _ => block { x * 2 } }",
+		"if (n == 0) { block { x + 1 } } else { block { x * 2 } }",
+		"match (n) { 0 => block { x + 1 }, 1 => block { x * 2 }, 2 => block { x * 2 }, _ => block { x * 2 } }",
 	] {
 		let source = format!(
 			"func run(n: i32, x: i32) -> i32 {{ {body} }} export {{ run as \"run\" }}"
@@ -995,7 +995,7 @@ fn nonlocal_exits_keep_their_wrapper_and_skip_parent_continuation() {
 			trace.set(0);
 			local value: i32 = block :done {
 				block {
-					if flag { trace.set(1); break :done 7; };
+					if (flag) { trace.set(1); break :done 7; };
 				};
 				trace.set(2);
 				9
@@ -1044,7 +1044,7 @@ fn a_loop_header_s_columns_are_its_emitted_parameters() {
 		func run(n: i32) -> i32 {
 			local mut total: i32 = 0;
 			local last = loop (a: i32 = 0, b: i32 = 1, k = n) {
-				if k == 0 { break a };
+				if (k == 0) { break a };
 				local previous = total;
 				total = a + b;
 				(b, previous + b, k - 1)
@@ -1093,11 +1093,11 @@ fn exit_values_are_carried_by_their_edges() {
 	let source = r#"
 		func run(n: i32, target: i32) -> i32 {
 			local found: i32 = loop (i: i32 = 0) {
-				if i == n { break -1 };
-				if i * i == target { break i };
+				if (i == n) { break -1 };
+				if (i * i == target) { break i };
 				i + 1
 			};
-			local doubled = if found < 0 { 0 } else { found * 2 };
+			local doubled = if (found < 0) { 0 } else { found * 2 };
 			doubled + found
 		}
 		export { run as "run" }
@@ -1136,14 +1136,14 @@ fn exit_values_are_carried_by_their_edges() {
 /// that statement evaluates before it are pure, so they may be read first.
 #[test]
 fn an_exit_value_read_once_right_after_its_construct_stays_on_the_stack() {
-	let value = "(if c == 0 { a } else { a * 3 })";
+	let value = "(if (c == 0) { a } else { a * 3 })";
 	for (body, stays) in [
 		(format!("{value} * 2"), true),
 		(format!("b - {value}"), true),
 		(format!("local v = {value}; v * v"), false),
 		(
 			format!(
-				"loop (i = {value}) {{ if i > 100 {{ break i }}; i * 2 + b }}"
+				"loop (i = {value}) {{ if (i > 100) {{ break i }}; i * 2 + b }}"
 			),
 			false,
 		),
@@ -1196,8 +1196,8 @@ fn an_exit_value_crosses_the_end_of_an_inlined_call() {
 		#[inline]
 		func root(n: i32) -> (Bool, i32) {
 			loop (i: i32 = 0) {
-				if i * i == n { break (True, i) };
-				if i * i > n { break (False, i) };
+				if (i * i == n) { break (True, i) };
+				if (i * i > n) { break (False, i) };
 				i + 1
 			}
 		}

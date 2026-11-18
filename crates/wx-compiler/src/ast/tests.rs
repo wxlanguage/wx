@@ -307,9 +307,9 @@ fn test_top_level_items() {
         pub func add<T: Add + Copy, const N: u32>(a: T, mut b: T, d: u8, c: u16) -> T {
             local x: i32 = 1;
             local (p, mut q) = pair;
-            local Point({ x, y: py, .. }) = point;
+            local Point{ x, y: py, .. } = point;
             f(a, (b: u8));
-            g({ value: 1, x });
+            g{ value: 1, x };
             point.inner.&.*[0] = [0; 4];
             local items = [1, 2, -3];
             local text = "hi\n";
@@ -317,10 +317,10 @@ fn test_top_level_items() {
             local ratio = 1.5;
             local call = Wrap::<u8>::new(x).get::<T>();
             local qualified = <T as Shape>::SIDES + <heap::&[u8]>::len(s);
-            if a < b { return a; } else if c { x } else { _ = y; }
+            if (a < b) { return a; } else if (c) { x } else { _ = y; }
             block :outer {
                 loop :inner {
-                    match n {
+                    match (n) {
                         0 | 1 => break :outer x,
                         const MAX => continue :inner,
                         Pair(a, ..) => { f(a) },
@@ -334,7 +334,7 @@ fn test_top_level_items() {
         pub package func clz(value: u32) -> u32;
         package const SIZE: u32;
         pub package type Pointer<M>;
-        #[memory_limits({ min_pages: 1, max_pages: 10 })]
+        #[memory_limits{ min_pages: 1, max_pages: 10 }]
         memory heap: u32;
         global mut counter: i32 = 0;
         const MAX: i32 = 100;
@@ -942,7 +942,7 @@ fn test_literals() {
 fn test_if_else() {
 	let case = TestCase::new(indoc! {"
         func sign(x: i32) -> i32 {
-            if x > 0 {
+            if (x > 0) {
                 1
             } else {
                 0
@@ -960,10 +960,8 @@ fn test_if_else() {
 	else {
 		panic!("expected an if/else")
 	};
-	assert!(matches!(
-		case.ast.expr(condition),
-		Expression::Binary { .. }
-	));
+	assert!(matches!(case.ast.expr(condition), Expression::Tuple { .. }));
+	assert_eq!(case.shape(condition), "(tuple (> x 0))");
 	assert_eq!(case.entries(then_block).len(), 1);
 	// `else if` nests an `if` in the else position; the checker and lowering
 	// both expect either a block or a nested `if` there.
@@ -975,8 +973,8 @@ fn test_if_else() {
 fn test_else_if_nests_an_if_in_the_else_position() {
 	let case = TestCase::new(indoc! {"
         func sign(x: i32) -> i32 {
-            if x > 0 { 1 }
-            else if x < 0 { -1 }
+            if (x > 0) { 1 }
+            else if (x < 0) { -1 }
             else { 0 }
         }
     "});
@@ -1001,10 +999,89 @@ fn test_else_if_nests_an_if_in_the_else_position() {
 }
 
 #[test]
+fn control_flow_subjects_are_ordinary_tuple_expressions() {
+	for (source, expected) in [
+		("if (ready: Bool) {}", "(if (tuple (: ready Bool)) (block))"),
+		("if () {}", "(if (tuple) (block))"),
+		("if (a, b) {}", "(if (tuple a b) (block))"),
+		(
+			"match (value: Ordering) {}",
+			"(match (tuple (: value Ordering)))",
+		),
+		("match (a, b) {}", "(match (tuple a b))"),
+		(
+			"if (valid{ value }) { work(); }",
+			"(if (tuple (call valid (named value))) (block (; (call work))))",
+		),
+		(
+			"match (Point{ x, y }.classify()) { _ => 0 }",
+			"(match (tuple (call (. (call Point (named x y)) classify))) (=> _ 0))",
+		),
+	] {
+		assert_eq!(shape_of(source), expected, "{source}");
+	}
+}
+
+#[test]
+fn control_flow_subjects_require_written_parentheses() {
+	for body in ["if ready {}", "match value {}", "if { ready } {}"] {
+		TestCase::new(&format!("func f() {{ {body} }}"))
+			.diagnostics()
+			.assert_error_saying("expected `(`");
+	}
+}
+
+#[test]
+fn named_calls_are_postfix_expressions_not_block_like_statements() {
+	for (source, expected) in [
+		("Point{ x, y }", "(call Point (named x y))"),
+		("Point { x, y }", "(call Point (named x y))"),
+		(
+			"Point{ x, y }.translate{ dx, dy }.x",
+			"(. (call (. (call Point (named x y)) translate) (named dx dy)) x)",
+		),
+		(
+			"factory(){ value }[0]",
+			"(index (call (call factory) (named value)) 0)",
+		),
+		("add{ a, b } * 2", "(* (call add (named a b)) 2)"),
+		(
+			"outer{ inner: Point{ x, y } }",
+			"(call outer (named (inner (call Point (named x y)))))",
+		),
+	] {
+		assert_eq!(shape_of(source), expected, "{source}");
+	}
+	let case = TestCase::new("func f() { Point{ x, y }; next(); }");
+	case.diagnostics().assert_none();
+	let entries = case.function_block(0);
+	assert_eq!(entries.len(), 2);
+	assert!(!case.statement_expression(&entries, 0).is_block_like());
+}
+
+#[test]
+fn branch_operands_share_ordinary_expression_parsing() {
+	for keyword in ["return", "break", "continue"] {
+		for (operand, expected) in [
+			("", ""),
+			("x + 1", " (+ x 1)"),
+			("(x + 1) * 2", " (* (tuple (+ x 1)) 2)"),
+			("(a, b)", " (tuple a b)"),
+			("{ a, b }", " (named a b)"),
+		] {
+			assert_eq!(
+				shape_of(&format!("{keyword} {operand}")),
+				format!("({keyword}{expected})"),
+			);
+		}
+	}
+}
+
+#[test]
 fn test_match_int_literal_patterns() {
 	let case = TestCase::new(indoc! {"
         func sign(x: i32) -> i32 {
-            match x {
+            match (x) {
                 0 => { 0 },
                 1 | 2 => { 1 },
                 _ => { -1 },
@@ -1019,7 +1096,7 @@ fn test_match_int_literal_patterns() {
 	else {
 		panic!("expected a match")
 	};
-	assert!(matches!(case.ast.expr(scrutinee), Expression::Path(_)));
+	assert_eq!(case.shape(scrutinee), "(tuple x)");
 	assert_eq!(case.arm_patterns(0), ["0", "(| 1 2)", "_"]);
 }
 
@@ -1027,7 +1104,7 @@ fn test_match_int_literal_patterns() {
 fn test_match_arm_bodies_may_be_expressions_or_blocks() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32) -> i32 {
-            match x {
+            match (x) {
                 0 => 10,
                 1 => { local y: i32 = 20; y },
                 _ => x + 1,
@@ -1057,7 +1134,7 @@ fn a_written_block_is_not_a_constructs_own() {
 	// an arm or an `else` owns are the construct's own.
 	let case = TestCase::new(indoc! {"
         func f(x: i32) -> i32 {
-            match x {
+            match (x) {
                 0 => block { 1 },
                 _ => { 2 },
             }
@@ -1081,7 +1158,7 @@ fn a_written_block_is_not_a_constructs_own() {
 fn test_a_match_arm_expression_body_needs_a_separator() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32) -> i32 {
-            match x {
+            match (x) {
                 0 => 10
                 _ => 20,
             }
@@ -1101,7 +1178,7 @@ fn test_match_enum_variant_patterns() {
         }
 
         func name(fd: FileDescriptor) -> u8 {
-            match fd {
+            match (fd) {
                 FileDescriptor::StdIn => { 0 },
                 FileDescriptor::StdOut => { 1 },
                 FileDescriptor::StdErr => { 2 },
@@ -1131,7 +1208,7 @@ fn test_match_missing_arrow_recovers_with_diagnostic() {
 	// reports E1009.
 	let case = TestCase::new(indoc! {"
         func f(x: i32) -> i32 {
-            match x {
+            match (x) {
                 0 { 1 },
                 _ => { 0 },
             }
@@ -1150,7 +1227,7 @@ fn test_loop_break_label() {
 	let case = TestCase::new(indoc! {"
         func first_positive(mut n: i32) -> i32 {
             loop :result {
-                if n > 0 {
+                if (n > 0) {
                     break :result n;
                 }
                 n += 1;
@@ -1237,35 +1314,47 @@ fn a_loops_parameters_are_not_patterns() {
 }
 
 #[test]
-fn continue_takes_its_arguments_as_a_call_does() {
-	assert_eq!(shape_of("continue(i + 1)"), "(continue (+ i 1))");
-	assert_eq!(shape_of("continue(i, 0)"), "(continue i 0)");
-	assert_eq!(shape_of("continue :rows(row)"), "(continue :rows row)");
+fn continue_takes_a_complete_next_state_expression() {
+	assert_eq!(shape_of("continue i + 1"), "(continue (+ i 1))");
+	assert_eq!(shape_of("continue(i + 1)"), "(continue (tuple (+ i 1)))");
+	assert_eq!(shape_of("continue(i, 0)"), "(continue (tuple i 0))");
+	assert_eq!(shape_of("continue :rows row"), "(continue :rows row)");
 	assert_eq!(
-		shape_of("continue :rows({ row: row + 1 })"),
+		shape_of("continue :rows(row)"),
+		"(continue :rows (tuple row))"
+	);
+	assert_eq!(
+		shape_of("continue :rows { row: row + 1 }"),
 		"(continue :rows (named (row (+ row 1))))"
 	);
-	assert_eq!(shape_of("continue()"), "(continue)");
+	assert_eq!(
+		shape_of("continue (i + 1) * 2"),
+		"(continue (* (tuple (+ i 1)) 2))"
+	);
+	assert_eq!(shape_of("continue next()"), "(continue (call next))");
+	assert_eq!(shape_of("continue()"), "(continue (tuple))");
 	assert_eq!(shape_of("continue :rows"), "(continue :rows)");
 	assert_eq!(shape_of("continue"), "(continue)");
-	// A value without parentheses is reported, and read as the argument.
-	let case = TestCase::new("func f() { continue i + 1 }");
-	case.diagnostics()
-		.assert_codes(&[DiagnosticCode::ContinueArgumentsNeedParentheses]);
 }
 
 #[test]
 fn a_named_list_is_an_expression_on_its_own() {
-	assert_eq!(
-		shape_of("({ i: i + 1, total })"),
-		"(named (i (+ i 1)) total)"
-	);
-	// Named and positional values do not mix in one list, either way round.
-	for body in ["f({ a: 1 }, 2)", "f(1, { a: 2 })", "continue({ a: 1 }, 2)"] {
-		let case = TestCase::new(&format!("func f() {{ {body} }}"));
-		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::MixedCallArguments]);
-	}
+	assert_eq!(shape_of("{ i: i + 1, total }"), "(named (i (+ i 1)) total)");
+	assert_eq!(shape_of("{}"), "(named)");
+	// Parentheses are ordinary grouping, not an alternate named-call syntax.
+	assert_eq!(shape_of("({ a: 1 })"), "(tuple (named (a 1)))");
+	assert_eq!(shape_of("f({ a: 1 })"), "(call f (named (a 1)))");
+	let case = TestCase::new("func f() { f({ a: 1 }) }");
+	case.diagnostics().assert_none();
+	let Expression::Call { arguments, .. } =
+		case.statement_expression(&case.function_block(0), 0)
+	else {
+		panic!("expected a call")
+	};
+	assert!(matches!(
+		case.ast.argument_list(arguments),
+		ArgumentList::Positional([_])
+	));
 }
 
 #[test]
@@ -1331,7 +1420,7 @@ fn a_missing_expression_is_reported_once_where_it_was_expected() {
 #[test]
 fn a_labelled_if_is_reported_and_read_without_its_label() {
 	let case =
-		TestCase::new("func f(c: bool) -> u8 { if :l c { 1 } else { 2 } }");
+		TestCase::new("func f(c: bool) -> u8 { if :l (c) { 1 } else { 2 } }");
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::LabelOnIf]);
 	assert!(matches!(
@@ -1366,7 +1455,7 @@ fn an_ascription_is_only_an_element() {
 	case.diagnostics()
 		.assert_error(DiagnosticCode::UnexpectedToken);
 	// Inside braces, `:` still names an argument.
-	let case = TestCase::new("func f() { g({ x: 1 }) }");
+	let case = TestCase::new("func f() { g{ x: 1 } }");
 	case.diagnostics().assert_none();
 	let Expression::Call { arguments, .. } =
 		case.statement_expression(&case.function_block(0), 0)
@@ -1413,7 +1502,7 @@ impl TestCase {
 fn a_named_argument_with_no_value_keeps_its_name() {
 	// `a:` with no value: the error node spans the gap up to the `,`, and
 	// the rest of the list is read.
-	let source = "func f() { g({ a: , b: 1 }) }";
+	let source = "func f() { g{ a: , b: 1 } }";
 	let case = TestCase::new(source);
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
@@ -1423,13 +1512,13 @@ fn a_named_argument_with_no_value_keeps_its_name() {
 	let value = (arguments[0].value)
 		.expect("the value is kept, not read as a shorthand");
 	assert!(matches!(case.ast.expr(value), Expression::Error));
-	assert_eq!(case.ast.expr_span(value), TextSpan::from(17..18));
+	assert_eq!(case.ast.expr_span(value).extract_str(source), " ");
 	assert!(arguments[1].value.is_some());
 }
 
 #[test]
 fn a_call_keeps_the_span_of_its_delimiters() {
-	let source = "func f() { g(1, 2); h({ a: 1 }); }";
+	let source = "func f() { g(1, 2); h{ a: 1 }; }";
 	let case = TestCase::new(source);
 	case.diagnostics().assert_none();
 	let statements = case.function_block(0);
@@ -1451,9 +1540,9 @@ fn test_named_call() {
 	// a struct constructed by position
 	let case = TestCase::new(indoc! {"
         func make(x: i32, y: i32) {
-            local full  = Point({ x: x, y: y });
-            local short = Point({ x, y });
-            local empty = f({});
+            local full  = Point{ x: x, y: y };
+            local short = Point{ x, y };
+            local empty = f{};
             local unit  = Unit();
         }
     "});
@@ -1471,7 +1560,7 @@ fn test_named_call() {
 	let (_, shorthand) = call(1);
 	assert!(
 		shorthand.iter().all(|f| f.value.is_none()),
-		"`Point({{ x, y }})` is shorthand, so no explicit values"
+		"`Point{{ x, y }}` is shorthand, so no explicit values"
 	);
 	let names: Vec<&str> =
 		shorthand.iter().map(|f| case.name(f.name.inner)).collect();
@@ -1490,8 +1579,8 @@ fn test_named_call() {
 fn test_named_method_call_and_turbofish() {
 	let case = TestCase::new(indoc! {"
         func make(x: f32, y: f32, o: Obj) {
-            local p = Point::<f32>({ x: x, y: y });
-            o.move_to({ x, y });
+            local p = Point::<f32>{ x: x, y: y };
+            o.move_to{ x, y };
         }
     "});
 	case.diagnostics().assert_none();
@@ -1524,8 +1613,8 @@ fn a_receiver_is_given_by_name_as_self() {
 	// `self` names a method's receiver; any other keyword is no name.
 	let case = TestCase::new(indoc! {"
         func f(s: S) {
-            S::m({ self: s, n: 1 });
-            S::m({ self });
+            S::m{ self: s, n: 1 };
+            S::m{ self };
         }
     "});
 	case.diagnostics().assert_none();
@@ -1536,22 +1625,15 @@ fn a_receiver_is_given_by_name_as_self() {
 		assert_eq!(case.name(arguments[0].name.inner), "self");
 	}
 
-	let case = TestCase::new("func f() { g({ loop: 1 }); }");
+	let case = TestCase::new("func f() { g{ loop: 1 }; }");
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::ReservedIdentifier]);
 }
 
 #[test]
-fn named_and_positional_arguments_do_not_mix() {
-	for source in [
-		"func f() { g({ a: 1 }, 2); }",
-		"func f() { g(1, { a: 2 }); }",
-		"func f() { o.m(1, { a: 2 }); }",
-	] {
-		let case = TestCase::new(source);
-		case.diagnostics()
-			.assert_codes(&[DiagnosticCode::MixedCallArguments]);
-	}
+fn named_lists_inside_positional_arguments_remain_expressions() {
+	assert_eq!(shape_of("g({ a: 1 }, 2)"), "(call g (named (a 1)) 2)");
+	assert_eq!(shape_of("g(1, { a: 2 })"), "(call g 1 (named (a 2)))");
 }
 
 #[test]
@@ -1561,7 +1643,7 @@ fn a_plain_block_is_written_with_its_keyword() {
             local x = block { 1 };
             block { x; }
             block :outer { break :outer; }
-            if true { x } else { 2 }
+            if (true) { x } else { 2 }
         }
     "});
 	case.diagnostics().assert_none();
@@ -1579,14 +1661,12 @@ fn a_plain_block_is_written_with_its_keyword() {
 		Expression::Block { label: Some(_), .. }
 	));
 
-	// Without the keyword, `{` is reported and read as the braces it is,
-	// which nothing jumps out of.
-	let case = TestCase::new("func f() { local x = { 1 }; }");
-	case.diagnostics()
-		.assert_codes(&[DiagnosticCode::BlockNeedsKeyword]);
+	// Bare braces are a named list, not an executable block.
+	let case = TestCase::new("func f() { local x = { value: 1 }; }");
+	case.diagnostics().assert_none();
 	assert!(matches!(
 		case.local_definition_value(&case.function_block(0), 0),
-		Expression::BareBlock(_)
+		Expression::NamedList { .. }
 	));
 }
 
@@ -1643,27 +1723,11 @@ fn an_enum_repr_after_a_colon_is_not_read() {
 }
 
 #[test]
-fn old_struct_forms_are_reported_and_read_as_the_new_ones() {
-	let case = TestCase::new(indoc! {"
-        struct Point { x: i32, y: i32 };
-        func f(p: Point) {
-            local q = Point::{ x: 1, y: 2 };
-            local Point::{ x, .. } = p;
-        }
-    "});
-	case.diagnostics().assert_codes(&[
-		DiagnosticCode::StructFieldsNeedParentheses,
-		DiagnosticCode::StructLiteralIsACall,
-		DiagnosticCode::StructLiteralIsACall,
-	]);
+fn struct_declarations_still_use_parenthesized_fields() {
+	let case = TestCase::new("struct Point { x: i32, y: i32 };");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::StructFieldsNeedParentheses]);
 	assert_eq!(case.struct_fields(0).len(), 2);
-	let statements = case.function_block(1);
-	let (_, arguments) =
-		case.named_call(case.local_definition_value(&statements, 0));
-	assert_eq!(arguments.len(), 2);
-	// The old *pattern* form is gone: it is reported and read as an error,
-	// not as the new one.
-	assert_eq!(case.local_patterns(1)[1], "<error>");
 }
 
 /// A parameter and a field are both written `binding: Type`, a binding
@@ -2126,9 +2190,9 @@ fn test_pattern_tuple_destructuring() {
 fn test_pattern_struct_destructuring() {
 	let case = TestCase::new(indoc! {"
         func f(p: Point) {
-            local Point({ x, y }) = p;
-            local Point({ x: a, y: b }) = p;
-            local geom::Point({ x, .. }) = p;
+            local Point{ x, y } = p;
+            local Point{ x: a, y: b } = p;
+            local geom::Point{ x, .. } = p;
             local Point(a, ..) = p;
         }
     "});
@@ -2148,7 +2212,7 @@ fn test_pattern_struct_destructuring() {
 /// room inside them from the path before.
 #[test]
 fn a_named_struct_pattern_keeps_its_open_brace() {
-	let source = "func f(p: Point) {\n    local Point({ x }) = p;\n}\n";
+	let source = "func f(p: Point) {\n    local Point{ x } = p;\n}\n";
 	let case = TestCase::new(source);
 	case.diagnostics().assert_none();
 	let pattern = local_definition_pattern(&case.function_block(0), 0);
@@ -2157,7 +2221,7 @@ fn a_named_struct_pattern_keeps_its_open_brace() {
 	else {
 		panic!("expected a struct pattern with braces")
 	};
-	assert_eq!(usize::from(open_brace), source.find("({").unwrap() + 1);
+	assert_eq!(usize::from(open_brace), source.find("{ x }").unwrap());
 }
 
 #[test]
@@ -2167,7 +2231,7 @@ fn a_pattern_path_starts_where_an_expression_path_can() {
 	let case = TestCase::new(indoc! {"
         func f(p: Point) {
             local Self(a, ..) = p;
-            local package::geom::Point({ x, .. }) = p;
+            local package::geom::Point{ x, .. } = p;
             local super::super::Point(b, ..) = p;
         }
     "});
@@ -2194,7 +2258,7 @@ fn test_pattern_rests_are_kept_as_written() {
         func f(p: Point) {
             local (.., a, ..) = p;
             local Point(.., ..) = p;
-            local Point({ .., x, .. }) = p;
+            local Point{ .., x, .. } = p;
         }
     "});
 	case.diagnostics().assert_none();
@@ -2214,13 +2278,13 @@ fn test_pattern_terms_say_what_they_are() {
 	// constant, and a name binds — unless `const` says it is a constant.
 	let case = TestCase::new(indoc! {"
         func f(p: Point) {
-            match p {
+            match (p) {
                 Point(0, 0) => {},
                 Point(x, const MAX) => {},
                 Point(x, 0) => {},
                 Point(-1, 'a' | true) => {},
                 (mut x, _) => {},
-                Point({ x, y: const MAX }) => {},
+                Point{ x, y: const MAX } => {},
                 x => {},
             }
         }
@@ -2246,7 +2310,7 @@ fn test_pattern_const_marks_a_name_as_a_constant() {
 	// compare with a constant rather than bind.
 	let case = TestCase::new(indoc! {"
         func f(x: i32) {
-            match x {
+            match (x) {
                 const MAX => {},
                 const MAX | const MIN => {},
             }
@@ -2265,7 +2329,7 @@ fn test_pattern_redundant_const_is_dropped_and_warned() {
 	// the parser warns and drops it.
 	let case = TestCase::new(indoc! {"
         func f(x: i32) {
-            match x {
+            match (x) {
                 const Ordering::Less => {},
                 const MAX => {},
             }
@@ -2287,7 +2351,7 @@ fn test_pattern_a_literal_is_a_test() {
 	// is needed to say what it means.
 	for pattern in ["0", "-1", "'a'", "true"] {
 		let case = TestCase::new(&format!(
-			"func f(x: i32) {{ match x {{ {pattern} => {{}} }} }}"
+			"func f(x: i32) {{ match (x) {{ {pattern} => {{}} }} }}"
 		));
 		case.diagnostics().assert_none();
 	}
@@ -2304,7 +2368,7 @@ fn test_pattern_const_takes_a_path_and_nothing_else() {
 		("const mut y", DiagnosticCode::ReservedIdentifier),
 	] {
 		let case = TestCase::new(&format!(
-			"func f(x: i32) {{ match x {{ {pattern} => {{}} }} }}"
+			"func f(x: i32) {{ match (x) {{ {pattern} => {{}} }} }}"
 		));
 		case.diagnostics().assert_error(code);
 	}
@@ -2326,7 +2390,7 @@ fn test_pattern_a_float_or_string_is_read() {
 	// judgement, so the rest of the file still parses.
 	for pattern in ["1.5", "-1.5", "\"hi\""] {
 		let case = TestCase::new(&format!(
-			"func f(x: i32) {{ match x {{ {pattern} => {{}} }} }}"
+			"func f(x: i32) {{ match (x) {{ {pattern} => {{}} }} }}"
 		));
 		case.diagnostics().assert_none();
 	}
@@ -2711,7 +2775,7 @@ fn chained_assignments_are_an_error() {
 	assert_eq!(shape_of("a = (b = c)"), "(= a (tuple (= b c)))");
 	// One mistake, one diagnostic: the second `=` continues the assignment,
 	// not the `if`.
-	TestCase::new("func f() { x = if c { 1 } else { 2 } = y }")
+	TestCase::new("func f() { x = if (c) { 1 } else { 2 } = y }")
 		.diagnostics()
 		.assert_codes(&[DiagnosticCode::ChainedAssignment]);
 }
@@ -4218,9 +4282,9 @@ fn test_impl_associated_const() {
 #[test]
 fn test_attribute_with_arguments() {
 	// `#[word]` is covered elsewhere; this is the other shape, arguments
-	// named as a call's, `#[name({ arg: value, .. })]`.
+	// named as a call's, `#[name{ arg: value, .. }]`.
 	let case = TestCase::new(indoc! {"
-        #[memory_limits({ min_pages: 1, max_pages: 4 })]
+        #[memory_limits{ min_pages: 1, max_pages: 4 }]
         memory m: u32;
     "});
 	case.diagnostics().assert_none();
@@ -4253,29 +4317,58 @@ fn test_attribute_with_arguments() {
 }
 
 #[test]
-fn old_attribute_arguments_are_reported_and_read_as_named() {
-	let case = TestCase::new(indoc! {"
-        #[memory_limits(min_pages = 1, max_pages = 4)]
-        memory m: u32;
-    "});
-	case.diagnostics()
-		.assert_codes(&[DiagnosticCode::AttributeArgumentsAreNamed]);
-	case.diagnostics()
-		.assert_error_saying("an attribute's arguments are named as a call's");
-	let Item::Memory { attributes, .. } = case.item(0) else {
-		panic!("item 0 is {}, not a memory", item_kind(case.item(0)))
+fn attribute_arguments_use_braces_without_a_parenthesized_form() {
+	for source in [
+		"#[memory_limits({ min_pages: 1 })] memory m: u32;",
+		"#[memory_limits(min_pages = 1)] memory m: u32;",
+		"#[memory_limits()] memory m: u32;",
+	] {
+		TestCase::new(source)
+			.diagnostics()
+			.assert_error(DiagnosticCode::UnclosedDelimiter);
+	}
+}
+
+#[test]
+fn attributes_share_named_argument_syntax_and_keep_their_spans() {
+	let source = "#[inline]\n#[empty{}]\n#[other { value: Point{ x: (1: u8) }, shorthand, }]\nfunc f() {}";
+	let case = TestCase::new(source);
+	case.diagnostics().assert_none();
+	let Item::Function { attributes, .. } = case.item(0) else {
+		panic!("expected a function");
 	};
-	let AttributeValue::Named(args) = &case.ast.list(*attributes)[0].value
-	else {
-		panic!("expected named attribute arguments")
+	let written = case.ast.list(*attributes);
+	assert!(matches!(written[0].value, AttributeValue::Word));
+	assert!(
+		matches!(written[1].value, AttributeValue::Named(args) if args.is_empty())
+	);
+	let AttributeValue::Named(args) = written[2].value else {
+		panic!("expected named arguments");
 	};
-	let names: Vec<&str> = case
+	let [value, shorthand] = case.ast.list(args) else {
+		panic!("expected two arguments");
+	};
+	assert_eq!(case.name(value.name.inner), "value");
+	assert_eq!(
+		case.shape(value.value.unwrap()),
+		"(call Point (named (x (tuple (: 1 u8)))))"
+	);
+	assert_eq!(case.name(shorthand.name.inner), "shorthand");
+	assert!(shorthand.value.is_none());
+	let spans: Vec<_> = case
 		.ast
-		.list(*args)
+		.spans(*attributes)
 		.iter()
-		.map(|arg| case.name(arg.name.inner))
+		.map(|span| span.extract_str(source))
 		.collect();
-	assert_eq!(names, ["min_pages", "max_pages"]);
+	assert_eq!(
+		spans,
+		[
+			"#[inline]",
+			"#[empty{}]",
+			"#[other { value: Point{ x: (1: u8) }, shorthand, }]",
+		]
+	);
 }
 
 // ── remaining parser diagnostics ─────────────────────────────────────────────
@@ -4356,7 +4449,7 @@ fn test_unknown_characters_are_skipped_rather_than_derailing_the_parse() {
 #[test]
 fn string_contexts_preserve_raw_spans_without_interning_contents() {
 	let source = indoc! {"
-        #[other({ value: \"line\\nslash\\\\n\" })]
+        #[other{ value: \"line\\nslash\\\\n\" }]
         func f() {
             local text = \"line\\nslash\\\\n\";
         }
@@ -4407,7 +4500,7 @@ fn string_contexts_preserve_raw_spans_without_interning_contents() {
 #[test]
 fn invalid_escapes_preserve_string_nodes_and_surrounding_syntax() {
 	let source = indoc! {"
-        #[other({ value: \"\\o\" })]
+        #[other{ value: \"\\o\" }]
         func f() {
             local bad = \"\\o\";
             local good = \"ok\";
@@ -4483,7 +4576,7 @@ fn every_generic_argument_site_may_open_with_a_qualified_type() {
 		"func f() { local p: Is<<A as B>::C> = 0; }",
 		"func f() { g::<<A as B>::C>(); }",
 		"func f() { x.m::<<A as B>::C>(); }",
-		"func f() { match x { P::<<A as B>::C>(..) => {} } }",
+		"func f() { match (x) { P::<<A as B>::C>(..) => {} } }",
 	] {
 		TestCase::new(source).diagnostics().assert_none();
 	}
@@ -4494,9 +4587,9 @@ fn every_generic_argument_site_may_open_with_a_qualified_type() {
 #[test]
 fn a_block_like_statement_ends_at_its_brace() {
 	for (source, second) in [
-		("if c { a() } (x, y)", "(tuple x y)"),
-		("if c { a() } else { b() } (x, y)", "(tuple x y)"),
-		("match n { _ => a() } -1", "(u- 1)"),
+		("if (c) { a() } (x, y)", "(tuple x y)"),
+		("if (c) { a() } else { b() } (x, y)", "(tuple x y)"),
+		("match (n) { _ => a() } -1", "(u- 1)"),
 		("loop { break } [1]", "(array 1)"),
 		("block { a() } (x)", "(tuple x)"),
 	] {
@@ -4521,12 +4614,12 @@ fn a_block_like_statement_ends_at_its_brace() {
 #[test]
 fn a_parenthesized_block_like_expression_is_an_operand() {
 	assert_eq!(
-		shape_of("(if c { f } else { g })(x)"),
-		"(call (tuple (if c (block f) (block g))) x)"
+		shape_of("(if (c) { f } else { g })(x)"),
+		"(call (tuple (if (tuple c) (block f) (block g))) x)"
 	);
 	assert_eq!(
-		shape_of("x + (match n { _ => 1 })"),
-		"(+ x (tuple (match n (=> _ 1))))"
+		shape_of("x + (match (n) { _ => 1 })"),
+		"(+ x (tuple (match (tuple n) (=> _ 1))))"
 	);
 	assert_eq!(shape_of("-(block { 1 })"), "(u- (tuple (block 1)))");
 }
@@ -4536,22 +4629,22 @@ fn a_parenthesized_block_like_expression_is_an_operand() {
 #[test]
 fn a_block_like_expression_fills_a_whole_position() {
 	for source in [
-		"x = if c { 1 } else { 2 }",
-		"x += match n { _ => 1 }",
-		"local v = if c { f } else { g }",
-		"return if c { 1 } else { 2 }",
-		"g(if c { 1 } else { 2 }, loop { break 3 })",
-		"match n { _ => if c { 1 } else { 2 } }",
+		"x = if (c) { 1 } else { 2 }",
+		"x += match (n) { _ => 1 }",
+		"local v = if (c) { f } else { g }",
+		"return if (c) { 1 } else { 2 }",
+		"g(if (c) { 1 } else { 2 }, loop { break 3 })",
+		"match (n) { _ => if (c) { 1 } else { 2 } }",
 	] {
 		TestCase::new(&format!("func f() {{ {source} }}"))
 			.diagnostics()
 			.assert_none();
 	}
 	assert_eq!(
-		shape_of("x = if c { 1 } else { 2 }"),
-		"(= x (if c (block 1) (block 2)))"
+		shape_of("x = if (c) { 1 } else { 2 }"),
+		"(= x (if (tuple c) (block 1) (block 2)))"
 	);
-	TestCase::new("func f() { x = if c { 1 } else { 2 } + 3 }")
+	TestCase::new("func f() { x = if (c) { 1 } else { 2 } + 3 }")
 		.diagnostics()
 		.assert_codes(&[DiagnosticCode::BlockLikeOperand]);
 }
@@ -4561,23 +4654,23 @@ fn a_block_like_expression_fills_a_whole_position() {
 #[test]
 fn a_block_like_expression_is_not_an_operand() {
 	for source in [
-		"local v = x + if c { 1 } else { 2 };",
-		"local v = -if c { 1 } else { 2 };",
-		"local v = !match n { _ => c };",
-		"local v = match n { _ => s }.len();",
-		"local v = if c { 1 } else { 2 } * 3;",
+		"local v = x + if (c) { 1 } else { 2 };",
+		"local v = -if (c) { 1 } else { 2 };",
+		"local v = !match (n) { _ => c };",
+		"local v = match (n) { _ => s }.len();",
+		"local v = if (c) { 1 } else { 2 } * 3;",
 		"local v = block { 1 } == 1;",
-		"match n { _ => s }.len()",
-		"if c { 1 } else { 2 } + 3",
+		"match (n) { _ => s }.len()",
+		"if (c) { 1 } else { 2 } + 3",
 	] {
 		let case = TestCase::new(&format!("func f() {{ {source} }}"));
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::BlockLikeOperand]);
 	}
-	TestCase::new("func f() { local v = x + if c { 1 } else { 2 }; }")
+	TestCase::new("func f() { local v = x + if (c) { 1 } else { 2 }; }")
 		.diagnostics()
 		.assert_error_saying("`if` cannot be an operand");
-	TestCase::new("func f() { local v = match n { _ => s }.len(); }")
+	TestCase::new("func f() { local v = match (n) { _ => s }.len(); }")
 		.diagnostics()
 		.assert_error_saying("wrap it in parentheses: `(match ..)`");
 }
@@ -4845,7 +4938,7 @@ fn an_array_with_no_length_keeps_the_array() {
 fn a_pattern_path_with_no_last_segment_keeps_its_prefix() {
 	let case = TestCase::new(indoc! {"
 		func f() {
-		    match o {
+		    match (o) {
 		        Ordering:: => (),
 		        _ => (),
 		    }
@@ -4996,7 +5089,7 @@ fn a_label_with_no_name_keeps_its_jump() {
 
 #[test]
 fn unfinished_calls_keep_the_cursor_and_the_following_statement() {
-	for call in ["f(", "f(1,", "f({", "f({ a:", "f({ a: 1,", "f({ a: 1 }"] {
+	for call in ["f(", "f(1,", "f{", "f{ a:", "f{ a: 1,"] {
 		let source = format!("func g() {{ {call}   ");
 		let case = TestCase::new(&source);
 		let entries = case.function_block(0);

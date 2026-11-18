@@ -3,7 +3,7 @@
 struct Reading(raw: i32, calibrated: i32);
 
 func calibrate(raw: i32, offset: i32) -> Reading {
-    local reading = Reading({ raw, calibrated: raw + offset });
+    local reading = Reading{ raw, calibrated: raw + offset };
     reading
 }
 

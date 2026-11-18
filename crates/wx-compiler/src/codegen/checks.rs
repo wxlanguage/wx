@@ -69,21 +69,21 @@ fn compile(
 fn compare_emitter_size_locals_and_execution() {
 	let corpus = [
 		("arithmetic", "", "(n + x) * (n + x) + (n - x)"),
-		("if", "", "if n == 0 { (x + 1) * 2 } else { (x + 1) * 3 }"),
+		("if", "", "if (n == 0) { (x + 1) * 2 } else { (x + 1) * 3 }"),
 		(
 			"switch",
 			"",
-			"match n { 0 => { x + 10 }, 1 => { x + 20 }, 2 => { x + 30 }, _ => { x + 40 } }",
+			"match (n) { 0 => { x + 10 }, 1 => { x + 20 }, 2 => { x + 30 }, _ => { x + 40 } }",
 		),
 		(
 			"swap_loop",
 			"",
-			"local mut a = x; local mut b = x + 7; local mut i: i32 = 0; loop { if i == n { break; }; local old = a; a = b; b = old; i += 1; }; a * 100 + b",
+			"local mut a = x; local mut b = x + 7; local mut i: i32 = 0; loop { if (i == n) { break; }; local old = a; a = b; b = old; i += 1; }; a * 100 + b",
 		),
 		(
 			"nested_loops",
 			"",
-			"local mut i: i32 = 0; local mut sum = x; loop :outer { if i == n { break; }; local mut j: i32 = 0; loop { sum += i + j; j += 1; if j == 2 { i += 1; continue :outer; }; }; }; sum",
+			"local mut i: i32 = 0; local mut sum = x; loop :outer { if (i == n) { break; }; local mut j: i32 = 0; loop { sum += i + j; j += 1; if (j == 2) { i += 1; continue :outer; }; }; }; sum",
 		),
 		(
 			"calls",

@@ -24,7 +24,7 @@ trait Hasher: StackValue {
     #[inline]
     func write_u32(self: Self, word: u32) -> Self {
         loop (state = self, rest = u64_extend_u32(word), i: u64 = 0) {
-            if i == 4 { break state };
+            if (i == 4) { break state };
             (state.write_byte(low_byte(rest)), rest >> 8, i + 1)
         }
     }
@@ -33,7 +33,7 @@ trait Hasher: StackValue {
     #[inline]
     func write_u64(self: Self, word: u64) -> Self {
         loop (state = self, rest = word, i: u64 = 0) {
-            if i == 8 { break state };
+            if (i == 8) { break state };
             (state.write_byte(low_byte(rest)), rest >> 8, i + 1)
         }
     }
@@ -42,7 +42,7 @@ trait Hasher: StackValue {
     #[inline]
     func write_bytes<Mem: Memory>(self: Self, bytes: Mem::&[u8]) -> Self {
         loop (state = self, i: Mem::Size = 0) {
-            if i == bytes.len() { break state };
+            if (i == bytes.len()) { break state };
             (state.write_byte(bytes[i]), i + 1)
         }
     }
@@ -81,7 +81,7 @@ struct Fnv(value: u64);
 
 impl Fnv {
     pub func new() -> Self {
-        Self({ value: FNV_OFFSET_BASIS })
+        Self{ value: FNV_OFFSET_BASIS }
     }
 }
 
@@ -92,12 +92,12 @@ impl Fnv {
 impl Hasher for Fnv {
     #[inline]
     func write_byte(self: Self, byte: u8) -> Self {
-        Self({
+        Self{
             value: fnv_byte(
                 self.value,
                 u64_extend_u32(transmute::<u8, u32>(byte)),
             ),
-        })
+        }
     }
 
     func finish(self: Self) -> u64 {
@@ -138,7 +138,7 @@ impl Hash for Point {
     }
 }
 
-#[memory_limits({ min_pages: 1 })]
+#[memory_limits{ min_pages: 1 }]
 memory heap: u32;
 
 /// A string is a pointer into `heap`. The pointer is a stack value, so a

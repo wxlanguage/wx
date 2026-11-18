@@ -22,7 +22,7 @@ func transform(count: i32, scale: f64) -> f64 {
     // running accumulation
     local i = 0;
     loop {
-        if i >= count { break; }
+        if (i >= count) { break; }
         total = total + scale * (i as f64);
         i = i + 1;
     }

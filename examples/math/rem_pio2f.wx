@@ -23,7 +23,7 @@ pub func rem_pio2f(x: f32) -> (i32, f64) {
     local ix: u32 = x.to_bits() & 0x7fffffff;
 
     // |x| ~< 2^28*(pi/2), medium size — 25+53 bit pi is good enough here.
-    if ix < 0x4dc90fdb {
+    if (ix < 0x4dc90fdb) {
         // Specialised rint(): adding then subtracting 1.5/EPSILON forces rounding to an
         // integer without a round-trip through an integer type. Assumes round-to-nearest,
         // which is the only mode wasm has (musl's two correction branches for directed

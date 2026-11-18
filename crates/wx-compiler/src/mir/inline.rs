@@ -585,7 +585,7 @@ mod tests {
 	#[test]
 	fn a_recursive_function_stays_a_call_of_itself() {
 		let source = r#"
-			#[inline] func count(n: u32) -> u32 { if n == 0 { 0 } else { count(n - 1) + 1 } }
+			#[inline] func count(n: u32) -> u32 { if (n == 0) { 0 } else { count(n - 1) + 1 } }
 			func run(n: u32) -> u32 { count(n) }
 			export { run as "run" }
 		"#;
@@ -600,8 +600,8 @@ mod tests {
 	#[test]
 	fn mutually_recursive_functions_are_never_spliced_into_each_other() {
 		let source = r#"
-			func even(n: u32) -> u32 { if n == 0 { 1 } else { odd(n - 1) } }
-			func odd(n: u32) -> u32 { if n == 0 { 0 } else { even(n - 1) } }
+			func even(n: u32) -> u32 { if (n == 0) { 1 } else { odd(n - 1) } }
+			func odd(n: u32) -> u32 { if (n == 0) { 0 } else { even(n - 1) } }
 			export { even as "even" }
 		"#;
 		let (strings, mir) = inlined(source, Policy::DEFAULT);
@@ -614,7 +614,7 @@ mod tests {
 	#[test]
 	fn an_inlined_early_return_leaves_the_callers_wrapper() {
 		let source = r#"
-			#[inline] func clamp(x: i32) -> i32 { if x < 0 { return 0; } x }
+			#[inline] func clamp(x: i32) -> i32 { if (x < 0) { return 0; } x }
 			func run(a: i32) -> i32 { clamp(a) + clamp(a - 10) }
 			export { run as "run" }
 		"#;
@@ -637,7 +637,7 @@ mod tests {
 				local mut i: i32 = 0;
 				local mut acc: i32 = 0;
 				loop {
-					if i == n { break acc; }
+					if (i == n) { break acc; }
 					i = i + 1;
 					acc = acc + i;
 				}
@@ -680,8 +680,8 @@ mod tests {
 			#[inline] func a(x: u32) -> u32 { b(x) + c(x) }
 			func b(x: u32) -> u32 { c(x) * 2 }
 			func c(x: u32) -> u32 { x + 1 }
-			func d(x: u32) -> u32 { if x == 0 { 0 } else { e(x - 1) } }
-			func e(x: u32) -> u32 { if x == 0 { 1 } else { d(x - 1) } }
+			func d(x: u32) -> u32 { if (x == 0) { 0 } else { e(x - 1) } }
+			func e(x: u32) -> u32 { if (x == 0) { 1 } else { d(x - 1) } }
 			func run(x: u32) -> u32 { a(x) + d(x) + a(x + 1) }
 			export { run as "run", d as "d" }
 		"#;

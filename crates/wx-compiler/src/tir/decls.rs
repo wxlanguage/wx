@@ -867,8 +867,8 @@ pub struct MemoryDecl {
 	pub limits: MemoryLimits,
 }
 
-/// A memory's page limits, as `#[memory_limits({ min_pages: .., max_pages:
-/// .. })]` writes them: counts of 64 KiB pages, `None` for a bound left out.
+/// A memory's page limits, as `#[memory_limits{ min_pages: .., max_pages:
+/// .. }]` writes them: counts of 64 KiB pages, `None` for a bound left out.
 /// Recorded as written; whether a count fits the memory is the checker's
 /// (`Semantics::check_memory_limits`), since it depends on the memory's
 /// `Size`.
@@ -7678,7 +7678,7 @@ mod tests {
 				&vfs::VirtualFileSource::from_relative(HashMap::from([(
 					"main.wx".to_string(),
 					indoc! {"
-            #[other({ value: \"\\o\" })
+            #[other{ value: \"\\o\" }
         "}
 					.to_string(),
 				)])),
@@ -8125,13 +8125,13 @@ mod tests {
 	#[test]
 	fn memory_limits_are_recorded_as_written() {
 		let case = TestCase::new(indoc! {"
-			#[memory_limits({ min_pages: 2, max_pages: 9 })]
+			#[memory_limits{ min_pages: 2, max_pages: 9 }]
 			memory both: u32;
-			#[memory_limits({ max_pages: 4 })]
+			#[memory_limits{ max_pages: 4 }]
 			memory capped: u32;
 			memory free: u32;
 			// Too many for a 32-bit memory: that is the checker's to say.
-			#[memory_limits({ min_pages: 70000 })]
+			#[memory_limits{ min_pages: 70000 }]
 			memory big: u32;
 			import \"env\" as env { memory host: u32; }
 		"});
@@ -8147,17 +8147,17 @@ mod tests {
 	fn a_memory_limits_argument_that_says_nothing_is_reported_and_left_out() {
 		for (source, message, recorded) in [
 			(
-				"#[memory_limits({ pages: 1 })] memory heap: u32;",
+				"#[memory_limits{ pages: 1 }] memory heap: u32;",
 				"`#[memory_limits]` has no argument `pages`",
 				(None, None),
 			),
 			(
-				"#[memory_limits({ min_pages: 1, min_pages: 2 })] memory heap: u32;",
+				"#[memory_limits{ min_pages: 1, min_pages: 2 }] memory heap: u32;",
 				"`min_pages` is written twice",
 				(Some(1), None),
 			),
 			(
-				"#[memory_limits({ max_pages: \"4\" })] memory heap: u32;",
+				"#[memory_limits{ max_pages: \"4\" }] memory heap: u32;",
 				"`max_pages` must be a number of pages",
 				(None, None),
 			),
@@ -8218,7 +8218,7 @@ mod tests {
 	#[test]
 	fn a_known_attribute_in_the_wrong_form_is_an_error() {
 		let case = TestCase::new(indoc! {"
-			#[inline({ always: 1 })]
+			#[inline{ always: 1 }]
 			func f() {}
 			#[memory_limits]
 			memory heap: u32;

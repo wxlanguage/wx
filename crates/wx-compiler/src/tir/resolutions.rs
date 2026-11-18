@@ -1357,8 +1357,8 @@ mod tests {
 		let a = Analysis::clean(indoc! {"
 			func take(x: u32) {}
 			func f(x: u32) -> u32 {
-				take({ x: 1 });
-				take({ x });
+				take{ x: 1 };
+				take{ x };
 				x
 			}
 		"});
@@ -1381,8 +1381,8 @@ mod tests {
 		let a = Analysis::clean(indoc! {"
 			struct S(other: u32, value: u32);
 			func f(value: u32) -> u32 {
-				local _ = S({ other: 0, value: 1 });
-				local _ = S({ other: 0, value });
+				local _ = S{ other: 0, value: 1 };
+				local _ = S{ other: 0, value };
 				value
 			}
 		"});
@@ -1393,7 +1393,7 @@ mod tests {
 		};
 		assert_eq!(a.label("value: 1", "value"), field);
 		assert_eq!(
-			a.shorthand("value });", "value"),
+			a.shorthand("value };", "value"),
 			Some(Shorthand {
 				label: field,
 				value: a.value("\n\tvalue\n", "value"),
@@ -1408,7 +1408,7 @@ mod tests {
 			use m::value;
 			func take(value: u32) {}
 			func f() -> u32 {
-				take({ value });
+				take{ value };
 				value
 			}
 		"});
@@ -1437,7 +1437,7 @@ mod tests {
 		let a = Analysis::new(indoc! {"
 			func take(value: u32) {}
 			func f() {
-				take({ value });
+				take{ value };
 			}
 		"});
 		assert!(a.has_errors());
@@ -1455,7 +1455,7 @@ mod tests {
 		let a = Analysis::new(indoc! {"
 			func take(other: u32) {}
 			func f(value: u32) -> u32 {
-				take({ value });
+				take{ value };
 				value
 			}
 		"});
@@ -1477,10 +1477,10 @@ mod tests {
 				func make(value: u32) -> Self { S(0) }
 			}
 			func concrete(value: u32) -> S {
-				S::make({ value })
+				S::make{ value }
 			}
 			func generic<T: Make>(value: u32) -> T {
-				T::make({ value })
+				T::make{ value }
 			}
 		"});
 		let make = a.strings.get("make").unwrap();
@@ -1509,8 +1509,8 @@ mod tests {
 		// A concrete call names the impl's parameter; a call through the
 		// trait, the declaration's, which has no body.
 		for (call, caller, function) in [
-			("S::make({ value })", "concrete", implementation),
-			("T::make({ value })", "generic", declaration),
+			("S::make{ value }", "concrete", implementation),
+			("T::make{ value }", "generic", declaration),
 		] {
 			assert_eq!(
 				a.shorthand(call, "value"),
@@ -1535,7 +1535,7 @@ mod tests {
 			struct S(value: u32);
 			func f(s: S) -> u32 {
 				local _ = s.value;
-				local S({ value: x }) = s;
+				local S{ value: x } = s;
 				x
 			}
 		"});
@@ -1587,7 +1587,7 @@ mod tests {
 		let a = Analysis::clean(indoc! {"
 			func f(c: Bool) {
 				loop :outer {
-					if c { continue :outer; }
+					if (c) { continue :outer; }
 					break :outer;
 				}
 			}
@@ -1643,7 +1643,7 @@ mod tests {
 		let a = Analysis::clean(indoc! {"
 			struct S(value: u32);
 			func f(s: S) -> u32 {
-				local S({ value }) = s;
+				local S{ value } = s;
 				value
 			}
 		"});
@@ -1868,7 +1868,7 @@ mod tests {
 			struct S(value: u32);
 			func f(s: S, x: u32) -> u32 {
 				local _ = s.missing(x);
-				local _ = s.missing({ value: x });
+				local _ = s.missing{ value: x };
 				local _ = s.absent;
 				x
 			}
@@ -1900,7 +1900,7 @@ mod tests {
 		let a = Analysis::new(indoc! {"
 			func take(x: u32, y: u32) {}
 			func f(x: u32) -> u32 {
-				take({ x, y: missing });
+				take{ x, y: missing };
 				x
 			}
 		"});
@@ -1943,8 +1943,8 @@ mod tests {
 			struct S();
 			func f(x: u32) -> u32 {
 				missing(x);
-				S::absent({ x });
-				<Missing>::absent({ value: x });
+				S::absent{ x };
+				<Missing>::absent{ value: x };
 				x
 			}
 		"});
@@ -2018,10 +2018,10 @@ mod tests {
 			const LIMIT: u32 = 1;
 			enum E(value: u8) { A = 0, B = 1 }
 			func f(x: u32) -> u32 {
-				match x { const LIMIT => 1, _ => 0 }
+				match (x) { const LIMIT => 1, _ => 0 }
 			}
 			func g(x: E) -> u32 {
-				match x { E::A => 1, _ => 0 }
+				match (x) { E::A => 1, _ => 0 }
 			}
 		"});
 		assert_eq!(

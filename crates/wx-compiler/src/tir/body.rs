@@ -1306,7 +1306,7 @@ mod tests {
 			        local y = x;
 			        b = y;
 			    }
-			    if a == 0 {
+			    if (a == 0) {
 			        local z = x;
 			        b = z;
 			    } else {
@@ -1314,7 +1314,7 @@ mod tests {
 			        b = z;
 			    }
 			    local (p, q) = (x, b);
-			    match a {
+			    match (a) {
 			        0 | 1 => p,
 			        n => n + q,
 			    }
@@ -1326,7 +1326,7 @@ mod tests {
 			        n = n + d;
 			        break;
 			    }
-			    match o {
+			    match (o) {
 			        Ordering::Less => n,
 			        m => n,
 			    }
@@ -1511,16 +1511,16 @@ mod tests {
 		    func f(x: f32, cb: func() -> f32, c: Caller) {
 		        local g = make;
 		        _ = x.trunc().abs();
-		        _ = x.trunc({}).ceil();
+		        _ = x.trunc{}.ceil();
 		        _ = make().floor();
 		        _ = consume_unit().floor();
-		        _ = make({}).floor();
+		        _ = make{}.floor();
 		        _ = g().floor();
-		        _ = g({}).floor();
+		        _ = g{}.floor();
 		        _ = cb().floor();
 		        _ = c().floor();
 		        _ = Empty().id();
-		        _ = Empty({}).id();
+		        _ = Empty{}.id();
 		    }
 		"};
 		let case = Case::new(source);
@@ -1533,16 +1533,16 @@ mod tests {
 		let ast = case.graph.ast(case.file);
 		for (written, object, expected) in [
 			("x.trunc().abs", "x.trunc()", "f32"),
-			("x.trunc({}).ceil", "x.trunc({})", "f32"),
+			("x.trunc{}.ceil", "x.trunc{}", "f32"),
 			("make().floor", "make()", "f32"),
 			("consume_unit().floor", "consume_unit()", "f32"),
-			("make({}).floor", "make({})", "f32"),
+			("make{}.floor", "make{}", "f32"),
 			("g().floor", "g()", "f32"),
-			("g({}).floor", "g({})", "f32"),
+			("g{}.floor", "g{}", "f32"),
 			("cb().floor", "cb()", "f32"),
 			("c().floor", "c()", "f32"),
 			("Empty().id", "Empty()", "Empty"),
-			("Empty({}).id", "Empty({})", "Empty"),
+			("Empty{}.id", "Empty{}", "Empty"),
 		] {
 			let (value, ty) = operand(&case, "f", written, object);
 			assert_eq!(ty, expected, "{object}");
@@ -1657,7 +1657,7 @@ mod tests {
 		let case = Case::new(indoc! {"
 			func f(c: Bool) {
 			    local a: u32 = 1;
-			    if c {
+			    if (c) {
 			        local x: u32 = a;
 			        // then
 			    } else {
@@ -1676,7 +1676,7 @@ mod tests {
 	fn an_arm_binds_after_its_pattern() {
 		let case = Case::new(indoc! {"
 			func f(a: u32) -> u32 {
-			    match a {
+			    match (a) {
 			        0 => {
 			            // first
 			            a

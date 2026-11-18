@@ -629,7 +629,7 @@ mod tests {
 			r#"
 			func f(c: Bool, x: i32) -> i32 {
 				local shared = (x + 1) * 2;
-				if c { shared + 3 } else { shared + 4 }
+				if (c) { shared + 3 } else { shared + 4 }
 			}
 			export { f as "f" }
 		"#,
@@ -681,7 +681,7 @@ mod tests {
 			func get(x: i32) -> i32 { x }
 			func f(c: Bool, x: i32) -> i32 {
 				local result = get(x);
-				if c { result + 1 } else { result + 2 }
+				if (c) { result + 1 } else { result + 2 }
 			}
 			export { f as "f" }
 		"#,
@@ -728,7 +728,7 @@ mod tests {
 				local mut i: i32 = 0;
 				loop {
 					local next = i + 1;
-					if i == n { break; };
+					if (i == n) { break; };
 					i = next;
 				};
 				i + 1
@@ -769,7 +769,7 @@ mod tests {
 				local mut b = y;
 				local mut i: i32 = 0;
 				loop {
-					if i == n { break; };
+					if (i == n) { break; };
 					local old = a;
 					a = b;
 					b = old;
@@ -818,9 +818,9 @@ mod tests {
 				local mut c = z;
 				local mut i: i32 = 0;
 				loop {
-					if i == n { break; };
+					if (i == n) { break; };
 					local old = a;
-					if i == 2 {
+					if (i == 2) {
 						a = c; c = b; b = old;
 						i += 1;
 						continue;
@@ -922,7 +922,7 @@ mod tests {
 			r#"
 			func f(n: i32) -> i32 {
 				local mut i: i32 = 0;
-				loop { if i == n { break; }; i += 1; };
+				loop { if (i == n) { break; }; i += 1; };
 				i
 			}
 			export { f as "f" }
@@ -948,7 +948,7 @@ mod tests {
 			r#"
 			func get(x: i32) -> i32 { x }
 			func f(c: Bool, x: i32, y: i32) -> i32 {
-				if c {
+				if (c) {
 					_ = get(x);
 					local ignored = x / y;
 					x + 1
@@ -1062,7 +1062,7 @@ mod tests {
 			for column in 0..width {
 				body.push_str(&format!("local mut v{column} = x + {column};"));
 			}
-			body.push_str("loop { if i == n { break; };");
+			body.push_str("loop { if (i == n) { break; };");
 			for column in 0..width {
 				body.push_str(&format!("v{column} += {};", column + 1));
 			}
@@ -1191,7 +1191,7 @@ mod tests {
 		let mut graph = graph_of(
 			r#"
 			func get(x: i32) -> i32 { x }
-			func f(c: Bool, x: i32) -> i32 { if c { get(x) } else { get(x + 1) } }
+			func f(c: Bool, x: i32) -> i32 { if (c) { get(x) } else { get(x + 1) } }
 			export { f as "f" }
 		"#,
 			"f",

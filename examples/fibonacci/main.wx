@@ -6,16 +6,15 @@ import "console" as console {
 }
 
 func fibonacci(n: i32) -> i32 {
-    if n <= 1 { return n };
-
+    if (n <= 1) { return n };
     fibonacci(n - 1) + fibonacci(n - 2)
 }
 
 func fibonacci_iterative(n: i32) -> i32 {
-    if n <= 1 { return n };
+    if (n <= 1) { return n };
 
     loop (a: i32 = 0, b: i32 = 1, k = n) {
-        if k == 1 { break b };
+        if (k == 1) { break b };
         (b, a + b, k - 1)
     }
 }
@@ -25,25 +24,25 @@ func binary_search<M: Memory, T: Ord>(
     target: T,
 ) -> (Bool, M::Size) {
     loop (low: M::Size = 0, high = arr.len()) {
-        if low == high { break (False, 0) };
+        if (low == high) { return (False, 0) };
 
         local mid = low + (high - low) / 2;
-        match arr[mid].cmp(target) {
-            Ordering::Less => continue({
+        match (arr[mid].cmp(target)) {
+            Ordering::Less => continue {
                 low: mid + 1,
                 high,
-            }),
-            Ordering::Greater => continue({
+            },
+            Ordering::Greater => continue {
                 low,
                 high: mid,
-            }),
-            Ordering::Equal => break (True, mid),
+            },
+            Ordering::Equal => return (True, mid),
         }
     }
 }
 
 func contains(arr: heap::&[u32], target: u32) -> Bool {
-    local (found, _) = binary_search(arr, target);
+    local (found, _) = binary_search{ arr, target };
     found
 }
 

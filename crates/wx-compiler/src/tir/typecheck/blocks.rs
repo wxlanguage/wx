@@ -11,8 +11,7 @@ use string_interner::symbol::SymbolU32;
 
 use super::calls::{NamedMatch, NamedOwner};
 use super::patterns::PatternContext;
-use super::{Arguments, BodyBuilder, OpenTarget, ScopeType};
-use crate::ast::ArgumentList;
+use super::{BodyBuilder, OpenTarget, ScopeType};
 use crate::ast::{self, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextOffset, TextSpan};
 use crate::symbols::Keyword;
@@ -769,7 +768,7 @@ impl BodyBuilder<'_, '_> {
 		}
 	}
 
-	/// `continue({ b: 2, a })`, a call by name of the loop `target`: each
+	/// `continue { b: 2, a }`, a call by name of the loop `target`: each
 	/// value gives the parameter of its name (`match_names`), held to its
 	/// type.
 	fn build_named_state(
@@ -875,38 +874,38 @@ impl BodyBuilder<'_, '_> {
 	pub(super) fn build_continue(
 		&mut self,
 		label: Option<Spanned<SymbolU32>>,
-		arguments: Option<Arguments<'_>>,
+		value: Option<ast::ExprId>,
 		span: TextSpan,
 	) -> ExprIdx {
-		let arguments = arguments.filter(|arguments| {
-			!matches!(arguments.kind, ArgumentList::Positional([]))
-		});
 		let Some(target) = self.jump_target(label, span, Jump::Continue) else {
-			// Its arguments are still checked, against nothing.
-			match arguments.map(|arguments| (arguments.kind, arguments.span)) {
-				Some((ArgumentList::Positional(values), _)) => {
-					for &value in values {
-						self.build(value, TypeIndex::ERROR);
-					}
+			// Its operand is still checked, against nothing.
+			if let Some(value) = value {
+				let ast = self.ast();
+				if let ast::Expression::NamedList { arguments } =
+					ast.expr(value)
+				{
+					self.build_named_values(
+						ast.list(arguments),
+						ast.expr_span(value),
+					);
+				} else {
+					self.build(value, TypeIndex::ERROR);
 				}
-				Some((ArgumentList::Named(arguments), span)) => {
-					self.build_named_values(arguments, span);
-				}
-				None => {}
 			}
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
 		let scope = target.scope;
 		let state = self.scope_types[usize::from(scope)].state;
-		let value = arguments.map(|arguments| {
-			// The list is one value of the parameters, as a call's is.
-			let value = match arguments.kind {
-				ArgumentList::Positional(values) => {
-					self.build_tuple(values, state, arguments.span)
-				}
-				ArgumentList::Named(named) => {
-					self.build_named_state(scope, named, arguments.span)
-				}
+		let value = value.map(|value| {
+			let ast = self.ast();
+			let value = match ast.expr(value) {
+				ast::Expression::NamedList { arguments } => self
+					.build_named_state(
+						scope,
+						ast.list(arguments),
+						ast.expr_span(value),
+					),
+				_ => self.build(value, state),
 			};
 			self.expect(value, state)
 		});

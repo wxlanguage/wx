@@ -2785,7 +2785,7 @@ mod tests {
 			}
 			impl Eq for Errno {}
 			func f(x: u16) -> u32 {
-				match Errno(x) {
+				match (Errno(x)) {
 					Errno::SUCCESS => 10,
 					Errno::BADF => 20,
 					Errno(code) => 100 + transmute::<u16, u32>(code),
@@ -2811,20 +2811,20 @@ mod tests {
 			enum Signal(number: i32) { Hangup = 1, Interrupt = 2 }
 			enum Ordering2(value: i8) { Less = -1, Equal = 0, Greater = 1 }
 			func pick(x: u32) -> Signal {
-				if x == 0 { Signal::Hangup } else { Signal::Interrupt }
+				if (x == 0) { Signal::Hangup } else { Signal::Interrupt }
 			}
 			func by_field(x: u32) -> i32 { pick(x).number }
 			func by_position(x: u32) -> i32 { local Signal(n) = pick(x); n }
-			func by_name(x: u32) -> i32 { local Signal({ number }) = pick(x); number }
+			func by_name(x: u32) -> i32 { local Signal{ number } = pick(x); number }
 			func order(x: i32) -> i32 {
-				local o = if x < 0 {
+				local o = if (x < 0) {
 					Ordering2::Less
-				} else if x == 0 {
+				} else if (x == 0) {
 					Ordering2::Equal
 				} else {
 					Ordering2::Greater
 				};
-				match o {
+				match (o) {
 					Ordering2::Equal => 100,
 					Ordering2(n) => transmute::<i8, i32>(n),
 				}
@@ -2879,7 +2879,7 @@ mod tests {
 			r#"
 			enum E(value: u8) { A = 0, B = 1 }
 			func f(x: u8) -> u32 {
-				match transmute::<u8, E>(x) { E::A => 10, E::B => 20 }
+				match (transmute::<u8, E>(x)) { E::A => 10, E::B => 20 }
 			}
 			export { f as "f" }
 		"#,
@@ -3141,14 +3141,14 @@ mod tests {
 			func subtract(a: i32, b: i32) -> i32 { a - b }
 			func run() -> i32 {
 				local mut x: i32 = 0
-				local a: i32 = core::i32_sub({
+				local a: i32 = core::i32_sub{
 					b: block { x = x + 1; x },
 					a: block { x = x + 1; x },
-				})
-				local b: i32 = subtract({
+				}
+				local b: i32 = subtract{
 					b: block { x = x + 1; x },
 					a: block { x = x + 1; x },
-				})
+				}
 				a * 100 + b * 10 + x
 			}
 			export { run as "run" }
@@ -3161,16 +3161,64 @@ mod tests {
 	}
 
 	#[test]
+	fn grouped_subjects_brace_calls_and_branch_operands_execute() {
+		let source = r#"
+			struct Point(x: i32, y: i32);
+			func add(a: i32, b: i32) -> i32 { a + b }
+			impl Point {
+				func sum(self: Self) -> i32 { add{ b: self.y, a: self.x } }
+			}
+			func named() -> i32 {
+				match (Point{ y: 2, x: 1 }: Point) {
+					Point{ x, y } => Point{ x, y }.sum(),
+				}
+			}
+			func single() -> i32 {
+				loop (i: i32 = 1) {
+					if (i >= 8: Bool) { break i };
+					continue (i + 1) * 2
+				}
+			}
+			func state() -> i32 {
+				loop :state (i: i32 = 0, total: i32 = 0) {
+					if (i == 3) { break total };
+					match (i) {
+						0 => continue (i + 1, total + 2),
+						1 => continue :state { total: total + 3, i: i + 1 },
+						_ => (i + 1, total + 5),
+					}
+				}
+			}
+			export { named, single, state }
+		"#;
+		for policy in [None, Some(mir::inline::Policy::DEFAULT)] {
+			let (mut store, instance) = instantiate_with_policy(source, policy);
+			for (name, expected) in
+				[("named", 3), ("single", 10), ("state", 10)]
+			{
+				let run = instance
+					.get_typed_func::<(), i32>(&mut store, name)
+					.unwrap();
+				assert_eq!(
+					run.call(&mut store, ()).unwrap(),
+					expected,
+					"{name}"
+				);
+			}
+		}
+	}
+
+	#[test]
 	fn argument_spills_preserve_zero_sized_field_effects() {
 		let source = r#"
 			struct Value(a: i32, marker: (), b: i32);
 			func run() -> i32 {
 				local mut x: i32 = 0
-				local p: Value = Value({
+				local p: Value = Value{
 					b: block { x = x + 1; x },
 					marker: block { x = x + 1; () },
 					a: block { x = x + 1; x },
-				})
+				}
 				p.a * 100 + p.b * 10 + x
 			}
 			export { run as "run" }
@@ -3283,7 +3331,7 @@ mod tests {
 					func ordered(x: {from}) -> i32 {{
 						local result = core::{to}_trunc_{from}(x);
 						trace.set(9);
-						if result == 0 {{ 0 }} else {{ 1 }}
+						if (result == 0) {{ 0 }} else {{ 1 }}
 					}}
 					func converted(x: {from}) -> {to} {{ core::{to}_trunc_{from}(x) }}
 					func read() -> i32 {{ trace.get() }}
@@ -3369,7 +3417,7 @@ mod tests {
 	fn trapping_integer_operations_stay_in_their_branch_and_loop_iteration() {
 		let source = r#"
 			func branch(x: i32) -> i32 {
-				if x == 0 { return 7; }
+				if (x == 0) { return 7; }
 				local _ = 10 / x;
 				42
 			}
@@ -3377,7 +3425,7 @@ mod tests {
 				local mut divisor: i32 = 2;
 				loop {
 					local _ = 10 / divisor;
-					if divisor == stop { break 42; }
+					if (divisor == stop) { break 42; }
 					divisor -= 1;
 				}
 			}
@@ -3541,7 +3589,7 @@ mod tests {
 			struct Meters(m: u32);
 			struct Pair(a: Meters, unit: (), b: u32);
 			func regroup(x: u32, y: u32) -> u32 {
-				local Pair({ a: Meters(a), b, .. }) = transmute::<(u32, u32), Pair>((x, y));
+				local Pair{ a: Meters(a), b, .. } = transmute::<(u32, u32), Pair>((x, y));
 				a * 10 + b
 			}
 			func flatten(p: Pair) -> (u32, u32) { transmute(p) }
@@ -3564,7 +3612,7 @@ mod tests {
 		// `Bool`'s `!` and the narrow-integer operators are core impls over
 		// `transmute`d `i32` instructions.
 		let source = r#"
-			func not(b: u32) -> u32 { if !(b == 0) { 1 } else { 2 } }
+			func not(b: u32) -> u32 { if (!(b == 0)) { 1 } else { 2 } }
 			func narrow(a: i8, b: i8) -> i8 { a.div(b) }
 			export { not as "not", narrow as "narrow" }
 		"#;
@@ -4010,7 +4058,7 @@ mod tests {
 			func branch(flag: Bool) -> i32 {
 				counter.set(1);
 				local before = counter.get();
-				if flag { counter.set(2); } else { counter.set(3); }
+				if (flag) { counter.set(2); } else { counter.set(3); }
 				before * 10 + counter.get()
 			}
 			func repeat() -> i32 {
@@ -4021,7 +4069,7 @@ mod tests {
 					local before = counter.get();
 					counter.set(9);
 					sum += before;
-					if i == 3 { break; }
+					if (i == 3) { break; }
 					i += 1;
 				};
 				sum
@@ -4195,7 +4243,7 @@ mod tests {
 			func read<G: Global>(g: G) -> G::Value { g.get() }
 			func run() -> i32 {
 				total.set(read(total) + widen(read(small)));
-				if read(flag) { read(total) } else { 0 }
+				if (read(flag)) { read(total) } else { 0 }
 			}
 			// A narrow signed value is held sign-extended in its `i32`.
 			func widen(x: i8) -> i32 { transmute(x) }
@@ -4295,7 +4343,7 @@ mod tests {
             struct Pair(a: i32, b: i32);
             const ORIGIN: Pair = Pair(0, 0);
             func pick(p: Pair) -> i32 {
-                match p {
+                match (p) {
                     const ORIGIN => { 1 },
                     _ => { 2 },
                 }
@@ -4327,7 +4375,7 @@ mod tests {
 	#[test]
 	fn a_slice_parameter_is_indexed_against_its_length() {
 		let source = r#"
-			#[memory_limits({ min_pages: 1 })]
+			#[memory_limits{ min_pages: 1 }]
 			memory heap: u32;
 			func at(s: heap::&[u8], i: u32) -> u8 { s[i] }
 			export { at as "at", heap as "heap" }
@@ -4425,7 +4473,7 @@ mod tests {
 	#[test]
 	fn same_slot_types_with_distinct_layouts_coexist_in_one_module() {
 		let source = r#"
-			#[memory_limits({ min_pages: 1 })]
+			#[memory_limits{ min_pages: 1 }]
 			memory heap: u32;
 			struct Sorted(a: u8, b: i64, c: u8);
 			#[fixed_order]
@@ -4662,7 +4710,7 @@ mod tests {
 		let source = r#"
             struct Pair<T>(first: T, second: T);
             func sum(p: Pair<i32>) -> i32 { p.first + p.second }
-            func run() -> i32 { sum(Pair({ first: 3, second: 4 })) }
+            func run() -> i32 { sum(Pair{ first: 3, second: 4 }) }
             export { run as "run" }
         "#;
 		let (mut store, instance) = instantiate(source);
@@ -4756,7 +4804,7 @@ mod tests {
 	fn a_recursive_generic_call_with_the_same_arguments_is_one_instance() {
 		let source = r#"
 			func count<T: StackValue>(x: T, n: u32) -> u32 {
-				if n == 0 { 0 } else { count(x, n - 1) + 1 }
+				if (n == 0) { 0 } else { count(x, n - 1) + 1 }
 			}
 			func run(n: u32) -> u32 { count((1: u8), n) }
 			export { run as "run" }
@@ -4870,7 +4918,7 @@ mod tests {
 		let source = r#"
 			func differ<T: PartialEq>(a: T, b: T) -> Bool { a != b }
 			func run(a: u32, b: u32) -> u32 {
-				if differ(a, b) { 1 } else { 0 }
+				if (differ(a, b)) { 1 } else { 0 }
 			}
 			export { run as "run" }
 		"#;
@@ -4988,7 +5036,7 @@ mod tests {
 		// recursion limit would.
 		let source = r#"
 			func grow<T: StackValue>(x: T, n: u32) -> u32 {
-				if n == 0 { 0 } else { grow((x, x), n - 1) }
+				if (n == 0) { 0 } else { grow((x, x), n - 1) }
 			}
 			func run(n: u32) -> u32 { grow((1: u8), n) }
 			export { run as "run" }
@@ -5017,7 +5065,7 @@ mod tests {
 		// names a type of 2^128 leaves by printing only the start of it.
 		let source = r#"
 			func grow<T: StackValue>(x: T, n: u32) -> u32 {
-				if n == 0 { 0 } else { grow((x, x), n - 1) }
+				if (n == 0) { 0 } else { grow((x, x), n - 1) }
 			}
 			func run(n: u32) -> u32 { grow((), n) }
 			export { run as "run" }
@@ -5040,7 +5088,7 @@ mod tests {
 			r#"
 				struct Wrap<T>(value: T);
 				func grow<T: StackValue>(x: T, n: u32) -> u32 {
-					if n == 0 { 0 } else { grow(Wrap(x), n - 1) }
+					if (n == 0) { 0 } else { grow(Wrap(x), n - 1) }
 				}
 				func run(n: u32) -> u32 { grow((1: u8), n) }
 				export { run as "run" }
@@ -5048,7 +5096,7 @@ mod tests {
 			r#"
 				struct Wrap<T>(value: T);
 				func ping<T: StackValue>(x: T, n: u32) -> u32 {
-					if n == 0 { 0 } else { pong(Wrap(x), n - 1) }
+					if (n == 0) { 0 } else { pong(Wrap(x), n - 1) }
 				}
 				func pong<T: StackValue>(x: T, n: u32) -> u32 { ping(x, n) }
 				func run(n: u32) -> u32 { ping((1: u8), n) }
@@ -5168,7 +5216,7 @@ mod tests {
 		let source = r#"
             struct Point(x: i32, y: i32);
             func run() -> i32 {
-                local Point({ x: a, y: b }) = Point({ x: 1, y: 2 })
+                local Point{ x: a, y: b } = Point{ x: 1, y: 2 }
                 a * 10 + b
             }
             export { run as "run" }
@@ -5596,7 +5644,7 @@ mod tests {
 				local mut total: i32 = 0;
 				loop {
 					total += i;
-					if i == 3 { break total; }
+					if (i == 3) { break total; }
 					i += 1;
 				}
 			}
@@ -5627,8 +5675,8 @@ mod tests {
 				local mut total: i32 = 0;
 				loop {
 					total += i;
-					if i == stop { break total; }
-					if i == 3 { break total; }
+					if (i == stop) { break total; }
+					if (i == 3) { break total; }
 					i += 1;
 				}
 			}
@@ -5654,8 +5702,8 @@ mod tests {
 				local mut total: i32 = 0;
 				loop {
 					total += i;
-					if i == stop { break Result(total, (), (i, total + 1)); }
-					if i == 3 { break Result(total + 10, (), (i, total + 11)); }
+					if (i == stop) { break Result(total, (), (i, total + 1)); }
+					if (i == 3) { break Result(total + 10, (), (i, total + 11)); }
 					i += 1;
 				}
 			}
@@ -5663,7 +5711,7 @@ mod tests {
 				local mut total: i32 = 1;
 				local result = block :done {
 					total += 1;
-					if flag { break :done total * 10; }
+					if (flag) { break :done total * 10; }
 					total += 1;
 					total * 10
 				};
@@ -5695,7 +5743,7 @@ mod tests {
 				local result: (i32, (), (i32, i32)) = block :done {
 					local before = counter.get();
 					counter.set(2);
-					if flag { break :done (before, (), (counter.get(), 3)); }
+					if (flag) { break :done (before, (), (counter.get(), 3)); }
 					counter.set(4);
 					(before, (), (counter.get(), 5))
 				};
@@ -5745,8 +5793,8 @@ mod tests {
                 local mut i: i32 = 0;
                 local mut hits: i32 = 0;
                 loop {
-                    if i >= n { break x; }
-                    if i == 1 || x * x > 1000 { hits += 1; }
+                    if (i >= n) { break x; }
+                    if (i == 1 || x * x > 1000) { hits += 1; }
                     x = x * x;
                     i += 1;
                 }
@@ -5779,7 +5827,7 @@ mod tests {
                 local mut zi: f64 = 0;
                 local mut iterations: i32 = 0;
                 loop {
-                    if iterations >= limit || zr * zr + zi * zi > 4 {
+                    if (iterations >= limit || zr * zr + zi * zi > 4) {
                         break iterations;
                     }
                     local next_real = zr * zr - zi * zi + real;
@@ -6186,7 +6234,7 @@ mod tests {
 	fn a_bool_constant_drives_control_flow() {
 		let source = r#"
             const YES: Bool = True;
-            func run() -> i32 { if YES { 1 } else { 2 } }
+            func run() -> i32 { if (YES) { 1 } else { 2 } }
             export { run as "run" }
         "#;
 		let (mut store, instance) = instantiate(source);
@@ -6252,7 +6300,7 @@ mod tests {
                 func combine(self: Self, a: i32, b: i32) -> i32 { a - b }
             }
             func run() -> i32 {
-                Point(0, 0).combine({ b: 5, a: 10 })
+                Point(0, 0).combine{ b: 5, a: 10 }
             }
             export { run as "run" }
         "#;
@@ -6277,7 +6325,7 @@ mod tests {
                 func combine(self: Self, a: i32, b: i32) -> i32 { a - b }
             }
             func run() -> i32 {
-                Marker().combine({ b: 2, a: 9 })
+                Marker().combine{ b: 2, a: 9 }
             }
             export { run as "run" }
         "#;
@@ -6404,7 +6452,7 @@ mod tests {
 	fn a_scalar_match_selects_the_first_matching_arm() {
 		let source = r#"
             func run(x: i32) -> i32 {
-                match x {
+                match (x) {
                     0 => { 10 },
                     1 => { 20 },
                     _ => { 30 },
@@ -6430,7 +6478,7 @@ mod tests {
             func run(d: i32, w: i32) -> i32 {
                 local mut x: i32 = 7;
                 local mut y: i32 = 7;
-                match d {
+                match (d) {
                     0 => x = x / w,
                     1 => y = y / w,
                     2 => x = x % w,
@@ -6455,7 +6503,7 @@ mod tests {
 	fn a_match_arm_body_may_be_an_expression() {
 		let source = r#"
             func run(x: i32) -> i32 {
-                match x {
+                match (x) {
                     0 => 10,
                     1 => { local y: i32 = 20; y },
                     n => n + 1,
@@ -6479,13 +6527,13 @@ mod tests {
 		let source = r#"
             func g() -> u8 { 5 }
             func run(x: u32) -> u8 {
-                match x { 0 => 10, 1 => 11, 2 => 12, _ => g() }
+                match (x) { 0 => 10, 1 => 11, 2 => 12, _ => g() }
             }
             func digit(c: Char) -> u8 {
-                match c {
+                match (c) {
                     'a' | 'e' => 0,
                     ' ' => 1,
-                    _ => if c.is_ascii_digit() { 2 } else { 3 },
+                    _ => if (c.is_ascii_digit()) { 2 } else { 3 },
                 }
             }
             export { run as "run", digit as "digit" }
@@ -6512,7 +6560,7 @@ mod tests {
 		let source = r#"
             enum Color(value: u8) { Red = 0, Green, Blue }
             func run(c: Color) -> i32 {
-                match c {
+                match (c) {
                     Color::Red => { 1 },
                     Color::Green => { 2 },
                     Color::Blue => { 3 },
@@ -6534,7 +6582,7 @@ mod tests {
 	fn a_bool_match_compares_bool_constants() {
 		let source = r#"
             func run(b: Bool) -> i32 {
-                match b {
+                match (b) {
                     const True => { 1 },
                     const False => { 0 },
                 }
@@ -6557,10 +6605,10 @@ mod tests {
 		let source = r#"
             enum Color(value: u8) { Red = 0, Green, Blue }
             func run(c: Color) -> i32 {
-                match c {
+                match (c) {
                     Color::Red => { 1 },
                     other => {
-                        match other {
+                        match (other) {
                             Color::Green => { 2 },
                             Color::Blue => { 3 },
                             _ => { 4 },
@@ -6586,7 +6634,7 @@ mod tests {
 		let source = r#"
             func run(a: i32, b: i32) -> i32 {
                 local pair = (a, b)
-                match pair {
+                match (pair) {
                     (0, y) => { y },
                     (x, _) => { x },
                 }
@@ -6609,7 +6657,7 @@ mod tests {
             struct Point(x: i32, y: i32);
             func run(a: i32, b: i32) -> i32 {
                 local p = Point(a, b)
-                match p {
+                match (p) {
                     Point(0, y) => { y },
                     Point(x, _) => { x },
                 }
@@ -6631,10 +6679,10 @@ mod tests {
 		let source = r#"
             struct Point(x: i32, y: i32);
             func run(a: i32, b: i32) -> i32 {
-                local p = Point({ x: a, y: b })
-                match p {
-                    Point({ x: 0, y }) => { y },
-                    Point({ x, .. }) => { x },
+                local p = Point{ x: a, y: b }
+                match (p) {
+                    Point{ x: 0, y } => { y },
+                    Point{ x, .. } => { x },
                 }
             }
             export { run as "run" }
@@ -6654,7 +6702,7 @@ mod tests {
 		let source = r#"
             func run(a: i32, b: i32) -> i32 {
                 local pair = (a, b)
-                match pair {
+                match (pair) {
                     (0, x) | (x, 1) => { x },
                     _ => { 99 },
                 }
@@ -6677,7 +6725,7 @@ mod tests {
 		let source = r#"
             func run(a: i32, b: i32) -> i32 {
                 local pair = (a, b)
-                match pair {
+                match (pair) {
                     ((0 | 1), y) => { y },
                     _ => { 9 },
                 }
@@ -6698,7 +6746,7 @@ mod tests {
 	fn a_match_result_may_be_an_aggregate() {
 		let source = r#"
             func run(a: i32) -> (i32, i32) {
-                match a {
+                match (a) {
                     0 => { (1, 2) },
                     _ => { (3, 4) },
                 }
@@ -6719,7 +6767,7 @@ mod tests {
 		let source = r#"
             func make() -> i32 { core::trap() }
             func run() -> i32 {
-                match make() {
+                match (make()) {
                     0 => { 1 },
                     _ => { 2 },
                 }
@@ -6738,7 +6786,7 @@ mod tests {
 	fn a_diverging_arm_does_not_change_the_other_results() {
 		let source = r#"
             func run(x: i32) -> i32 {
-                match x {
+                match (x) {
                     0 => { core::trap() },
                     _ => { 7 },
                 }
@@ -6760,7 +6808,7 @@ mod tests {
 	fn a_duplicate_case_keeps_the_first_arm() {
 		let source = r#"
             func run(x: i32) -> i32 {
-                match x {
+                match (x) {
                     0 => { 1 },
                     0 => { 2 },
                     1 => { 3 },
@@ -6785,7 +6833,7 @@ mod tests {
 		let source = r#"
             enum Sign(value: i8) { Neg = -1, Zero = 0, Pos = 1 }
             func run(s: Sign) -> i32 {
-                match s {
+                match (s) {
                     Sign::Neg => { 1 },
                     Sign::Zero => { 2 },
                     Sign::Pos => { 3 },
@@ -6808,7 +6856,7 @@ mod tests {
 	fn narrow_signed_patterns_compare_with_sign_extension() {
 		let source = r#"
             func run(x: i8) -> i32 {
-                match x {
+                match (x) {
                     -1 => { 1 },
                     0 => { 2 },
                     1 => { 3 },
@@ -6834,7 +6882,7 @@ mod tests {
 		let source = r#"
             const ZERO: i32 = 0;
             func run(x: i32) -> i32 {
-                match x {
+                match (x) {
                     const ZERO => { 1 },
                     _ => { 2 },
                 }
@@ -6854,7 +6902,7 @@ mod tests {
 	fn a_char_match_compares_codepoints() {
 		let source = r#"
             func run(c: Char) -> i32 {
-                match c {
+                match (c) {
                     'a' => { 1 },
                     'b' => { 2 },
                     _ => { 3 },
@@ -6879,7 +6927,7 @@ mod tests {
             const A: Char = 'a';
             const B: Char = 'b';
             func run(c: Char) -> i32 {
-                match c {
+                match (c) {
                     const A => 1,
                     const B => 2,
                     _ => 3,
@@ -6911,7 +6959,7 @@ mod tests {
             impl Eq for P {}
             const TEN: P = P(10);
             func run(p: P) -> i32 {
-                match p {
+                match (p) {
                     const TEN => 1,
                     _ => 2,
                 }
@@ -6940,7 +6988,7 @@ mod tests {
             impl Eq for Pair {}
             const ORIGIN: Pair = Pair(0, 0);
             func run(p: Pair) -> i32 {
-                match p {
+                match (p) {
                     const ORIGIN => 1,
                     _ => 2,
                 }
@@ -6964,7 +7012,7 @@ mod tests {
             const A: Char = 'a';
             func run(c: Char) -> i32 {
                 local w = Wrapper(c)
-                match w {
+                match (w) {
                     Wrapper(const A) => 1,
                     Wrapper(_) => 2,
                 }
@@ -6987,7 +7035,7 @@ mod tests {
             struct Wrapper(value: Char);
             func run(c: Char) -> i32 {
                 local w = Wrapper(c)
-                match w {
+                match (w) {
                     Wrapper('a') => { 1 },
                     Wrapper(_) => { 2 },
                 }
@@ -7061,7 +7109,7 @@ mod tests {
             struct Marker();
             func run() -> i32 {
                 local m = Marker()
-                match m {
+                match (m) {
                     Marker() => { 7 },
                 }
             }
@@ -7082,7 +7130,7 @@ mod tests {
             struct Point(x: i32, y: i32);
             func make(a: i32, b: i32) -> Point { Point(a, b) }
             func run(a: i32, b: i32) -> i32 {
-                match make(a, b) {
+                match (make(a, b)) {
                     Point(0, y) => { y },
                     Point(x, _) => { x },
                 }
@@ -7104,10 +7152,10 @@ mod tests {
 		let source = r#"
             struct Wrapper(value: i32);
             func run(a: i32) -> i32 {
-                local w = Wrapper({ value: a })
-                match w {
-                    Wrapper({ value: 0 }) => { 1 },
-                    Wrapper({ value }) => { value },
+                local w = Wrapper{ value: a }
+                match (w) {
+                    Wrapper{ value: 0 } => { 1 },
+                    Wrapper{ value } => { value },
                 }
             }
             export { run as "run" }
@@ -7128,10 +7176,10 @@ mod tests {
             struct Pair(a: i32, b: i32);
             struct Holder(pair: Pair);
             func run(a: i32, b: i32) -> i32 {
-                local h = Holder({ pair: Pair(a, b) })
-                match h {
-                    Holder({ pair: Pair(0, y) }) => { y },
-                    Holder({ pair }) => { pair.a },
+                local h = Holder{ pair: Pair(a, b) }
+                match (h) {
+                    Holder{ pair: Pair(0, y) } => { y },
+                    Holder{ pair } => { pair.a },
                 }
             }
             export { run as "run" }
@@ -7153,7 +7201,7 @@ mod tests {
             struct Segment(a: Point, b: Point);
             func run(a: i32, b: i32, c: i32, d: i32) -> i32 {
                 local s = Segment(Point(a, b), Point(c, d))
-                match s {
+                match (s) {
                     Segment(Point(0, y), Point(_, z)) => { y + z },
                     Segment(Point(x, _), _) => { x },
                 }
@@ -7176,7 +7224,7 @@ mod tests {
             struct Pair(a: i32, b: i32);
             func run(a: i32, b: i32) -> i32 {
                 local pair = Pair(a, b)
-                match pair {
+                match (pair) {
                     whole => { whole.a + whole.b },
                 }
             }
@@ -7194,7 +7242,7 @@ mod tests {
 	fn a_narrow_signed_switch_uses_the_selector_width() {
 		let source = r#"
             func run(x: i16) -> i32 {
-                match x {
+                match (x) {
                     -2 => { 1 },
                     -1 => { 2 },
                     0 => { 3 },
@@ -7218,7 +7266,7 @@ mod tests {
 	fn an_unsigned_narrow_pattern_keeps_its_value() {
 		let source = r#"
             func run(x: u8) -> i32 {
-                match x {
+                match (x) {
                     255 => { 1 },
                     0 => { 2 },
                     1 => { 3 },
@@ -7242,7 +7290,7 @@ mod tests {
 	fn a_64_bit_selector_keeps_its_width() {
 		let source = r#"
             func run(x: i64) -> i32 {
-                match x {
+                match (x) {
                     -1 => { 1 },
                     0 => { 2 },
                     _ => { 3 },
@@ -7266,7 +7314,7 @@ mod tests {
 		let source = r#"
             const ZERO: f64 = 0.0;
             func run(x: f64) -> i32 {
-                match x {
+                match (x) {
                     const ZERO => { 1 },
                     _ => { 2 },
                 }
@@ -7295,7 +7343,7 @@ mod tests {
 	fn a_float_can_be_bound_in_a_match() {
 		let source = r#"
             func run(x: f64) -> f64 {
-                match x {
+                match (x) {
                     whole => { whole + 1.0 },
                 }
             }
@@ -7316,7 +7364,7 @@ mod tests {
             struct Wrapper(value: Bool);
             func run(value: Bool) -> i32 {
                 local w = Wrapper(value)
-                match w {
+                match (w) {
                     Wrapper(const True) => { 1 },
                     Wrapper(const False) => { 2 },
                 }
@@ -7338,7 +7386,7 @@ mod tests {
             func run(n: i32) -> i32 {
                 local mut i: i32 = 0
                 loop {
-                    match i {
+                    match (i) {
                         3 => { break 7 },
                         _ => { i = i + 1 },
                     }
@@ -7413,7 +7461,7 @@ mod tests {
 		let source = r#"
             func count(n: u32) -> u32 {
                 loop (i: u32 = 0) {
-                    if i == n { break i * 2 };
+                    if (i == n) { break i * 2 };
                     i + 1
                 }
             }
@@ -7440,9 +7488,9 @@ mod tests {
 		let source = r#"
             func sum(n: u32) -> u32 {
                 loop (i: u32 = 0, total: u32 = 0) {
-                    if i == n { break total };
-                    if i == 2 { continue({ total, i: i + 1 }) };
-                    continue({ i: i + 1, total: total + i })
+                    if (i == n) { break total };
+                    if (i == 2) { continue { total, i: i + 1 } };
+                    continue { i: i + 1, total: total + i }
                 }
             }
             export { sum as "sum" }
@@ -7457,7 +7505,7 @@ mod tests {
 		let source = r#"
             func fib(n: u32) -> u32 {
                 loop (a: u32 = 0, b: u32 = 1, k = n) {
-                    if k == 0 { break a };
+                    if (k == 0) { break a };
                     (b, a + b, k - 1)
                 }
             }
@@ -7473,10 +7521,10 @@ mod tests {
 		let source = r#"
             func steps(n: u32) -> u32 {
                 loop (mut at: u32 = 0, taken: u32 = 0) {
-                    if at >= n { break taken };
+                    if (at >= n) { break taken };
                     at += 1;
-                    if at % 3 == 0 { at += 1 };
-                    continue({ at, taken: taken + 1 })
+                    if (at % 3 == 0) { at += 1 };
+                    continue { at, taken: taken + 1 }
                 }
             }
             export { steps as "steps" }
@@ -7491,9 +7539,9 @@ mod tests {
 		let source = r#"
             func cells(n: u32) -> u32 {
                 loop :rows (row: u32 = 0, seen: u32 = 0) {
-                    if row == n { break seen };
+                    if (row == n) { break seen };
                     loop (col: u32 = 0, here: u32 = seen) {
-                        if col == row { continue :rows (row + 1, here) };
+                        if (col == row) { continue :rows (row + 1, here) };
                         (col + 1, here + 1)
                     }
                 }
@@ -7512,7 +7560,7 @@ mod tests {
             struct Range(start: u32, end: u32);
             func width(n: u32) -> u32 {
                 loop (r: Range = Range(0, n), steps: u32 = 0) {
-                    if r.start == r.end { break steps };
+                    if (r.start == r.end) { break steps };
                     (Range(r.start + 1, r.end), steps + 1)
                 }
             }
@@ -7662,7 +7710,7 @@ mod tests {
 	fn a_short_circuit_drives_an_if() {
 		let source = r#"
             func run(a: i32, b: i32) -> i32 {
-                if a == a && b != b { 1 } else { 2 }
+                if (a == a && b != b) { 1 } else { 2 }
             }
             export { run as "run" }
         "#;
@@ -7679,7 +7727,7 @@ mod tests {
 	#[test]
 	fn an_if_chooses_its_branch_value() {
 		let source = r#"
-            func run(c: Bool) -> i32 { if c { 1 } else { 2 } }
+            func run(c: Bool) -> i32 { if (c) { 1 } else { 2 } }
             export { run as "run" }
         "#;
 		let (mut store, instance) = instantiate(source);
@@ -7697,7 +7745,7 @@ mod tests {
 		let source = r#"
             func run(c: Bool) -> i32 {
                 local mut x: i32 = 0;
-                if c { x = 1; }
+                if (c) { x = 1; }
                 x
             }
             export { run as "run" }
@@ -7716,7 +7764,7 @@ mod tests {
 	fn an_if_result_initializes_a_local() {
 		let source = r#"
             func run(c: Bool) -> i32 {
-                local x: i32 = if c { 3 } else { 4 };
+                local x: i32 = if (c) { 3 } else { 4 };
                 x + 1
             }
 			export { run as "run" }
@@ -7735,9 +7783,9 @@ mod tests {
 	fn an_else_if_chain_selects_the_first_matching_branch() {
 		let source = r#"
             func grade(n: i32) -> i32 {
-                if n < 0 { 0 }
-                else if n < 10 { 1 }
-                else if n < 100 { 2 }
+                if (n < 0) { 0 }
+                else if (n < 10) { 1 }
+                else if (n < 100) { 2 }
                 else { 3 }
             }
             export { grade as "grade" }
@@ -7757,7 +7805,7 @@ mod tests {
 	fn a_return_in_a_branch_leaves_the_rest_of_the_body() {
 		let source = r#"
             func run(c: Bool) -> i32 {
-                if c { return 1; }
+                if (c) { return 1; }
                 2
             }
             export { run as "run" }
@@ -7776,8 +7824,8 @@ mod tests {
 	fn a_diverging_branch_contributes_no_value() {
 		let source = r#"
             use core::trap as stop;
-            func then(c: Bool) -> i32 { if c { stop() } else { 2 } }
-            func otherwise(c: Bool) -> i32 { if c { 1 } else { stop() } }
+            func then(c: Bool) -> i32 { if (c) { stop() } else { 2 } }
+            func otherwise(c: Bool) -> i32 { if (c) { 1 } else { stop() } }
             export { then as "then", otherwise as "otherwise" }
         "#;
 		let (mut store, instance) = instantiate(source);
@@ -7798,7 +7846,7 @@ mod tests {
 	fn a_diverging_if_condition_never_enters_a_branch() {
 		let source = r#"
             use core::trap as stop;
-            func run(c: Bool) -> i32 { if stop() { 1 } else { 2 } }
+            func run(c: Bool) -> i32 { if (stop()) { 1 } else { 2 } }
             export { run as "run" }
         "#;
 		let (mut store, instance) = instantiate(source);
@@ -7815,7 +7863,7 @@ mod tests {
 	fn an_if_without_else_may_take_a_diverging_branch() {
 		let source = r#"
             use core::trap as stop;
-            func run(c: Bool) { if c { stop() } }
+            func run(c: Bool) { if (c) { stop() } }
             export { run as "run" }
         "#;
 		let (mut store, instance) = instantiate(source);
@@ -7832,7 +7880,7 @@ mod tests {
 		let source = r#"
             func run(c: Bool) -> i32 {
                 loop {
-                    if c { break 1; } else { break 2; }
+                    if (c) { break 1; } else { break 2; }
                 }
             }
             export { run as "run" }
@@ -7850,7 +7898,7 @@ mod tests {
 	fn an_aggregate_if_value_crosses_the_join() {
 		let source = r#"
             func run(c: Bool) -> (i32, i32) {
-                if c { (1, 2) } else { (3, 4) }
+                if (c) { (1, 2) } else { (3, 4) }
             }
             export { run as "run" }
         "#;
@@ -7866,7 +7914,7 @@ mod tests {
 	#[test]
 	fn empty_if_branches_are_unit() {
 		let source = r#"
-            func run(c: Bool) { if c {} else {} }
+            func run(c: Bool) { if (c) {} else {} }
             export { run as "run" }
         "#;
 		let (mut store, instance) = instantiate(source);
@@ -7883,7 +7931,7 @@ mod tests {
 		let source = r#"
             use core::trap as stop;
             func run(c: Bool) -> ! {
-                if c { stop() } else { stop() }
+                if (c) { stop() } else { stop() }
             }
             export { run as "run" }
         "#;
@@ -7902,7 +7950,7 @@ mod tests {
 		let source = r#"
             use core::trap as stop;
             func run(c: Bool) -> (i32, i32) {
-                if c { (1, 2) } else { stop() }
+                if (c) { (1, 2) } else { stop() }
             }
             export { run as "run" }
         "#;
@@ -7921,7 +7969,7 @@ mod tests {
 		let source = r#"
             func run(c: Bool) -> i32 {
                 loop {
-                    if c { continue; }
+                    if (c) { continue; }
                     break 1;
                 }
             }
@@ -7941,7 +7989,7 @@ mod tests {
 		let source = r#"
             func run(c: Bool) -> i32 {
                 block :done {
-                    if c { break :done 3; }
+                    if (c) { break :done 3; }
                     4
                 }
             }
@@ -7961,7 +8009,7 @@ mod tests {
 		let source = r#"
             use core::trap as stop;
             func run(a: Bool, b: Bool) -> i32 {
-                if a { 1 } else if b { stop() } else { 2 }
+                if (a) { 1 } else if (b) { stop() } else { 2 }
             }
             export { run as "run" }
         "#;
@@ -7980,7 +8028,7 @@ mod tests {
 	fn an_else_if_chain_joins_aggregate_values() {
 		let source = r#"
             func run(a: Bool, b: Bool) -> (i32, i32) {
-                if a { (1, 2) } else if b { (3, 4) } else { (5, 6) }
+                if (a) { (1, 2) } else if (b) { (3, 4) } else { (5, 6) }
             }
             export { run as "run" }
         "#;
@@ -8238,11 +8286,11 @@ mod tests {
 			local mut p: (i32, i32, i32) = (1, 2, 3);
 			local mut i: i32 = 0;
 			loop :outer {
-				if i >= n { break p; }
+				if (i >= n) { break p; }
 				local (a, b, c) = p;
 				p = (b, c, a);
 				i += 1;
-				if i % 2 == 0 {
+				if (i % 2 == 0) {
 					loop { continue :outer; }
 				}
 			}
@@ -8272,9 +8320,9 @@ mod tests {
 			local mut i: i32 = 0;
 			local mut sum: i32 = 0;
 			loop {
-				if i >= n { break (i, sum); }
+				if (i >= n) { break (i, sum); }
 				i += 1;
-				match i % 7 {
+				match (i % 7) {
 					4 => { sum += 40; },
 					0 => continue,
 					2 => { sum += 20; },
@@ -8282,7 +8330,7 @@ mod tests {
 					3 => { sum += 30; },
 					_ => { sum += 1; },
 				};
-				match i {
+				match (i) {
 					11 => break (i, sum),
 					1000 => { sum += 100; },
 					_ => {},
@@ -8326,7 +8374,7 @@ mod tests {
 			pub func swap(self: Self) -> Self { Pair(self.b, (), self.a) }
 		}
 		func rotate<T: StackValue>(p: Pair<T>, n: i32) -> Pair<T> {
-			if n == 0 { p } else { rotate(p.swap(), n - 1) }
+			if (n == 0) { p } else { rotate(p.swap(), n - 1) }
 		}
 		func run(a: i32, b: i32, n: i32) -> (i32, (), i32) {
 			local Pair(x, (), y) = rotate(Pair(a, (), b), n);
@@ -8364,8 +8412,8 @@ mod tests {
 		}
 		func run() -> (i32, i32) {
 			log.set(0);
-			local value = P({ b: mark(1), empty: unit(2), a: mark(3) })
-				.combine({ y: mark(4), empty: unit(5), x: mark(6) });
+			local value = P{ b: mark(1), empty: unit(2), a: mark(3) }
+				.combine{ y: mark(4), empty: unit(5), x: mark(6) };
 			(value, log.get())
 		}
 		export { run }
@@ -8388,7 +8436,7 @@ mod tests {
 		func combine(a: i32, empty: (), b: i32) -> i32 { mark(9) }
 		func run() -> i32 {
 			log.set(0);
-			combine({ b: mark(1), empty: fail(), a: mark(3) })
+			combine{ b: mark(1), empty: fail(), a: mark(3) }
 		}
 		func read() -> i32 { log.get() }
 		export { run, read }
@@ -8413,9 +8461,9 @@ mod tests {
 		#[inline]
 		func choose(x: i32) -> (i32, (), i32) {
 			log.set(log.get() + 1);
-			if x < 0 { return (x - 1, (), x + 1); }
+			if (x < 0) { return (x - 1, (), x + 1); }
 			local p: (i32, (), i32) = block :done {
-				if x == 0 { break :done (7, (), 8); };
+				if (x == 0) { break :done (7, (), 8); };
 				(x * 2, (), x * 3)
 			};
 			log.set(log.get() + 10);
@@ -8463,7 +8511,7 @@ mod tests {
 			local mut x = a;
 			local mut y = b;
 			loop {
-				if y == 0 { break x; }
+				if (y == 0) { break x; }
 				local remainder = x % y;
 				x = y;
 				y = remainder;
@@ -8474,10 +8522,10 @@ mod tests {
 			local mut result: u32 = 4294967295;
 			local mut i: i32 = 0;
 			loop {
-				if i == 32 { break ^result; }
+				if (i == 32) { break ^result; }
 				local low: u32 = (result ^ value) & 1;
 				result = result >> 1;
-				if low != 0 { result = result ^ 3988292384; }
+				if (low != 0) { result = result ^ 3988292384; }
 				value = value >> 1;
 				i += 1;
 			}
@@ -8632,7 +8680,7 @@ mod tests {
 	#[test]
 	fn a_value_stored_through_a_pointer_is_read_back() {
 		let source = r#"
-			#[memory_limits({ min_pages: 1 })]
+			#[memory_limits{ min_pages: 1 }]
 			memory heap: u32;
 			func run(address: u32, value: i32) -> i32 {
 				local p: heap::*i32 = transmute(address);
@@ -8655,7 +8703,7 @@ mod tests {
 		// Sorted by alignment: `value` at 0, `flag` at 4, `tag` at 5,
 		// padding to 8.
 		let source = r#"
-			#[memory_limits({ min_pages: 1 })]
+			#[memory_limits{ min_pages: 1 }]
 			memory heap: u32;
 			struct Pixel(flag: Bool, value: u32, tag: u8);
 			func write(address: u32) {
@@ -8668,8 +8716,8 @@ mod tests {
 			}
 			func read(address: u32) -> u32 {
 				local p: heap::*Pixel = transmute(address);
-				local Pixel({ value, tag, flag }) = p.*;
-				if flag { value + transmute::<_, u32>(tag) } else { 0 }
+				local Pixel{ value, tag, flag } = p.*;
+				if (flag) { value + transmute::<_, u32>(tag) } else { 0 }
 			}
 			export {
 				write as "write",
@@ -8711,7 +8759,7 @@ mod tests {
 	fn a_compound_store_and_a_fields_address_go_through_the_place() {
 		// `Pair` is laid out `b` at 0, `a` at 8.
 		let source = r#"
-			#[memory_limits({ min_pages: 1 })]
+			#[memory_limits{ min_pages: 1 }]
 			memory heap: u32;
 			struct Pair(a: u32, b: u64);
 			func bump(address: u32, by: u32) -> u32 {
@@ -8748,7 +8796,7 @@ mod tests {
 	#[test]
 	fn a_store_evaluates_its_value_before_its_address() {
 		let source = r#"
-			#[memory_limits({ min_pages: 1 })]
+			#[memory_limits{ min_pages: 1 }]
 			memory heap: u32;
 			global mut trace: u32 = 0;
 			func address(at: u32) -> heap::*u32 {
@@ -8788,7 +8836,7 @@ mod tests {
 	#[test]
 	fn memory_intrinsics_and_limits_reach_the_module() {
 		let source = r#"
-			#[memory_limits({ min_pages: 1, max_pages: 3 })]
+			#[memory_limits{ min_pages: 1, max_pages: 3 }]
 			memory heap: u32;
 			struct Pair(a: u32, b: u64);
 			func grow() -> i32 { heap.grow(1) }
@@ -8860,7 +8908,7 @@ mod tests {
 	#[test]
 	fn a_pointer_into_a_64_bit_memory_is_an_i64() {
 		let source = r#"
-			#[memory_limits({ min_pages: 1 })]
+			#[memory_limits{ min_pages: 1 }]
 			memory heap: u64;
 			struct Pair(a: u32, b: u64);
 			func run(address: u64, value: u64) -> u64 {
@@ -9105,9 +9153,9 @@ mod tests {
 	#[test]
 	fn a_generic_memory_places_a_copy_per_instance() {
 		let source = r#"
-			#[memory_limits({ min_pages: 1 })]
+			#[memory_limits{ min_pages: 1 }]
 			memory heap: u32;
-			#[memory_limits({ min_pages: 1 })]
+			#[memory_limits{ min_pages: 1 }]
 			memory wide: u64;
 			func hello<M: Memory>() -> M::&[u8] { "hello" }
 			func narrow() -> heap::&[u8] { hello::<heap>() }
@@ -9281,7 +9329,7 @@ mod tests {
 	#[test]
 	fn an_element_is_written_through_an_exclusive_pointer() {
 		let source = r#"
-			#[memory_limits({ min_pages: 1 })]
+			#[memory_limits{ min_pages: 1 }]
 			memory heap: u32;
 			global mut calls: u32 = 0;
 			func words() -> heap::*[u32; 4] {
@@ -9370,7 +9418,7 @@ mod tests {
 	#[test]
 	fn slice_and_array_methods_lower() {
 		let source = r#"
-			#[memory_limits({ min_pages: 1 })]
+			#[memory_limits{ min_pages: 1 }]
 			memory heap: u32;
 			func slice_len(s: heap::&[u32]) -> u32 { s.len() }
 			func slice_ref(s: heap::&[u32]) -> u32 { s.as_ref().* }
@@ -9487,7 +9535,7 @@ mod tests {
 	#[test]
 	fn nested_loads_through_pointers_match_their_explicit_form() {
 		let source = r#"
-			#[memory_limits({ min_pages: 1 })]
+			#[memory_limits{ min_pages: 1 }]
 			memory heap: u32;
 			#[fixed_order]
 			struct C(pad: u32, z: u32);
@@ -9555,7 +9603,7 @@ mod tests {
 	#[test]
 	fn an_array_field_is_indexed_in_place() {
 		let source = r#"
-			#[memory_limits({ min_pages: 1 })]
+			#[memory_limits{ min_pages: 1 }]
 			memory heap: u32;
 			#[fixed_order]
 			struct Header(len: u8, data: [u16; 3], tail: u32);

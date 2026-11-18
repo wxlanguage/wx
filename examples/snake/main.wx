@@ -19,7 +19,7 @@ func alloc<T: StackValue>() -> heap::*T {
         );
     local new_end = ptr.addr() + size_of::<T, heap>();
     local cur_end = heap.size_bytes();
-    if new_end > cur_end {
+    if (new_end > cur_end) {
         _
             = heap.grow(
                 (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE,
@@ -54,20 +54,20 @@ global mut acc_ms: i64 = 0;
 
 func push_front(x: i32, y: i32) {
     local n = alloc::<Node>();
-    n.* = Node({ x, y, next: RawPtr::from_addr(head.get()) });
+    n.* = Node{ x, y, next: RawPtr::from_addr(head.get()) };
     head.set(RawPtr::from_ptr(n).addr());
 }
 
 func pop_back() {
     local first = RawPtr::<heap, Node>::from_addr(head.get());
-    if first.is_null() { return };
-    if first.as_ref().next.is_null() {
+    if (first.is_null()) { return };
+    if (first.as_ref().next.is_null()) {
         head.set(0);
         return;
     }
     loop (curr = first) {
         local next = curr.as_ref().next;
-        if next.as_ref().next.is_null() {
+        if (next.as_ref().next.is_null()) {
             curr.as_ptr().next = RawPtr::null();
             break;
         }
@@ -77,9 +77,9 @@ func pop_back() {
 
 func contains(x: i32, y: i32) -> Bool {
     loop (curr = RawPtr::<heap, Node>::from_addr(head.get())) {
-        if curr.is_null() { break False };
+        if (curr.is_null()) { break False };
         local n = curr.as_ref();
-        if n.x == x && n.y == y { break True };
+        if (n.x == x && n.y == y) { break True };
         continue(n.next);
     }
 }
@@ -88,7 +88,7 @@ func place_food() {
     local t = i32_wrap_i64(host::get_time_ms());
     local mut fx = (t % GRID_W + GRID_W) % GRID_W;
     local fy = ((t / 13) % GRID_H + GRID_H) % GRID_H;
-    if contains(fx, fy) {
+    if (contains(fx, fy)) {
         fx = (fx + 3) % GRID_W;
     }
     food_x.set(fx);
@@ -128,27 +128,27 @@ func step() {
     dir.set(turn(host::poll_key(), dir.get()));
 
     local first = RawPtr::<heap, Node>::from_addr(head.get());
-    local (mut hx, mut hy) = if first.is_null() {
+    local (mut hx, mut hy) = if (first.is_null()) {
         (0, 0)
     } else {
         local n = first.as_ref();
         (n.x, n.y)
     };
-    match dir.get() {
+    match (dir.get()) {
         Direction::Right => hx = (hx + 1) % GRID_W,
         Direction::Down => hy = (hy + 1) % GRID_H,
         Direction::Left => hx = (hx - 1 + GRID_W) % GRID_W,
         Direction::Up => hy = (hy - 1 + GRID_H) % GRID_H,
     }
 
-    if contains(hx, hy) {
+    if (contains(hx, hy)) {
         start();
         return;
     }
 
     push_front(hx, hy);
 
-    if hx == food_x.get() && hy == food_y.get() {
+    if (hx == food_x.get() && hy == food_y.get()) {
         place_food()
     } else {
         pop_back()
@@ -158,7 +158,7 @@ func step() {
 func update(dt: i64) {
     acc_ms.set(acc_ms.get() + dt);
     loop {
-        if acc_ms.get() < STEP_MS { break };
+        if (acc_ms.get() < STEP_MS) { break };
         acc_ms.set(acc_ms.get() - STEP_MS);
         step();
     }
@@ -180,7 +180,7 @@ func draw() {
         curr = RawPtr::<heap, Node>::from_addr(head.get()),
         color: u32 = 0xFFFF0000,
     ) {
-        if curr.is_null() { break };
+        if (curr.is_null()) { break };
         local n = curr.as_ref();
         host::draw_rect(
             n.x * CELL_SIZE,

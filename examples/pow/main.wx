@@ -1,8 +1,8 @@
 func pow(base: i32, exp: i32) -> i32 {
-    if exp < 0 { return 0 };
+    if (exp < 0) { return 0 };
 
     loop (result: i32 = 1, exp = exp) {
-        if exp == 0 { break result };
+        if (exp == 0) { break result };
         (result * base, exp - 1)
     }
 }

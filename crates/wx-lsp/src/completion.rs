@@ -1320,17 +1320,15 @@ impl Cursor<'_> {
 			}
 			// Before the braces is the keyword and the label, where nothing
 			// is looked up.
-			Expression::Block { block, .. } | Expression::BareBlock(block) => {
-				self.block(block)
-			}
+			Expression::Block { block, .. } => self.block(block),
 			Expression::Unary { operand, .. } => self.expression(operand),
 			Expression::Binary { left, right, .. } => {
 				self.expression(left).or_else(|| self.expression(right))
 			}
 			Expression::Call { callee, arguments } => {
 				let (named, braces) = match ast.expr(arguments) {
-					Expression::NamedList { arguments, braces } => {
-						(arguments, braces)
+					Expression::NamedList { arguments: named } => {
+						(named, ast.expr_span(arguments))
 					}
 					_ => {
 						return self
@@ -1381,19 +1379,18 @@ impl Cursor<'_> {
 			Expression::Break { label, value } => self
 				.label(label, Jump::Break)
 				.or_else(|| self.expression(value?)),
-			Expression::Continue { label, arguments } => {
+			Expression::Continue { label, value } => {
 				self.label(label, Jump::Continue).or_else(|| {
-					let arguments = arguments?;
-					match ast.expr(arguments) {
+					let value = value?;
+					match ast.expr(value) {
 						// Its names are the parameters of the loop it was
 						// checked to restart.
-						Expression::NamedList { arguments, braces } => self
-							.named(
-								Some(ArgumentTarget::Loop { jump: expression }),
-								ast.list(arguments),
-								braces,
-							),
-						_ => self.positional(arguments),
+						Expression::NamedList { arguments } => self.named(
+							Some(ArgumentTarget::Loop { jump: expression }),
+							ast.list(arguments),
+							ast.expr_span(value),
+						),
+						_ => self.expression(value),
 					}
 				})
 			}

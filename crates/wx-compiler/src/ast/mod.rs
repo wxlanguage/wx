@@ -208,7 +208,7 @@ pub enum Expression {
 		left: ExprId,
 		right: ExprId,
 	},
-	/// `{expr}(a, b)` or `{expr}({ x: a, y })`: a call, or the
+	/// `{expr}(a, b)` or `{expr}{ x: a, y }`: a call, or the
 	/// construction of a struct. `arguments` is its argument list
 	/// ([`AST::argument_list`]). A callee that is an
 	/// [`Expression::ObjectAccess`] makes it a method call (`x.m::<T>(a)`);
@@ -217,14 +217,12 @@ pub enum Expression {
 		callee: ExprId,
 		arguments: ExprId,
 	},
-	/// `({ x: a, y })`: a list by name, the named form of a
-	/// [`Expression::Tuple`]. Its names mean something only as a call's or
-	/// a `continue`'s arguments, where a declaration gives them; TIR reports
-	/// one anywhere else. Spanned by its parentheses, the list by its
-	/// braces.
+	/// `{ x: a, y }`: a list by name, the named form of a
+	/// [`Expression::Tuple`]. Its names mean something only as a call's
+	/// arguments or a `continue`'s direct operand, where a declaration gives
+	/// them; TIR reports one anywhere else. Its span includes its braces.
 	NamedList {
 		arguments: List<NamedArgument>,
-		braces: TextSpan,
 	},
 	/// `{expr}.{member}`, or `{expr}.{member}::<...>`: the type arguments
 	/// are only meaningful when it is called, which makes it a method
@@ -253,33 +251,31 @@ pub enum Expression {
 		label: Option<Spanned<SymbolU32>>,
 		block: BlockId,
 	},
-	/// `{ ... }` where an expression starts, without the `block` keyword:
-	/// reported, and read as its statements in a scope of their own. It is
-	/// no `Block`: nothing jumps out of it.
-	BareBlock(BlockId),
 	/// `break (:{label})? {expr}?`
 	Break {
 		label: Option<Spanned<SymbolU32>>,
 		value: Option<ExprId>,
 	},
-	/// `if {expr} { ... } else ...`; an `else` is a block
+	/// `if ({expr}) { ... } else ...`; the condition is a written
+	/// [`Expression::Tuple`]. An `else` is a block
 	/// (`Branch::Block`) or another `if` (`Branch::Expression`).
 	IfElse {
 		condition: ExprId,
 		then_block: BlockId,
 		else_block: Option<Branch>,
 	},
-	/// `match {expr} { {pattern} => { ... }, ... }`
+	/// `match ({expr}) { {pattern} => { ... }, ... }`; the scrutinee is a
+	/// written [`Expression::Tuple`].
 	Match {
 		scrutinee: ExprId,
 		arms: List<MatchArm>,
 	},
-	/// `continue (:{label})? ({arguments})?`: a call of the loop it
-	/// restarts, whose argument list ([`AST::argument_list`]) is its next
-	/// state. Without one it gives none, as `continue()` does.
+	/// `continue (:{label})? {expr}?`: a branch to the loop it restarts.
+	/// The operand is its next state, or a [`Expression::NamedList`] giving
+	/// that state by parameter name. Without one its state is `()`.
 	Continue {
 		label: Option<Spanned<SymbolU32>>,
-		arguments: Option<ExprId>,
+		value: Option<ExprId>,
 	},
 	/// `loop :label { ... }`, or `loop :label (p: T = e) { ... }` with
 	/// parameters ([`LoopHeader`]).
@@ -344,7 +340,7 @@ pub enum Expression {
 
 const _: () = assert!(size_of::<Expression>() <= 24);
 
-/// A call's or a `continue`'s arguments, by position or by name.
+/// A call's arguments, by position or by name.
 #[derive(Clone, Copy)]
 pub enum ArgumentList<'a> {
 	Positional(&'a [ExprId]),
@@ -492,7 +488,6 @@ impl Expression {
 		matches!(
 			self,
 			Expression::Block { .. }
-				| Expression::BareBlock(_)
 				| Expression::IfElse { .. }
 				| Expression::Loop { .. }
 				| Expression::Match { .. }
@@ -723,7 +718,7 @@ pub enum Destructure {
 		path: List<PathSegment>,
 		elements: List<PatternElement>,
 	},
-	/// `Name({ field, other: pat, .. })`, as `Name({ x: 1, y: 2 })` constructs
+	/// `Name{ field, other: pat, .. }`, as `Name{ x: 1, y: 2 }` constructs
 	/// it; `open_brace` is where its `{` starts.
 	NamedStruct {
 		path: List<PathSegment>,
@@ -854,14 +849,13 @@ pub struct FunctionParam {
 pub enum AttributeValue {
 	/// `#[inline]` — name only, no payload.
 	Word,
-	/// `#[memory_limits({ min_pages: 1, max_pages: 10 })]` — arguments by
-	/// name, written as a call's (`f({ x: 1 })`). What each value may be is
-	/// the attribute's to say, where it is resolved.
+	/// `#[memory_limits{ min_pages: 1, max_pages: 10 }]` — arguments by name.
+	/// What each value may be is the attribute's to say, where it is resolved.
 	Named(List<NamedArgument>),
 }
 
 /// A single attribute on an item, e.g. `#[inline]` or
-/// `#[memory_limits({ min_pages: 1 })]`.
+/// `#[memory_limits{ min_pages: 1 }]`.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct Attribute {
@@ -1913,7 +1907,7 @@ impl AST {
 		TextSpan::new(start, start + text.len() as u32)
 	}
 
-	/// The argument list `arguments` of a call or a `continue`.
+	/// The argument list `arguments` of a call.
 	pub fn argument_list(&self, arguments: ExprId) -> ArgumentList<'_> {
 		match self.expr(arguments) {
 			Expression::Tuple { elements } => {
@@ -1926,13 +1920,9 @@ impl AST {
 		}
 	}
 
-	/// Where the argument list `arguments` is written: its parentheses when
-	/// positional, its braces when named.
+	/// Where a call's argument list is written, including its delimiters.
 	pub fn arguments_span(&self, arguments: ExprId) -> TextSpan {
-		match self.expr(arguments) {
-			Expression::NamedList { braces, .. } => braces,
-			_ => self.expr_span(arguments),
-		}
+		self.expr_span(arguments)
 	}
 
 	pub fn qualified_root(&self, id: QualifiedRootId) -> QualifiedPathRoot {

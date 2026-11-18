@@ -9,9 +9,9 @@ func main() {
     local arena = wasi::arena();
     local digits = arena.allocate_slice_uninit::<u8>(fmt::DECIMAL_LEN);
     local arguments = wasi::args(arena);
-    if arguments.len() < 2 { wasi::panic(arena, "usage: args <word>...") };
+    if (arguments.len() < 2) { wasi::panic(arena, "usage: args <word>...") };
     loop (i: u32 = 0) {
-        if i == arguments.len() { break };
+        if (i == arguments.len()) { break };
         Fd::STDOUT.write(arena, fmt::decimal::<heap>(digits, i));
         Fd::STDOUT.write(arena, ": ");
         Fd::STDOUT.write(arena, arguments[i]);

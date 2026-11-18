@@ -20,11 +20,16 @@ expression: case.tree()
     (local ratio 1.5)
     (local call (call (. (call Wrap::<u8>::new x) get::<T>)))
     (local qualified (+ <T as Shape>::SIDES (call <heap::&[u8]>::len s)))
-    (; (if (< a b) (block (; (return a))) (if c (block x) (block (; (= _ y))))))
+    (;
+      (if
+        (tuple (< a b))
+        (block (; (return a)))
+        (if (tuple c) (block x) (block (; (= _ y))))))
     (;
       (block :outer
         (loop :inner
-          (match n
+          (match
+            (tuple n)
             (=> (| 0 1) (break :outer x))
             (=> (const MAX) (continue :inner))
             (=> (Pair a ..) (block (call f a)))

@@ -10,7 +10,7 @@
 //   │  static data │  alloc 0 │  alloc 1 │  alloc 2 │  (free)   │
 //   └──────────────┴──────────┴──────────┴──────────┴────── ·· ─┘
 //   0          DATA_END                            bump      heap end
-#[memory_limits({ min_pages: 1 })]
+#[memory_limits{ min_pages: 1 }]
 memory heap: u32; // start with one 64 KiB page
 
 // ── allocator state ───────────────────────────────────────────────────────────
@@ -29,7 +29,7 @@ pub func alloc<T: StackValue>() -> heap::*T {
         );
     local new_end = ptr.addr() + size_of::<T, heap>();
     local cur_end = heap.size_bytes();
-    if new_end > cur_end {
+    if (new_end > cur_end) {
         local needed =
             (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
         _ = heap.grow(needed);
@@ -51,7 +51,7 @@ struct Node(value: i32, next: RawPtr<heap, Node>);
 impl Node {
     pub func new(value: i32, next: RawPtr<heap, Node>) -> RawPtr<heap, Node> {
         local n = alloc::<Node>();
-        n.* = Node({ value, next });
+        n.* = Node{ value, next };
         RawPtr::from_ptr(n)
     }
 }
@@ -64,7 +64,7 @@ pub func demo() -> i32 {
     local n3 = Node::new(3, n2);
 
     loop (sum: i32 = 0, cur = n3) {
-        if cur.is_null() { break sum };
+        if (cur.is_null()) { break sum };
         local node = cur.as_ref();
         (sum + node.value, node.next)
     }

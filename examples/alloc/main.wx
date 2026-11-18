@@ -25,7 +25,7 @@ pub struct BumpAllocator<Mem: Memory>(mem: Mem, next: RawPtr<Mem, u8>);
 impl<Mem: Memory> BumpAllocator<Mem> {
     /// Creates an allocator whose first allocation starts at `start`.
     pub func new(mem: Mem, start: Mem::Size) -> Self {
-        Self({ mem, next: RawPtr::from_addr(start) })
+        Self{ mem, next: RawPtr::from_addr(start) }
     }
 
     /// Returns the allocator for `mem`, placing it right after the program's
@@ -37,12 +37,12 @@ impl<Mem: Memory> BumpAllocator<Mem> {
         local end = RawPtr::from_ptr(Mem::DATA_END).addr();
         // Address 0 is `RawPtr::null()`, so nothing is placed there: with no
         // static data the first usable address is 1, which aligns up to `align`.
-        local start = if end == 0 { 1 } else { end };
+        local start = if (end == 0) { 1 } else { end };
         local base = RawPtr::<Mem, u8>::from_addr(start).align_up(align);
         local this: Mem::*Self = transmute(base.addr());
         // Wasm memory is zero-initialized and a live `next` is never 0, so a
         // null `next` means "not bootstrapped yet".
-        if this.next.is_null() {
+        if (this.next.is_null()) {
             this.* = Self::new(mem, base.addr() + size_of::<Self, Mem>());
         }
         this
@@ -71,10 +71,10 @@ impl<Mem: Memory> Allocator for BumpAllocator<Mem> {
         local new_end = ptr.addr() + layout.size();
         // The addition wrapped: this allocation cannot fit in the address
         // space at all.
-        if new_end < ptr.addr() { trap() };
+        if (new_end < ptr.addr()) { trap() };
 
         local cur_end = self.mem.size_bytes();
-        if new_end > cur_end {
+        if (new_end > cur_end) {
             // `delta - 1` first, so the page-rounding addition cannot wrap.
             local delta = new_end - cur_end;
             local needed = (delta - 1) / Mem::PAGE_SIZE + 1;
@@ -82,7 +82,7 @@ impl<Mem: Memory> Allocator for BumpAllocator<Mem> {
             _ = self.mem.grow(needed);
             // `grow` returns the old size or -1, but the signed size has no
             // `PartialEq` in core; comparing the page count catches both.
-            if self.mem.size_pages() == before { trap() }
+            if (self.mem.size_pages() == before) { trap() }
         }
 
         self.next = RawPtr::from_addr(new_end);

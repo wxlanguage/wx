@@ -513,8 +513,8 @@ mod tests {
 	{
 		let a = Analysis::clean(indoc! {"
 			func take(value: u32) -> u32 {
-				_ = take({ value: 1 });
-				_ = take({ value });
+				_ = take{ value: 1 };
+				_ = take{ value };
 				value
 			}
 		"});
@@ -611,7 +611,7 @@ mod tests {
 		let a = Analysis::clean(indoc! {r#"
 			import "host" as host { func take(value: u32); }
 			func f<T: StackValue>(x: T) -> T {
-				host::take({ value: 1 });
+				host::take{ value: 1 };
 				loop :done { break :done; }
 				x
 			}
@@ -703,8 +703,8 @@ mod tests {
 				loop :$[done]done { break :$[done.break]done $[total.read]total }
 			}
 			func main() {
-				local p = $[Point.call]Point({ $[width.label]width: 1, height: 2 });
-				_ = $[make.call]make({ $[amount.label]amount: 3 });
+				local p = $[Point.call]Point{ $[width.label]width: 1, height: 2 };
+				_ = $[make.call]make{ $[amount.label]amount: 3 };
 				local q: $[Point.type]Point = p;
 			}
 		"});
@@ -759,7 +759,7 @@ mod tests {
 		let a = Analysis::clean(indoc! {"
 			func take(x: u32) {}
 			func f(x: u32) {
-				take({ x });
+				take{ x };
 			}
 		"});
 		let found: Vec<_> =
@@ -843,7 +843,7 @@ mod tests {
 		let a = Analysis::clean(indoc! {"
 			func take(x: u32) {}
 			func f(x: u32) {
-				take({ x });
+				take{ x };
 			}
 		"});
 		let found: Vec<_> = resolutions_in(&a.sema, a.file).collect();
@@ -868,8 +868,8 @@ mod tests {
 			func $[make]make(amount: i32) -> i32 { amount }
 			func main() {
 				local amount: i32 = 1;
-				_ = $[call]make({ $[label]amount: 3 });
-				_ = make({ $[short]amount });
+				_ = $[call]make{ $[label]amount: 3 };
+				_ = make{ $[short]amount };
 			}
 		"});
 		let analysis = Analysis::clean(&marked.source);

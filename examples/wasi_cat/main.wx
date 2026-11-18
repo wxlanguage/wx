@@ -7,7 +7,7 @@ func main() {
     local buffer = arena.allocate_slice_uninit::<u8>(4096);
     loop {
         local chunk = Fd::STDIN.read(arena, buffer);
-        if chunk.len() == 0 { break };
+        if (chunk.len() == 0) { break };
         Fd::STDOUT.write(arena, chunk);
     }
 }

@@ -50,9 +50,9 @@ func be16<M: Memory>(bytes: M::&[u8], at: M::Size) -> u32 {
 
 func decide(packet: host::io::&[u8]) -> Verdict {
     // Check lengths explicitly so a bad packet is a verdict, not a trap.
-    if packet.len() < HEADER_LEN { return Verdict::Malformed };
-    if packet[0] != 1 { return Verdict::Malformed };
-    if HEADER_LEN + transmute::<u8, u32>(packet[4]) != packet.len() {
+    if (packet.len() < HEADER_LEN) { return Verdict::Malformed };
+    if (packet[0] != 1) { return Verdict::Malformed };
+    if (HEADER_LEN + transmute::<u8, u32>(packet[4]) != packet.len()) {
         return Verdict::Malformed
     }
 
@@ -61,10 +61,10 @@ func decide(packet: host::io::&[u8]) -> Verdict {
 
     local table = RULES;
     loop (i: u32 = 0) {
-        if i == table.len() { break Verdict::Drop };
-        if (table[i] == 0 || table[i] == protocol)
-            && be16(table, i + 1) == port {
-            if table[i + 3] == 1 { break Verdict::Accept };
+        if (i == table.len()) { break Verdict::Drop };
+        if ((table[i] == 0 || table[i] == protocol)
+            && be16(table, i + 1) == port) {
+            if (table[i + 3] == 1) { break Verdict::Accept };
             break Verdict::Drop;
         }
         continue(i + RULE_LEN);
@@ -73,7 +73,7 @@ func decide(packet: host::io::&[u8]) -> Verdict {
 
 func filter(packet: host::io::&[u8]) -> Verdict {
     local verdict = decide(packet);
-    match verdict {
+    match (verdict) {
         Verdict::Accept => accepted_count.set(accepted_count.get() + 1),
         _ => dropped_count.set(dropped_count.get() + 1),
     }

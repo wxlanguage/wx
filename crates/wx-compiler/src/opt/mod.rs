@@ -520,7 +520,7 @@ mod tests {
 			r#"
 				func f(c: Bool, x: i32) -> i32 {
 					local mut y: i32 = 0;
-					if c { y = x } else { y = x };
+					if (c) { y = x } else { y = x };
 					y
 				}
 				export { f as "f" }
@@ -539,7 +539,7 @@ mod tests {
 				func f(a: i32, b: i32) -> i32 {
 					local s = a + b;
 					local r: i32 = block :done {
-						if b > 0 { break :done 1 };
+						if (b > 0) { break :done 1 };
 						2
 					};
 					s + r
@@ -592,7 +592,7 @@ mod tests {
 					local mut i: i32 = 0;
 					local mut s: i32 = 0;
 					loop {
-						if i == n { break };
+						if (i == n) { break };
 						s += i + k;
 						i += 1;
 					};
@@ -625,7 +625,7 @@ mod tests {
 					local mut i: i32 = 0;
 					local mut y: i32 = x;
 					loop {
-						if i == n { break };
+						if (i == n) { break };
 						y = y;
 						i += 1;
 					};

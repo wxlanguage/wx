@@ -23,7 +23,7 @@ package "slices" as slices;
 
 // A program's static data may be empty, which would give a memory of no
 // pages, and the allocator places its state in the memory it manages.
-#[memory_limits({ min_pages: 1 })]
+#[memory_limits{ min_pages: 1 }]
 pub memory heap: u32;
 
 /// The allocator of `heap`, which the calls below take their cells from.
@@ -53,7 +53,7 @@ impl Errno {
     /// Ends the program, with the code as its exit status, unless this is
     /// `SUCCESS`.
     pub func or_exit(self: Self) {
-        match self {
+        match (self) {
             Errno::SUCCESS => (),
             Errno(code) => sys::proc_exit(transmute(code)),
         }
@@ -116,10 +116,10 @@ impl Fd {
         local io_vecs = arena.allocate_slice_uninit::<heap::&[u8]>(1);
         local count = arena.allocate_value::<u32>(0);
         local error = loop (rest = bytes) {
-            if rest.len() == 0 { break Errno::SUCCESS };
+            if (rest.len() == 0) { break Errno::SUCCESS };
             io_vecs[0] = rest;
             local error = sys::fd_write(self, io_vecs, count);
-            if error != Errno::SUCCESS { break error };
+            if (error != Errno::SUCCESS) { break error };
             continue(slices::slice_at(rest, count.*, rest.len() - count.*));
         };
         arena.release(mark);
@@ -137,7 +137,7 @@ impl Fd {
         Errno,
         heap::&[u8],
     ) {
-        if buffer.len() == 0 { return (Errno::INVAL, "") };
+        if (buffer.len() == 0) { return (Errno::INVAL, "") };
         local mark = arena.mark();
         local io_vecs = arena.allocate_slice_uninit::<heap::*[u8]>(1);
         local count = arena.allocate_value::<u32>(0);
@@ -145,7 +145,7 @@ impl Fd {
         local error = sys::fd_read(self, io_vecs, count);
         local read = count.*;
         arena.release(mark);
-        if error != Errno::SUCCESS { return (error, "") };
+        if (error != Errno::SUCCESS) { return (error, "") };
         (Errno::SUCCESS, slices::slice_at(buffer, 0, read))
     }
 
@@ -185,19 +185,19 @@ pub func try_args(arena: heap::*Arena) -> (Errno, heap::&[heap::&[u8]]) {
     local total = count.*;
     local text_size = size.*;
     arena.release(mark);
-    if error != Errno::SUCCESS || total == 0 { return (error, []) };
+    if (error != Errno::SUCCESS || total == 0) { return (error, []) };
 
     // The host also fills in a pointer to each argument. They are not needed:
     // the arguments follow one another in the text, each ending in a NUL.
     local pointers = arena.allocate_slice_uninit::<heap::&u8>(total);
     local text = arena.allocate_slice_uninit::<u8>(text_size);
     error = sys::args_get(pointers[0].&, text[0].&);
-    if error != Errno::SUCCESS { return (error, []) };
+    if (error != Errno::SUCCESS) { return (error, []) };
     local arguments = arena.allocate_slice_uninit::<heap::&[u8]>(total);
 
     loop (next: u32 = 0, start: u32 = 0, at: u32 = 0) {
-        if at == text.len() { break };
-        if text[at] == '\0' {
+        if (at == text.len()) { break };
+        if (text[at] == '\0') {
             arguments[next] = slices::slice_at(text, start, at - start);
             continue(next + 1, at + 1, at + 1);
         }

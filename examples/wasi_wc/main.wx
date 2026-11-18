@@ -33,18 +33,18 @@ func main() {
         in_word = False,
     ) {
         local chunk = Fd::STDIN.read(arena, buffer);
-        if chunk.len() == 0 { break (lines, words, bytes) };
+        if (chunk.len() == 0) { break (lines, words, bytes) };
         local (lines, words, in_word) = loop (
             i: u32 = 0,
             lines = lines,
             words = words,
             in_word = in_word,
         ) {
-            if i == chunk.len() { break (lines, words, in_word) };
+            if (i == chunk.len()) { break (lines, words, in_word) };
             local byte = chunk[i];
-            local lines = if byte == '\n' { lines + 1 } else { lines };
-            if is_space(byte) { continue(i + 1, lines, words, False) };
-            (i + 1, lines, if in_word { words } else { words + 1 }, True)
+            local lines = if (byte == '\n') { lines + 1 } else { lines };
+            if (is_space(byte)) { continue(i + 1, lines, words, False) };
+            (i + 1, lines, if (in_word) { words } else { words + 1 }, True)
         };
         (lines, words, bytes + chunk.len(), in_word)
     };

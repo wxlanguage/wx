@@ -225,7 +225,7 @@ mod tests {
 		let mut graph = graph_of(
 			r#"
 				func f(c: Bool, x: i32) -> i32 {
-					if c { x } else { 0 }
+					if (c) { x } else { 0 }
 				}
 				export { f as "f" }
 			"#,
@@ -247,7 +247,7 @@ mod tests {
 		let mut graph = graph_of(
 			r#"
 				func f(c: Bool, x: i32) -> i32 {
-					if c { x } else { 0 }
+					if (c) { x } else { 0 }
 				}
 				export { f as "f" }
 			"#,

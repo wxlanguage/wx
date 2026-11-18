@@ -155,7 +155,7 @@ impl Ordering {
 
     #[inline]
     pub func reverse(self: Self) -> Ordering {
-        match self {
+        match (self) {
             Ordering::Less => Ordering::Greater,
             Ordering::Equal => Ordering::Equal,
             Ordering::Greater => Ordering::Less,
@@ -164,7 +164,7 @@ impl Ordering {
 
     #[inline]
     pub func then(self: Self, other: Ordering) -> Ordering {
-        match self {
+        match (self) {
             Ordering::Equal => other,
             _ => self,
         }
@@ -176,19 +176,19 @@ pub trait Ord: PartialOrd + Eq {
 
     #[inline]
     func min(self: Self, other: Self) -> Self {
-        if self < other { self } else { other }
+        if (self < other) { self } else { other }
     }
 
     #[inline]
     func max(self: Self, other: Self) -> Self {
-        if self < other { other } else { self }
+        if (self < other) { other } else { self }
     }
 
     #[inline]
     func clamp(self: Self, min: Self, max: Self) -> Self {
-        if max < min { trap() };
-        if self < min { return min };
-        if self > max { return max };
+        if (max < min) { trap() };
+        if (self < min) { return min };
+        if (self > max) { return max };
         self
     }
 }
@@ -239,13 +239,13 @@ pub trait Slice {
 
     #[inline]
     func first<M: Memory>(self: M::&Self) -> M::&Self::Value {
-        if self.len() == 0 { trap() };
+        if (self.len() == 0) { trap() };
         self[0].&
     }
 
     #[inline]
     func last<M: Memory>(self: M::&Self) -> M::&Self::Value {
-        if self.len() == 0 { trap() };
+        if (self.len() == 0) { trap() };
         self[self.len() - 1].&
     }
 }
@@ -2178,12 +2178,12 @@ pub struct Layout<Mem: Memory>(size: Mem::Size, align: Mem::Size);
 impl<Mem: Memory> Layout<Mem> {
     #[inline]
     pub func of<T>() -> Self {
-        Self({ size: size_of::<T, Mem>(), align: align_of::<T, Mem>() })
+        Self{ size: size_of::<T, Mem>(), align: align_of::<T, Mem>() }
     }
 
     #[inline]
     pub func array<T>(count: Mem::Size) -> Self {
-        Self({ align: align_of::<T, Mem>(), size: size_of::<T, Mem>() * count })
+        Self{ align: align_of::<T, Mem>(), size: size_of::<T, Mem>() * count }
     }
 
     #[inline]
@@ -2239,12 +2239,12 @@ impl<Mem: Memory, T> RawPtr<Mem, T> {
 
     #[inline]
     pub func null() -> Self {
-        Self({ addr: 0 })
+        Self{ addr: 0 }
     }
 
     #[inline]
     pub func from_addr(addr: Mem::Size) -> Self {
-        Self({ addr })
+        Self{ addr }
     }
 
     #[inline]
@@ -2254,7 +2254,7 @@ impl<Mem: Memory, T> RawPtr<Mem, T> {
 
     #[inline]
     pub func cast<U>(self: Self) -> RawPtr<Mem, U> {
-        RawPtr({ addr: self.addr })
+        RawPtr{ addr: self.addr }
     }
 }
 
@@ -2262,12 +2262,12 @@ impl<Mem: Memory, T> RawPtr<Mem, T> {
 impl<Mem: Memory, T: StackValue> RawPtr<Mem, T> {
     #[inline]
     pub func from_ref(ref: Mem::&T) -> Self {
-        Self({ addr: transmute(ref) })
+        Self{ addr: transmute(ref) }
     }
 
     #[inline]
     pub func from_ptr(ptr: Mem::*T) -> Self {
-        Self({ addr: transmute(ptr) })
+        Self{ addr: transmute(ptr) }
     }
 
     #[inline]
@@ -2284,14 +2284,14 @@ impl<Mem: Memory, T: StackValue> RawPtr<Mem, T> {
 impl<Mem: Memory where { Size: Sub }, T> RawPtr<Mem, T> {
     #[inline]
     pub func sub(self: Self, count: Mem::Size) -> Self {
-        Self({ addr: self.addr - count * size_of::<T, Mem>() })
+        Self{ addr: self.addr - count * size_of::<T, Mem>() }
     }
 }
 
 impl<Mem: Memory where { Size: Add }, T> RawPtr<Mem, T> {
     #[inline]
     pub func add(self: Self, count: Mem::Size) -> Self {
-        Self({ addr: self.addr + count * size_of::<T, Mem>() })
+        Self{ addr: self.addr + count * size_of::<T, Mem>() }
     }
 }
 
@@ -2300,7 +2300,7 @@ impl<Mem: Memory where { Size: BitAnd + BitNot }, T> RawPtr<Mem, T> {
     /// **`align` must be a power of two.**
     #[inline]
     pub func align_up(self: Self, align: Mem::Size) -> Self {
-        Self({ addr: (self.addr + align - 1) & ^(align - 1) })
+        Self{ addr: (self.addr + align - 1) & ^(align - 1) }
     }
 }
 
@@ -2309,7 +2309,7 @@ const ASCII_CASE_MASK: u32 = 0b0010_0000;
 impl Char {
     #[inline]
     pub func to_ascii_uppercase(self: Self) -> Char {
-        if self.is_ascii_lowercase() {
+        if (self.is_ascii_lowercase()) {
             Char(self.value ^ ASCII_CASE_MASK)
         } else {
             self
@@ -2318,7 +2318,7 @@ impl Char {
 
     #[inline]
     pub func to_ascii_lowercase(self: Self) -> Char {
-        if self.is_ascii_uppercase() {
+        if (self.is_ascii_uppercase()) {
             Char(self.value ^ ASCII_CASE_MASK)
         } else {
             self

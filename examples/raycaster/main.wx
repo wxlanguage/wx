@@ -1,4 +1,4 @@
-#[memory_limits({ min_pages: 4 })]
+#[memory_limits{ min_pages: 4 }]
 memory heap: u32;
 
 package "math" as math;
@@ -35,10 +35,10 @@ pub func map_ptr() -> i32 {
 }
 
 pub func map_at(x: i32, y: i32) -> u8 {
-    if x < 0
+    if (x < 0
         || y < 0
         || x >= transmute(map_w.get())
-        || y >= transmute(map_h.get()) {
+        || y >= transmute(map_h.get())) {
         1
     } else {
         RawPtr::from_ptr(map_data.get()).add(
@@ -55,10 +55,10 @@ func is_wall(x: f64, y: f64) -> Bool {
 // uploaded map doesn't need to guarantee any particular cell is walkable.
 func find_spawn() {
     loop :rows (y: i32 = 0) {
-        if y >= transmute(map_h.get()) { break };
+        if (y >= transmute(map_h.get())) { break };
         loop (x: i32 = 0) {
-            if x >= transmute(map_w.get()) { break };
-            if map_at(x, y) == 0 {
+            if (x >= transmute(map_w.get())) { break };
+            if (map_at(x, y) == 0) {
                 player_x.set(x.to_f64() + 0.5);
                 player_y.set(y.to_f64() + 0.5);
                 player_angle.set(0.0);
@@ -87,7 +87,7 @@ func alloc_bytes(size: u32, align: u32) -> heap::*u8 {
     local start = RawPtr::from_ptr(bump.get()).align_up(align);
     local end = start.add(size);
     local cur_end = heap.size_bytes();
-    if end.addr() > cur_end {
+    if (end.addr() > cur_end) {
         local needed =
             (end.addr() - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
         _ = heap.grow(needed);
@@ -104,7 +104,7 @@ pub func framebuffer_ptr() -> i32 {
 }
 
 func put_pixel(x: i32, y: i32, r: u8, g: u8, b: u8) {
-    if x < 0 || y < 0 || x >= SCREEN_W || y >= SCREEN_H {
+    if (x < 0 || y < 0 || x >= SCREEN_W || y >= SCREEN_H) {
         return;
     }
     local idx =
@@ -132,22 +132,22 @@ func cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
 
     local mut delta_dist_x: f64 = 1000000000000.0;
     local mut delta_dist_y: f64 = 1000000000000.0;
-    if dir_x != 0.0 { delta_dist_x = (1.0 / dir_x).abs() };
-    if dir_y != 0.0 { delta_dist_y = (1.0 / dir_y).abs() };
+    if (dir_x != 0.0) { delta_dist_x = (1.0 / dir_x).abs() };
+    if (dir_y != 0.0) { delta_dist_y = (1.0 / dir_y).abs() };
 
     local mut step_x: i32 = 0;
     local mut step_y: i32 = 0;
     local mut side_dist_x: f64 = 0.0;
     local mut side_dist_y: f64 = 0.0;
 
-    if dir_x < 0.0 {
+    if (dir_x < 0.0) {
         step_x = -1;
         side_dist_x = (ox - map_x.to_f64()) * delta_dist_x;
     } else {
         step_x = 1;
         side_dist_x = (map_x.to_f64() + 1.0 - ox) * delta_dist_x;
     }
-    if dir_y < 0.0 {
+    if (dir_y < 0.0) {
         step_y = -1;
         side_dist_y = (oy - map_y.to_f64()) * delta_dist_y;
     } else {
@@ -161,29 +161,29 @@ func cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
         side_dist_x = side_dist_x,
         side_dist_y = side_dist_y,
     ) {
-        if side_dist_x < side_dist_y {
+        if (side_dist_x < side_dist_y) {
             local map_x = map_x + step_x;
-            if map_at(map_x, map_y) != 0 { break (map_x, map_y, (0: i32)) };
+            if (map_at(map_x, map_y) != 0) { break (map_x, map_y, (0: i32)) };
             continue(map_x, map_y, side_dist_x + delta_dist_x, side_dist_y);
         }
         local map_y = map_y + step_y;
-        if map_at(map_x, map_y) != 0 { break (map_x, map_y, 1) };
+        if (map_at(map_x, map_y) != 0) { break (map_x, map_y, 1) };
         (map_x, map_y, side_dist_x, side_dist_y + delta_dist_y)
     };
 
-    local dist = if side == 0 {
+    local dist = if (side == 0) {
         (map_x.to_f64() - ox + (1.0 - step_x.to_f64()) / 2.0) / dir_x
     } else {
         (map_y.to_f64() - oy + (1.0 - step_y.to_f64()) / 2.0) / dir_y
     };
 
-    RayHit({ dist, side })
+    RayHit{ dist, side }
 }
 
 // ── render ───────────────────────────────────────────────────────────────────
 pub func render() {
     loop (x: i32 = 0) {
-        if x >= SCREEN_W { break };
+        if (x >= SCREEN_W) { break };
 
         local t = x.to_f64() / SCREEN_W.to_f64();
         local ray_angle = player_angle.get() - FOV / 2.0 + FOV * t;
@@ -191,7 +191,7 @@ pub func render() {
         local corrected = hit.dist * (ray_angle - player_angle.get()).cos();
 
         local mut line_height = SCREEN_H;
-        if corrected > 0.0001 {
+        if (corrected > 0.0001) {
             line_height = (SCREEN_H.to_f64() / corrected).to_i32();
         }
 
@@ -201,14 +201,14 @@ pub func render() {
             (SCREEN_H / 2 + line_height / 2).clamp(0, SCREEN_H - 1);
 
         local mut shade: u8 = 200;
-        if hit.side == 1 { shade = 140 };
+        if (hit.side == 1) { shade = 140 };
 
         loop (y: i32 = 0) {
-            if y >= SCREEN_H { break };
-            if y < draw_start {
+            if (y >= SCREEN_H) { break };
+            if (y < draw_start) {
                 put_pixel(x, y, 40, 40, 60);
             } else {
-                if y > draw_end {
+                if (y > draw_end) {
                     put_pixel(x, y, 70, 70, 70);
                 } else {
                     put_pixel(x, y, shade, 0, 0);
@@ -226,14 +226,14 @@ pub func update(dt_ms: i64) {
     local mut forward: f64 = 0.0;
     local mut strafe: f64 = 0.0;
 
-    if host::key_down(87) != 0 { forward += 1.0 };
-    if host::key_down(83) != 0 { forward -= 1.0 };
-    if host::key_down(68) != 0 { strafe += 1.0 };
-    if host::key_down(65) != 0 { strafe -= 1.0 };
-    if host::key_down(39) != 0 {
+    if (host::key_down(87) != 0) { forward += 1.0 };
+    if (host::key_down(83) != 0) { forward -= 1.0 };
+    if (host::key_down(68) != 0) { strafe += 1.0 };
+    if (host::key_down(65) != 0) { strafe -= 1.0 };
+    if (host::key_down(39) != 0) {
         player_angle.set(player_angle.get() + ROT_SPEED * dt);
     }
-    if host::key_down(37) != 0 {
+    if (host::key_down(37) != 0) {
         player_angle.set(player_angle.get() - ROT_SPEED * dt);
     }
 
@@ -248,10 +248,10 @@ pub func update(dt_ms: i64) {
     local ny =
         player_y.get() + (dir_y * forward + perp_y * strafe) * MOVE_SPEED * dt;
 
-    if !is_wall(nx, player_y.get()) {
+    if (!is_wall(nx, player_y.get())) {
         player_x.set(nx);
     }
-    if !is_wall(player_x.get(), ny) {
+    if (!is_wall(player_x.get(), ny)) {
         player_y.set(ny);
     };
 }

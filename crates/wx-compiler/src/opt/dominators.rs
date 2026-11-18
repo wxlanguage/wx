@@ -405,7 +405,7 @@ mod tests {
 	{
 		let graph = graph_of(
 			r#"
-			func f(c: Bool, x: i32) -> i32 { if c { x + 1 } else { x + 2 } }
+			func f(c: Bool, x: i32) -> i32 { if (c) { x + 1 } else { x + 2 } }
 			export { f as "f" }
 		"#,
 			"f",
@@ -452,8 +452,8 @@ mod tests {
 				local mut i: i32 = 0;
 				loop {
 					local next = i + 1;
-					if i == n { break; };
-					if i == 1 { i = next; continue; };
+					if (i == n) { break; };
+					if (i == 1) { i = next; continue; };
 					i = next;
 				};
 				i + 1
@@ -512,7 +512,7 @@ mod tests {
 			r#"
 			func f(x: i32) -> i32 {
 				block :done {
-					match x { 0 => { break :done 10; }, 1 => { 20 }, _ => { 30 } }
+					match (x) { 0 => { break :done 10; }, 1 => { 20 }, _ => { 30 } }
 				}
 			}
 			export { f as "f" }

@@ -2312,11 +2312,7 @@ impl<'a> Builder<'a> {
 		items
 	}
 
-	/// The `({ name: value, shorthand })` of a call by name, or of a named
-	/// list on its own. The braces hug the parentheses and are a delimited
-	/// list, so they break onto one field per line once they don't fit,
-	/// keeping the comments written in them.
-	/// A call's or a `continue`'s argument list, by position or by name.
+	/// A call's argument list, by position or by name.
 	fn build_arguments(
 		&mut self,
 		out: &mut Vec<NodeId>,
@@ -2326,13 +2322,18 @@ impl<'a> Builder<'a> {
 			ast::Expression::Tuple { elements } => {
 				self.build_call_args(out, self.ast.list(elements));
 			}
-			ast::Expression::NamedList { arguments, braces } => {
-				self.build_named_call_args(out, arguments, braces);
+			ast::Expression::NamedList { arguments: named } => {
+				self.build_named_call_args(
+					out,
+					named,
+					self.ast.expr_span(arguments),
+				);
 			}
 			_ => unreachable!("an argument list is a tuple or a named list"),
 		}
 	}
 
+	/// A named list's braces and entries, shared by calls and branch operands.
 	fn build_named_call_args(
 		&mut self,
 		out: &mut Vec<NodeId>,
@@ -2360,7 +2361,6 @@ impl<'a> Builder<'a> {
 				(span, self.arena.concat(nodes))
 			})
 			.collect();
-		out.push(self.text(Text::LParen));
 		out.push(self.build_delimited_list(
 			braces,
 			Text::LBrace,
@@ -2371,7 +2371,6 @@ impl<'a> Builder<'a> {
 			},
 			entries,
 		));
-		out.push(self.text(Text::RParen));
 	}
 
 	fn build_call_args(
@@ -2503,8 +2502,6 @@ impl<'a> Builder<'a> {
 				let content = self.build_block_content(block, span);
 				self.arena.concat2(keyword, content)
 			}
-			// A file the parser reported is not formatted.
-			ast::Expression::BareBlock(_) => unreachable!(),
 			ast::Expression::Placeholder => self.text(Text::Underscore),
 			ast::Expression::IfElse {
 				condition,
@@ -2614,14 +2611,15 @@ impl<'a> Builder<'a> {
 				}
 				self.arena.concat(items)
 			}
-			ast::Expression::Continue { label, arguments } => {
+			ast::Expression::Continue { label, value } => {
 				let mut items: Vec<NodeId> = vec![self.text(Text::Continue)];
 				if let Some(label) = label {
 					items.push(self.text(Text::LabelColon));
 					items.push(self.symbol(label.inner));
 				}
-				if let Some(arguments) = arguments {
-					self.build_arguments(&mut items, arguments);
+				if let Some(value) = value {
+					items.push(self.text(Text::Space));
+					items.push(self.build_expression(value));
 				}
 				let concat = self.arena.concat(items);
 				self.arena.group(concat)
@@ -2646,9 +2644,9 @@ impl<'a> Builder<'a> {
 				let concat = self.arena.concat(items);
 				self.arena.group(concat)
 			}
-			ast::Expression::NamedList { arguments, braces } => {
+			ast::Expression::NamedList { arguments } => {
 				let mut items: Vec<NodeId> = Vec::new();
-				self.build_named_call_args(&mut items, arguments, braces);
+				self.build_named_call_args(&mut items, arguments, span);
 				let concat = self.arena.concat(items);
 				self.arena.group(concat)
 			}
@@ -2833,7 +2831,6 @@ impl<'a> Builder<'a> {
 			ast::Destructure::NamedStruct { path, fields, .. } => {
 				let fields = ast.list(fields);
 				out.push(self.build_value_path(ast.list(path)));
-				out.push(self.text(Text::LParen));
 				out.push(self.text(Text::LBrace));
 				for (i, item) in fields.iter().enumerate() {
 					out.push(self.text(if i > 0 {
@@ -2858,7 +2855,6 @@ impl<'a> Builder<'a> {
 					out.push(self.text(Text::Space));
 				}
 				out.push(self.text(Text::RBrace));
-				out.push(self.text(Text::RParen));
 			}
 		}
 	}

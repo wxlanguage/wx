@@ -945,8 +945,8 @@ fn test_format_generic_function() {
 fn test_format_struct_init() {
 	let case = TestCase::new(indoc! {"
         func main() {
-            local a = Point({ x: 1, y: 2 });
-            local b = Point({ x: 1, y: 2, z: 3, w: 4, extra_long_field: 99 })
+            local a = Point{ x: 1, y: 2 };
+            local b = Point{ x: 1, y: 2, z: 3, w: 4, extra_long_field: 99 }
         }
     "});
 	let output = format(
@@ -963,14 +963,14 @@ fn test_format_struct_init() {
 		output,
 		indoc! {"
             func main() {
-                local a = Point({ x: 1, y: 2 });
-                local b = Point({
+                local a = Point{ x: 1, y: 2 };
+                local b = Point{
                     x: 1,
                     y: 2,
                     z: 3,
                     w: 4,
                     extra_long_field: 99,
-                });
+                };
             }
         "}
 	);
@@ -980,7 +980,7 @@ fn test_format_struct_init() {
 fn test_format_struct_init_block_value() {
 	let case = TestCase::new(indoc! {"
         func main() -> i32 {
-            local p = Point({ x: block :g { break :g 5 }, y: 10 })
+            local p = Point{ x: block :g { break :g 5 }, y: 10 }
         }
     "});
 	let output = format(
@@ -997,10 +997,10 @@ fn test_format_struct_init_block_value() {
 		output,
 		indoc! {"
             func main() -> i32 {
-                local p = Point({
+                local p = Point{
                     x: block :g { break :g 5 },
                     y: 10,
-                });
+                };
             }
         "}
 	);
@@ -1015,9 +1015,9 @@ fn test_format_local_patterns() {
             local _ = 3;
             local (a,b) = pair;
             local (mut c,_) = pair;
-            local Point({x,y:renamed}) = p;
-            local geom::Point({x,..}) = p;
-            local Point({..}) = p;
+            local Point{x,y:renamed} = p;
+            local geom::Point{x,..} = p;
+            local Point{..} = p;
             local (a,b): (i32,i32) = pair;
         }
     "});
@@ -1040,9 +1040,9 @@ fn test_format_local_patterns() {
                 local _ = 3;
                 local (a, b) = pair;
                 local (mut c, _) = pair;
-                local Point({ x, y: renamed }) = p;
-                local geom::Point({ x, .. }) = p;
-                local Point({ .. }) = p;
+                local Point{ x, y: renamed } = p;
+                local geom::Point{ x, .. } = p;
+                local Point{ .. } = p;
                 local (a, b): (i32, i32) = pair;
             }
         "}
@@ -1055,7 +1055,7 @@ fn test_format_pattern_constants() {
 	// path is a constant on its own.
 	let case = TestCase::new(indoc! {"
         func f(x: i32) {
-            match x {
+            match (x) {
                 const MAX => {},
                 Ordering::Less => {},
                 _ => {},
@@ -1076,7 +1076,7 @@ fn test_format_pattern_constants() {
 		output,
 		indoc! {"
             func f(x: i32) {
-                match x {
+                match (x) {
                     const MAX => {},
                     Ordering::Less => {},
                     _ => {},
@@ -1126,7 +1126,7 @@ fn test_format_block_like_statement_semicolon() {
 	// Flat non-final block-like expressions acquire a separator.
 	let case = TestCase::new(indoc! {"
         func f() -> i32 {
-            if true {}
+            if (true) {}
             42
         }
     "});
@@ -1144,7 +1144,7 @@ fn test_format_block_like_statement_semicolon() {
 		output,
 		indoc! {"
             func f() -> i32 {
-                if true {};
+                if (true) {};
                 42
             }
         "}
@@ -1153,7 +1153,7 @@ fn test_format_block_like_statement_semicolon() {
 	// The same flat form results when the source already has a separator.
 	let case = TestCase::new(indoc! {"
         func f() -> i32 {
-            if true {};
+            if (true) {};
             42
         }
     "});
@@ -1171,7 +1171,7 @@ fn test_format_block_like_statement_semicolon() {
 		output,
 		indoc! {"
             func f() -> i32 {
-                if true {};
+                if (true) {};
                 42
             }
         "}
@@ -1286,15 +1286,15 @@ fn test_format_local_definition_wraps() {
 	// Block-like value (call by name): = stays on the same line, the braces break inside.
 	assert_eq!(
 		fmt(
-			"func f() { local p = Point({ x: very_long_name_one, y: very_long_name_two, z: very_long_name_three }); }"
+			"func f() { local p = Point{ x: very_long_name_one, y: very_long_name_two, z: very_long_name_three }; }"
 		),
 		indoc! {"
             func f() {
-                local p = Point({
+                local p = Point{
                     x: very_long_name_one,
                     y: very_long_name_two,
                     z: very_long_name_three,
-                });
+                };
             }
         "},
 	);
@@ -1310,14 +1310,14 @@ fn test_format_local_definition_wraps() {
 	// it's in is actually rendered Flat or Break.
 	assert_eq!(
 		fmt(
-			"func f() { local p = alloc(Outer({ tag: 10001, inner: Inner({ id: 20002, timeout: 30003 }) })); }"
+			"func f() { local p = alloc(Outer{ tag: 10001, inner: Inner{ id: 20002, timeout: 30003 } }); }"
 		),
 		indoc! {"
             func f() {
-                local p = alloc(Outer({
+                local p = alloc(Outer{
                     tag: 10001,
-                    inner: Inner({ id: 20002, timeout: 30003 }),
-                }));
+                    inner: Inner{ id: 20002, timeout: 30003 },
+                });
             }
         "},
 	);
@@ -1342,13 +1342,13 @@ fn test_format_inline_blocks() {
 	// Single-statement if guard: fits → inline.
 	assert_eq!(
 		fmt(
-			"memory heap: Memory32; func check(data: heap::&[u8]) -> bool { if data.len() < 4 { return false }; true }"
+			"memory heap: Memory32; func check(data: heap::&[u8]) -> bool { if (data.len() < 4) { return false }; true }"
 		),
 		indoc! {"
             memory heap: Memory32;
 
             func check(data: heap::&[u8]) -> bool {
-                if data.len() < 4 { return false };
+                if (data.len() < 4) { return false };
                 true
             }
         "},
@@ -1357,11 +1357,11 @@ fn test_format_inline_blocks() {
 	// if-else as a value expression: both branches fit → inline.
 	assert_eq!(
 		fmt(
-			"func pick(cond: bool) -> i32 { local x: i32 = if cond { 5 } else { 6 }; x }"
+			"func pick(cond: bool) -> i32 { local x: i32 = if (cond) { 5 } else { 6 }; x }"
 		),
 		indoc! {"
             func pick(cond: bool) -> i32 {
-                local x: i32 = if cond { 5 } else { 6 };
+                local x: i32 = if (cond) { 5 } else { 6 };
                 x
             }
         "},
@@ -1371,11 +1371,11 @@ fn test_format_inline_blocks() {
 	// indent=4, cond takes 43 chars → remaining=33; block flat=50 > 33 → Break.
 	assert_eq!(
 		fmt(
-			"func f() -> i32 { if some_very_long_condition_variable { return some_very_long_return_value_here } 0 }"
+			"func f() -> i32 { if (some_very_long_condition_variable) { return some_very_long_return_value_here } 0 }"
 		),
 		indoc! {"
             func f() -> i32 {
-                if some_very_long_condition_variable {
+                if (some_very_long_condition_variable) {
                     return some_very_long_return_value_here
                 }
                 0
@@ -1416,8 +1416,8 @@ fn test_format_keeps_pub_on_memory_and_global() {
 		"pub memory heap: Memory32;\n"
 	);
 	assert_eq!(
-		fmt("#[memory_limits({ min_pages: 4 })] pub memory heap: Memory32;"),
-		"#[memory_limits({ min_pages: 4 })]\npub memory heap: Memory32;\n",
+		fmt("#[memory_limits{ min_pages: 4 }] pub memory heap: Memory32;"),
+		"#[memory_limits{ min_pages: 4 }]\npub memory heap: Memory32;\n",
 	);
 	assert_eq!(
 		fmt("pub global mut g: u32 = 0;"),
@@ -1446,22 +1446,22 @@ fn test_format_memory_config() {
 
 	// min_pages only
 	assert_eq!(
-		fmt("#[memory_limits({ min_pages: 4 })] memory heap: Memory32;"),
-		"#[memory_limits({ min_pages: 4 })]\nmemory heap: Memory32;\n",
+		fmt("#[memory_limits{ min_pages: 4 }] memory heap: Memory32;"),
+		"#[memory_limits{ min_pages: 4 }]\nmemory heap: Memory32;\n",
 	);
 
 	// max_pages only
 	assert_eq!(
-		fmt("#[memory_limits({ max_pages: 10 })] memory heap: Memory32;"),
-		"#[memory_limits({ max_pages: 10 })]\nmemory heap: Memory32;\n",
+		fmt("#[memory_limits{ max_pages: 10 }] memory heap: Memory32;"),
+		"#[memory_limits{ max_pages: 10 }]\nmemory heap: Memory32;\n",
 	);
 
 	// both fields
 	assert_eq!(
 		fmt(
-			"#[memory_limits({ min_pages: 1, max_pages: 10 })] memory heap: Memory32;"
+			"#[memory_limits{ min_pages: 1, max_pages: 10 }] memory heap: Memory32;"
 		),
-		"#[memory_limits({ min_pages: 1, max_pages: 10 })]\nmemory heap: Memory32;\n",
+		"#[memory_limits{ min_pages: 1, max_pages: 10 }]\nmemory heap: Memory32;\n",
 	);
 }
 
@@ -1977,10 +1977,10 @@ fn test_format_deep_indent_past_max_width_does_not_panic() {
 	// It must saturate to 0 (always break) instead.
 	let case = TestCase::new(indoc! {"
         func f() {
-          if true {
-            if true {
-              if true {
-                if true {
+          if (true) {
+            if (true) {
+              if (true) {
+                if (true) {
                   local x = 1 + 2;
                 }
               }
@@ -2057,7 +2057,7 @@ fn test_format_trailing_comments_keep_their_line() {
 
             // own-line, documents b
             local b = 2;
-            match v {
+            match (v) {
                 0 => { a }, // trailing on arm
                 // own-line before arm
                 _ => { b },
@@ -2231,7 +2231,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
         }
 
         func g(v: u32) -> u32 { // opens a block
-            match v { // opens a `match`
+            match (v) { // opens a `match`
                 _ => { v },
             }
         }
@@ -2275,7 +2275,7 @@ fn test_format_comment_after_a_list_opener_wraps() {
 
         func g(v: u32) -> u32 {
             // opens a block
-            match v {
+            match (v) {
                 // opens a `match`
                 _ => { v },
             }
@@ -2571,7 +2571,7 @@ fn raw_ast_strings_preserve_original_spelling_when_formatted() {
 		)
 	};
 	let source = indoc! {"
-        #[other({ value: \"line\\nslash\\\\n\" })]
+        #[other{ value: \"line\\nslash\\\\n\" }]
         func f() {
             local text = \"line\\nslash\\\\n\";
         }
@@ -2786,10 +2786,7 @@ impl Roles<'_> {
 				self.expr(ac, bc);
 				self.expr(a, b);
 			}
-			(
-				E::Continue { arguments: a, .. },
-				E::Continue { arguments: b, .. },
-			) => {
+			(E::Continue { value: a, .. }, E::Continue { value: b, .. }) => {
 				if let (Some(a), Some(b)) = (a, b) {
 					self.expr(a, b);
 				}
@@ -2892,7 +2889,7 @@ fn function_bodies_always_break() {
 		);
 		assert!(output.starts_with("func many(\n"), "{output}");
 		assert!(output.ends_with(") -> i32 {\n    first\n}\n"), "{output}");
-		for body in ["if x { a() } else { b() }", "a(); b()"] {
+		for body in ["if (x) { a() } else { b() }", "a(); b()"] {
 			let output =
 				checked_format(&format!("func f(x: bool) {{ {body} }}"), 80, 4);
 			assert!(output.starts_with("func f(x: bool) {\n"), "{output}");
@@ -2945,13 +2942,13 @@ fn function_bodies_always_break() {
 #[test]
 fn a_dropped_block_like_separator_keeps_the_next_statement() {
 	let output = checked_format(
-		"func f() -> (u32, u32) { if c { a(); return (1, 2); }; (3, 4) }",
+		"func f() -> (u32, u32) { if (c) { a(); return (1, 2); }; (3, 4) }",
 		80,
 		4,
 	);
 	assert_eq!(
 		output,
-		"func f() -> (u32, u32) {\n    if c {\n        a();\n        return (1, 2);\n    }\n    (3, 4)\n}\n"
+		"func f() -> (u32, u32) {\n    if (c) {\n        a();\n        return (1, 2);\n    }\n    (3, 4)\n}\n"
 	);
 }
 
@@ -2961,15 +2958,15 @@ fn block_like_statement_separators() {
 	{
 		for expression in [
 			"block { foo() }",
-			"if true { foo() } else { bar() }",
-			"if true { foo() } else if false { bar() } else { baz() }",
+			"if (true) { foo() } else { bar() }",
+			"if (true) { foo() } else if (false) { bar() } else { baz() }",
 			"loop { break 1 }",
 			"block :label { break :label 1 }",
-			"if true {}",
+			"if (true) {}",
 			"block {}",
 			"loop {}",
 			"block :label {}",
-			"match n {}",
+			"match (n) {}",
 		] {
 			for separator in ["", ";"] {
 				let source =
@@ -2989,10 +2986,10 @@ fn block_like_statement_separators() {
 		}
 		for expression in [
 			"block { foo(); }",
-			"if true { foo(); } else { bar() }",
+			"if (true) { foo(); } else { bar() }",
 			"loop { break 1; }",
 			"block :label { break :label 1; }",
-			"match n { _ => { 1 } }",
+			"match (n) { _ => { 1 } }",
 		] {
 			for separator in ["", ";"] {
 				let output = checked_format(
@@ -3017,7 +3014,7 @@ fn block_like_statement_separators() {
 	// The flat `;` counts toward the width the line must fit.
 	{
 		for expression in [
-			"if true { foo() } else { bar() }",
+			"if (true) { foo() } else { bar() }",
 			"loop { break value }",
 			"block :label { break :label 1 }",
 		] {
@@ -3050,9 +3047,9 @@ fn block_like_statement_separators() {
 	// Empty bodies follow the mode of the group that owns them.
 	{
 		for expression in [
-			"if test(a) {}",
-			"if !test(a) {}",
-			"match test(a) {}",
+			"if (test(a)) {}",
+			"if (!test(a)) {}",
+			"match (test(a)) {}",
 			"loop {}",
 			"block {}",
 			"block :label {}",
@@ -3091,27 +3088,27 @@ fn branch_coordination_and_comments() {
 		for (a, b) in [(body, "bar()"), ("bar()", body)] {
 			let output = checked_format(
 				&format!(
-					"func f() {{ if true {{ {a} }} else {{ {b} }}; next() }}"
+					"func f() {{ if (true) {{ {a} }} else {{ {b} }}; next() }}"
 				),
 				80,
 				4,
 			);
-			assert!(output.contains("if true {\n"), "{output}");
+			assert!(output.contains("if (true) {\n"), "{output}");
 			assert!(output.contains("} else {\n"), "{output}");
 			assert!(output.contains("\n    }\n    next()"), "{output}");
 		}
 	}
 	let output = checked_format(
-		"func f() { if true { foo() } // boundary\nnext() }",
+		"func f() { if (true) { foo() } // boundary\nnext() }",
 		80,
 		4,
 	);
 	assert!(
-		output.contains("if true { foo() }; // boundary\n"),
+		output.contains("if (true) { foo() }; // boundary\n"),
 		"{output}"
 	);
 	let output = checked_format(
-		"func f() { if true { foo(); }; // boundary\nnext() }",
+		"func f() { if (true) { foo(); }; // boundary\nnext() }",
 		80,
 		4,
 	);
@@ -3127,19 +3124,19 @@ fn chained_if_branches_share_one_layout() {
 			let [a, b, c] = branches;
 			let output = checked_format(
 				&format!(
-					"func f() {{ return if x {{ {a} }} else if y {{ {b} }} else {{ {c} }} }}"
+					"func f() {{ return if (x) {{ {a} }} else if (y) {{ {b} }} else {{ {c} }} }}"
 				),
 				120,
 				4,
 			);
-			assert!(output.contains("return if x {\n"), "{output}");
-			assert!(output.contains("} else if y {\n"), "{output}");
+			assert!(output.contains("return if (x) {\n"), "{output}");
+			assert!(output.contains("} else if (y) {\n"), "{output}");
 			assert!(output.contains("} else {\n"), "{output}");
 		}
 	}
 
 	let expression =
-		"if x { a() } else if y { b() } else if z { c() } else { d() }";
+		"if (x) { a() } else if (y) { b() } else if (z) { c() } else { d() }";
 	let boundary = (4 + expression.len() + 1) as u32;
 	for width in [boundary - 1, boundary, boundary + 1] {
 		let output = checked_format(
@@ -3153,9 +3150,9 @@ fn chained_if_branches_share_one_layout() {
 				"{output}"
 			);
 		} else {
-			assert!(output.contains("if x {\n"), "{output}");
-			assert!(output.contains("} else if y {\n"), "{output}");
-			assert!(output.contains("} else if z {\n"), "{output}");
+			assert!(output.contains("if (x) {\n"), "{output}");
+			assert!(output.contains("} else if (y) {\n"), "{output}");
+			assert!(output.contains("} else if (z) {\n"), "{output}");
 			assert!(output.contains("} else {\n"), "{output}");
 			assert!(output.contains("\n    }\n    next()"), "{output}");
 		}
@@ -3166,16 +3163,16 @@ fn chained_if_branches_share_one_layout() {
 fn chained_if_keeps_nested_expressions_independent() {
 	assert_eq!(
 		checked_format(
-			"func f() { return if x { // branch\n-k_cosf(if sign { a + b } else { a - b }) } else if y { b() } else { c() } }",
+			"func f() { return if (x) { // branch\n-k_cosf(if (sign) { a + b } else { a - b }) } else if (y) { b() } else { c() } }",
 			80,
 			4,
 		),
 		indoc! {"
             func f() {
-                return if x {
+                return if (x) {
                     // branch
-                    -k_cosf(if sign { a + b } else { a - b })
-                } else if y {
+                    -k_cosf(if (sign) { a + b } else { a - b })
+                } else if (y) {
                     b()
                 } else {
                     c()
@@ -3189,16 +3186,16 @@ fn chained_if_keeps_nested_expressions_independent() {
 fn redundant_else_if_wrappers_become_chains() {
 	for (source, expected) in [
 		(
-			"func f() { if x { a() } else { if y { b() } else { if z { c() } else { d() } } } }",
-			"func f() {\n    if x { a() } else if y { b() } else if z { c() } else { d() }\n}\n",
+			"func f() { if (x) { a() } else { if (y) { b() } else { if (z) { c() } else { d() } } } }",
+			"func f() {\n    if (x) { a() } else if (y) { b() } else if (z) { c() } else { d() }\n}\n",
 		),
 		(
-			"func f() { return if x { a() } else { if y { // branch\nb() } else { c() } } }",
+			"func f() { return if (x) { a() } else { if (y) { // branch\nb() } else { c() } } }",
 			indoc! {"
                 func f() {
-                    return if x {
+                    return if (x) {
                         a()
-                    } else if y {
+                    } else if (y) {
                         // branch
                         b()
                     } else {
@@ -3215,13 +3212,13 @@ fn redundant_else_if_wrappers_become_chains() {
 #[test]
 fn meaningful_else_if_wrappers_are_preserved() {
 	for body in [
-		"if y { b() } else { c() };",
-		"prepare(); if y { b() } else { c() }",
-		"// before\nif y { b() } else { c() }",
-		"if y { b() } else { c() } // after\n",
+		"if (y) { b() } else { c() };",
+		"prepare(); if (y) { b() } else { c() }",
+		"// before\nif (y) { b() } else { c() }",
+		"if (y) { b() } else { c() } // after\n",
 	] {
 		let output = checked_format(
-			&format!("func f() {{ if x {{ a() }} else {{ {body} }} }}"),
+			&format!("func f() {{ if (x) {{ a() }} else {{ {body} }} }}"),
 			120,
 			4,
 		);
@@ -3236,7 +3233,7 @@ fn mandatory_lines_prevent_flat_layout() {
 	// A nested block that must break stops its parents going flat.
 	{
 		let output = checked_format(
-			"func f() { return if true { a(); } else { b() } }",
+			"func f() { return if (true) { a(); } else { b() } }",
 			120,
 			4,
 		);
@@ -3246,14 +3243,14 @@ fn mandatory_lines_prevent_flat_layout() {
 		// operand is block-like when the whole thing is physically one line.
 		assert_eq!(
 			checked_format(
-				"func f() { return if true { a() } else { b() } }",
+				"func f() { return if (true) { a() } else { b() } }",
 				120,
 				4
 			),
-			"func f() {\n    return if true { a() } else { b() }\n}\n"
+			"func f() {\n    return if (true) { a() } else { b() }\n}\n"
 		);
 		let output = checked_format(
-			"func f() { wrap(Point({ x: block { a(); } })) }",
+			"func f() { wrap(Point{ x: block { a(); } }) }",
 			120,
 			4,
 		);
@@ -3283,17 +3280,17 @@ fn a_call_by_name_that_fits_stays_on_one_line() {
 		checked_format(
 			indoc! {"
                 func f() {
-                    g({b:1,a});
-                    geom::make({ x : 1 , y });
-                    <T as Make>::make({self: x});
-                    Self::m({ self });
-                    x.m({ y , z:2 });
-                    x.m::<u32>({ a });
-                    h({});
-                    g({
+                    g{b:1,a};
+                    geom::make{ x : 1 , y };
+                    <T as Make>::make{self: x};
+                    Self::m{ self };
+                    x.m{ y , z:2 };
+                    x.m::<u32>{ a };
+                    h{};
+                    g{
                         a: 1,
                         b: 2,
-                    });
+                    };
                 }
             "},
 			80,
@@ -3301,21 +3298,21 @@ fn a_call_by_name_that_fits_stays_on_one_line() {
 		),
 		indoc! {"
             func f() {
-                g({ b: 1, a });
-                geom::make({ x: 1, y });
-                <T as Make>::make({ self: x });
-                Self::m({ self });
-                x.m({ y, z: 2 });
-                x.m::<u32>({ a });
-                h({});
-                g({ a: 1, b: 2 });
+                g{ b: 1, a };
+                geom::make{ x: 1, y };
+                <T as Make>::make{ self: x };
+                Self::m{ self };
+                x.m{ y, z: 2 };
+                x.m::<u32>{ a };
+                h{};
+                g{ a: 1, b: 2 };
             }
         "},
 	);
 }
 
 /// A call by name that doesn't fit puts each argument on a line of its own,
-/// with a trailing comma, its braces hugging the parentheses. Wherever it
+/// with a trailing comma and its opening brace attached to the callee. Wherever it
 /// stands, the call itself stays where it starts: a local's value doesn't
 /// move below the `=`. An argument that fits stays flat.
 #[test]
@@ -3324,11 +3321,11 @@ fn a_call_by_name_that_does_not_fit_breaks_one_argument_per_line() {
 		checked_format(
 			indoc! {"
                 func f() -> u32 {
-                    connect({ host: primary_host, port: 8080, retries: 3 });
-                    local c = connect({ host: primary_host, port: 8080 });
-                    socket.send({ payload: buffer, flags: 0, timeout: 30 });
-                    open({ path: read_path({ dir: a, name: b }), mode: 0 });
-                    return connect({ host: primary_host, port: 8080 });
+                    connect{ host: primary_host, port: 8080, retries: 3 };
+                    local c = connect{ host: primary_host, port: 8080 };
+                    socket.send{ payload: buffer, flags: 0, timeout: 30 };
+                    open{ path: read_path{ dir: a, name: b }, mode: 0 };
+                    return connect{ host: primary_host, port: 8080 };
                 }
             "},
 			50,
@@ -3336,28 +3333,28 @@ fn a_call_by_name_that_does_not_fit_breaks_one_argument_per_line() {
 		),
 		indoc! {"
             func f() -> u32 {
-                connect({
+                connect{
                     host: primary_host,
                     port: 8080,
                     retries: 3,
-                });
-                local c = connect({
+                };
+                local c = connect{
                     host: primary_host,
                     port: 8080,
-                });
-                socket.send({
+                };
+                socket.send{
                     payload: buffer,
                     flags: 0,
                     timeout: 30,
-                });
-                open({
-                    path: read_path({ dir: a, name: b }),
+                };
+                open{
+                    path: read_path{ dir: a, name: b },
                     mode: 0,
-                });
-                return connect({
+                };
+                return connect{
                     host: primary_host,
                     port: 8080,
-                });
+                };
             }
         "},
 	);
@@ -3371,8 +3368,8 @@ fn a_call_by_name_hugs_the_call_it_is_the_only_argument_of() {
 		checked_format(
 			indoc! {"
                 func f() {
-                    wrap(make({ alpha: 1000000, beta: 2000000, gamma: 3 }));
-                    wrap(x.m({ alpha: 1000000, beta: 2000000, gamma: 3 }));
+                    wrap(make{ alpha: 1000000, beta: 2000000, gamma: 3 });
+                    wrap(x.m{ alpha: 1000000, beta: 2000000, gamma: 3 });
                 }
             "},
 			50,
@@ -3380,16 +3377,16 @@ fn a_call_by_name_hugs_the_call_it_is_the_only_argument_of() {
 		),
 		indoc! {"
             func f() {
-                wrap(make({
+                wrap(make{
                     alpha: 1000000,
                     beta: 2000000,
                     gamma: 3,
-                }));
-                wrap(x.m({
+                });
+                wrap(x.m{
                     alpha: 1000000,
                     beta: 2000000,
                     gamma: 3,
-                }));
+                });
             }
         "},
 	);
@@ -3403,9 +3400,9 @@ fn a_block_value_breaks_a_call_by_name() {
 		checked_format(
 			indoc! {"
                 func f() {
-                    g({ a: block { y(); }, b: 2 });
-                    x.m({ a: if c { 1 } else { 2 } });
-                    g({ a: match v { _ => { 1 } } });
+                    g{ a: block { y(); }, b: 2 };
+                    x.m{ a: if (c) { 1 } else { 2 } };
+                    g{ a: match (v) { _ => { 1 } } };
                 }
             "},
 			80,
@@ -3413,20 +3410,20 @@ fn a_block_value_breaks_a_call_by_name() {
 		),
 		indoc! {"
             func f() {
-                g({
+                g{
                     a: block {
                         y();
                     },
                     b: 2,
-                });
-                x.m({
-                    a: if c { 1 } else { 2 },
-                });
-                g({
-                    a: match v {
+                };
+                x.m{
+                    a: if (c) { 1 } else { 2 },
+                };
+                g{
+                    a: match (v) {
                         _ => { 1 },
                     },
-                });
+                };
             }
         "},
 	);
@@ -3439,33 +3436,50 @@ fn a_block_value_breaks_a_call_by_name() {
 fn comments_in_a_call_by_name_are_kept() {
 	let source = indoc! {"
         func f() {
-            g({
+            g{
                 a: 1,
                 // b: 2,
                 c: 3, // three
                 // d: 4,
-            });
-            g({ a: 1, // one
-                c: 3 });
+            };
+            g{ a: 1, // one
+                c: 3 };
         }
     "};
 	assert_eq!(
 		checked_format(source, 80, 4),
 		indoc! {"
             func f() {
-                g({
+                g{
                     a: 1,
                     // b: 2,
                     c: 3, // three
                     // d: 4,
-                });
-                g({
+                };
+                g{
                     a: 1, // one
                     c: 3,
-                });
+                };
             }
         "},
 	);
+}
+
+#[test]
+fn attributes_format_direct_named_lists_without_parentheses() {
+	for (source, expected) in [
+		(
+			"#[memory_limits {min_pages:1,max_pages:2,}] memory heap:u32;",
+			"#[memory_limits{ min_pages: 1, max_pages: 2 }]\nmemory heap: u32;\n",
+		),
+		("#[custom {}] func f(){}", "#[custom{}]\nfunc f() {}\n"),
+		(
+			"#[custom{value:Point {x:(1:u8)}, shorthand,}] func f(){}",
+			"#[custom{ value: Point{ x: (1: u8) }, shorthand }]\nfunc f() {}\n",
+		),
+	] {
+		assert_eq!(checked_format(source, 80, 4), expected);
+	}
 }
 
 /// A comment among an item's attributes stays where it is written: inside an
@@ -3475,11 +3489,11 @@ fn comments_in_a_call_by_name_are_kept() {
 fn comments_among_attributes_are_kept() {
 	let source = indoc! {"
         // before
-        #[memory_limits({
+        #[memory_limits{
             // first
             min_pages: 1,
             // max_pages: 4,
-        })]
+        }]
         memory heap: u32;
 
         #[inline] // trailing
@@ -3542,8 +3556,8 @@ fn test_format_current_syntax_forms() {
 
         func main() {
             local Pair(a, ..) = p;
-            local Named({ x, y: (q, _), .. }) = n;
-            local v = obj.method::<u32>({ a: 1, b });
+            local Named{ x, y: (q, _), .. } = n;
+            local v = obj.method::<u32>{ a: 1, b };
             local w = <Vec<u32> as Tr>::A::f::<u8>(x);
             local z = <u32>::MAX;
             local f: func(a: i32, i32) -> heap::*u8 = g;
@@ -3583,8 +3597,8 @@ fn test_format_current_syntax_forms() {
 
             func main() {
                 local Pair(a, ..) = p;
-                local Named({ x, y: (q, _), .. }) = n;
-                local v = obj.method::<u32>({ a: 1, b });
+                local Named{ x, y: (q, _), .. } = n;
+                local v = obj.method::<u32>{ a: 1, b };
                 local w = <Vec<u32> as Tr>::A::f::<u8>(x);
                 local z = <u32>::MAX;
                 local f: func(a: i32, i32) -> heap::*u8 = g;
@@ -3684,7 +3698,7 @@ fn test_format_one_element_tuple_as_its_element() {
 	let case = TestCase::new(indoc! {"
         func f(x: (u8,), w: (u16)) -> u8 { local (y,) = (x,); local (z) = y; z }
         func g(a: u8, b: u8, c: u8) -> u8 { (a + b,) * c }
-        func h(v: u8) { match v { (1 | 2,) => {}, _ => {} } }
+        func h(v: u8) { match (v) { (1 | 2,) => {}, _ => {} } }
     "});
 	let output = format(
 		&case.ast,
@@ -3710,7 +3724,7 @@ fn test_format_one_element_tuple_as_its_element() {
             }
 
             func h(v: u8) {
-                match v {
+                match (v) {
                     (1 | 2) => {},
                     _ => {},
                 }
@@ -3726,10 +3740,10 @@ fn test_format_match_arm_bodies() {
 		checked_format(
 			indoc! {"
                 func f(x: i32) -> i32 {
-                    match x {
+                    match (x) {
                         0 => 10,
                         1 => { local y: i32 = 20; y },
-                        _ => if x > 0 { 1 } else { 2 },
+                        _ => if (x > 0) { 1 } else { 2 },
                     }
                 }
             "},
@@ -3738,13 +3752,13 @@ fn test_format_match_arm_bodies() {
 		),
 		indoc! {"
             func f(x: i32) -> i32 {
-                match x {
+                match (x) {
                     0 => 10,
                     1 => {
                         local y: i32 = 20;
                         y
                     },
-                    _ => if x > 0 { 1 } else { 2 },
+                    _ => if (x > 0) { 1 } else { 2 },
                 }
             }
         "}
@@ -3757,7 +3771,7 @@ fn test_format_match_arm_bodies() {
 fn test_format_keeps_a_written_block_in_an_arm() {
 	let source = indoc! {"
         func f(x: i32) -> i32 {
-            match x {
+            match (x) {
                 0 => block :b { break :b 1 },
                 _ => block { break 2 },
             }
@@ -3798,14 +3812,34 @@ fn a_slot_without_a_type_is_printed_as_written() {
 }
 
 #[test]
+fn grouped_subjects_and_brace_calls_preserve_expression_structure() {
+	let source = indoc! {"
+		func f(ready: Bool, x: i32, y: i32) -> i32 {
+		    if (ready: Bool) { return Point{ x, y }.x };
+		    loop (i: i32 = 0) {
+		        match (Point{ x, y }) {
+		            Point{ x, y } => continue { i: i + x + y },
+		        }
+		    }
+		}
+	"};
+	let formatted = checked_format(source, 80, 4);
+	assert!(formatted.contains("if (ready: Bool)"));
+	assert!(formatted.contains("match (Point{ x, y })"));
+	assert!(formatted.contains("Point{ x, y }.x"));
+	assert!(formatted.contains("continue { i: i + x + y }"));
+	assert_eq!(checked_format(&formatted, 80, 4), formatted);
+}
+
+#[test]
 fn loop_parameters_and_a_continue_value_are_printed_after_their_labels() {
 	let source = indoc! {"
         func f(n: u32) -> u32 {
             loop :rows (mut a: u32 = 0, b = n) {
-                if a == b { continue :rows(a, b + 1) };
+                if (a == b) { continue :rows (a, b + 1) };
                 loop (i = (0: u32)) {
-                    if i == n { break };
-                    continue(i + 1);
+                    if (i == n) { break };
+                    continue (i + 1);
                 }
                 (b, a)
             }
@@ -3815,7 +3849,7 @@ fn loop_parameters_and_a_continue_value_are_printed_after_their_labels() {
 	for (source, expected) in [
 		(
 			"loop(i:u32=0){ continue ( i+1 ) }",
-			"loop (i: u32 = 0) { continue(i + 1) }",
+			"loop (i: u32 = 0) { continue (i + 1) }",
 		),
 		("loop (i: u32 = 0,) { }", "loop (i: u32 = 0) {}"),
 		// No parameters are no list.
@@ -3857,21 +3891,21 @@ fn loop_parameters_too_long_for_a_line_are_printed_one_per_line() {
 fn a_named_list_is_printed_as_a_call_by_names_arguments() {
 	for (source, expected) in [
 		("({i:i+1,total})", "({ i: i + 1, total })"),
-		("continue :l ({ i })", "continue :l({ i })"),
+		("continue :l { i }", "continue :l { i }"),
 	] {
 		assert_eq!(
 			checked_format(&format!("func f() {{ {source} }}"), 80, 4),
 			format!("func f() {{\n    {expected}\n}}\n")
 		);
 	}
-	// Too long: one name per line, the braces hugging the parentheses.
+	// Too long: one name per line inside the named-list braces.
 	let source = indoc! {"
         func f() {
-            continue({
+            continue {
                 next: next_index + 1,
                 start: at_position + 1,
                 at: at_position + 1,
-            })
+            }
         }
     "};
 	assert_eq!(checked_format(source, 40, 4), source);

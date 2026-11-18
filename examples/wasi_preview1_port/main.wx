@@ -36,7 +36,7 @@
 // `build_aggregate_load`/`build_param_value` and
 // `opt::scheduler::Scheduler::ensure_aggregate_locals`), so the nested
 // structs below are built directly with the natural, ordinary syntax
-// (`alloc::<T>(T({ ... nested literal ... }))`), same as any other struct.
+// (`alloc::<T>(T{ ... nested literal ... })`), same as any other struct.
 //
 // Every record type uses `#[fixed_order]` (declaration-order fields with
 // natural C-style alignment padding, rather than wx's default
@@ -45,7 +45,7 @@
 
 package "alloc" as alloc;
 
-#[memory_limits({ min_pages: 1 })]
+#[memory_limits{ min_pages: 1 }]
 memory heap: u32;
 // ── Plain scalar typedefs ───────────────────────────────────────────────────
 type Size = u32;
@@ -656,7 +656,7 @@ func write_all(fd: Fd, bytes: heap::&[u8]) {
     local io_vecs = alloc.allocate_slice_uninit::<heap::&[u8]>(1);
     io_vecs[0] = bytes;
     local nwritten = alloc.allocate_value::<u32>(0);
-    if wasi::fd_write(fd, io_vecs.*.&, nwritten) != Errno::Success { trap() };
+    if (wasi::fd_write(fd, io_vecs.*.&, nwritten) != Errno::Success) { trap() };
 }
 
 // Decimal, not hex, so the demo output reads naturally; values here are all
@@ -668,7 +668,7 @@ func write_decimal(fd: Fd, value: u32) {
         i -= 1;
         buf[i] = '0' + transmute::<_, u8>(value % 10);
         local rest = value / 10;
-        if rest == 0 { break i };
+        if (rest == 0) { break i };
         (i, rest)
     };
     write_all(fd, slice_from_parts(buf[i].&, 10 - i));
@@ -679,7 +679,7 @@ func main() {
 
     // clock_time_get: a plain scalar (u64) out-param.
     local time_ptr = alloc.allocate_value::<u64>(0);
-    if wasi::clock_time_get(ClockId::Monotonic, 0, time_ptr) != Errno::Success {
+    if (wasi::clock_time_get(ClockId::Monotonic, 0, time_ptr) != Errno::Success) {
         trap()
     }
     write_all(Fd::Stdout, "clock_time_get: ok\n");
@@ -687,13 +687,13 @@ func main() {
     // fd_fdstat_get: reads a #[fixed_order] record back through a pointer a
     // real host wrote into — proves the struct's byte layout actually lines
     // up, not just that wx accepted the declaration.
-    local stat_ptr = alloc.allocate_value(Fdstat({
+    local stat_ptr = alloc.allocate_value(Fdstat{
         fs_filetype: Filetype::Unknown,
         fs_flags: 0,
         fs_rights_base: 0,
         fs_rights_inheriting: 0,
-    }));
-    if wasi::fd_fdstat_get(Fd::Stdout, stat_ptr) != Errno::Success { trap() };
+    });
+    if (wasi::fd_fdstat_get(Fd::Stdout, stat_ptr) != Errno::Success) { trap() };
     write_all(Fd::Stdout, "fd_fdstat_get: fs_filetype=");
     write_decimal(Fd::Stdout, transmute(stat_ptr.fs_filetype));
     write_all(Fd::Stdout, "\n");
@@ -704,24 +704,24 @@ func main() {
     //
     // `Subscription` nests two levels deep (`u.clock`) — plain nested struct
     // literals, same as any other struct.
-    local sub_ptr = alloc.allocate_value(Subscription({
+    local sub_ptr = alloc.allocate_value(Subscription{
         userdata: 0,
-        u: SubscriptionU({
+        u: SubscriptionU{
             tag: Eventtype::Clock,
-            clock: SubscriptionClock({
+            clock: SubscriptionClock{
                 id: ClockId::Monotonic,
                 timeout: 5000000,
                 precision: 0,
                 flags: 0,
-            }),
-        }),
-    }));
-    local event_ptr = alloc.allocate_value(Event({
+            },
+        },
+    });
+    local event_ptr = alloc.allocate_value(Event{
         userdata: 0,
         error: Errno::Success,
         event_type: Eventtype::Clock,
-        fd_readwrite: EventFdReadwrite({ nbytes: 0, flags: 0 }),
-    }));
+        fd_readwrite: EventFdReadwrite{ nbytes: 0, flags: 0 },
+    });
     local nevents_ptr = alloc.allocate_value::<u32>(0);
     local poll_result =
         wasi::poll_oneoff(sub_ptr.*.&, event_ptr, 1, nevents_ptr);
@@ -735,15 +735,15 @@ func main() {
     // call: write through the larger variant (`clock.id = Monotonic`, 1) and
     // read the same bytes back through the smaller one
     // (`SubscriptionFdReadwrite`), which must see 1.
-    local scratch = alloc.allocate_value(SubscriptionU({
+    local scratch = alloc.allocate_value(SubscriptionU{
         tag: Eventtype::FdRead,
-        clock: SubscriptionClock({
+        clock: SubscriptionClock{
             id: ClockId::Monotonic,
             timeout: 0,
             precision: 0,
             flags: 0,
-        }),
-    }));
+        },
+    });
     local recovered = subscription_u_as_fd_readwrite(scratch).file_descriptor;
     write_all(Fd::Stdout, "union round-trip: file_descriptor=");
     write_decimal(Fd::Stdout, transmute(recovered));
