@@ -42,7 +42,8 @@ use string_interner::symbol::SymbolU32;
 
 use super::body::{
 	Body, BodyOwner, ElementOrder, ExprIdx, ExprKind, ExprObligation,
-	ExprRange, LocalIdx, Obligations, ScopeIdx, ScopeKind, TargetIdx,
+	ExprRange, JumpTarget, LocalIdx, Obligations, ScopeIdx, ScopeKind,
+	TargetIdx, TargetKind,
 };
 use super::bounds::AssumptionEnvIdx;
 use super::decls::{
@@ -71,7 +72,8 @@ use super::types::{
 	TypeIndex,
 };
 use crate::ast::{
-	self, BinaryOp, Keyword, Ownership, Spanned, StringInterner, UnaryOp,
+	self, AST, ArgumentList, BinaryOp, Keyword, Ownership, Spanned,
+	StringInterner, UnaryOp,
 };
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::vfs::FileId;
@@ -104,9 +106,12 @@ pub(super) struct BodyBuilder<'a, 'ast> {
 	owner: BodyOwner,
 	/// The block scope being checked.
 	current: ScopeIdx,
-	/// The innermost loop or `block` being checked, which an unlabelled
-	/// jump leaves.
-	current_target: Option<TargetIdx>,
+	/// The loops and `block`s being checked, innermost last: what a jump
+	/// inside them can name.
+	open_targets: Vec<OpenTarget>,
+	/// The targets left, each with the index it was given when entered; the
+	/// body's, in `TargetIdx` order, once it is finished (`finish`).
+	finished_targets: Vec<(TargetIdx, JumpTarget)>,
 	/// The locals each scope declares, by name. A name is looked up in the
 	/// current scope, then in each enclosing one; a later declaration of the
 	/// same name in one scope replaces the entry, which shadows the earlier.
@@ -131,6 +136,16 @@ enum TypeEquality {
 	Diff,
 	/// A constant left as written decides it.
 	NeedsValues,
+}
+
+/// A loop or `block` being checked: what a jump inside it needs of it, and
+/// what its `JumpTarget` is made of once its node is built.
+#[derive(Clone, Copy)]
+struct OpenTarget {
+	index: TargetIdx,
+	kind: TargetKind,
+	label: Option<Spanned<SymbolU32>>,
+	scope: ScopeIdx,
 }
 
 /// The type a scope's value is held to while its block is checked.
@@ -415,7 +430,8 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			scope,
 			owner,
 			current: ScopeIdx::ROOT,
-			current_target: None,
+			open_targets: Vec::new(),
+			finished_targets: Vec::new(),
 			lookup: FxHashMap::default(),
 			scope_types: Vec::new(),
 		}
@@ -454,6 +470,22 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		let expected = self.context().normalized(expected);
 		self.enter_root(self.ast().expr_span(expr), expected);
 		self.check(expr, expected);
+		self.finish()
+	}
+
+	/// The body, with its jump targets, all of them left by now, in
+	/// `TargetIdx` order.
+	fn finish(mut self) -> (Body, Obligations) {
+		debug_assert!(self.open_targets.is_empty());
+		self.finished_targets
+			.sort_unstable_by_key(|&(index, _)| u32::from(index));
+		debug_assert!(
+			(self.finished_targets.iter().enumerate())
+				.all(|(at, &(index, _))| usize::from(index) == at)
+		);
+		let targets =
+			self.finished_targets.into_iter().map(|(_, target)| target);
+		self.body.set_targets(targets.collect());
 		(self.body, self.obligations)
 	}
 
@@ -483,7 +515,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		// value against it would only repeat that.
 		if repr == TypeIndex::ERROR {
 			self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
-			return (self.body, self.obligations);
+			return self.finish();
 		}
 		match (variant.value, previous) {
 			(Some(value), _) => self.check(value, repr),
@@ -511,7 +543,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				self.body.push(ExprKind::Error, TypeIndex::ERROR, span)
 			}
 		};
-		(self.body, self.obligations)
+		self.finish()
 	}
 
 	/// Builds `expr` and holds it to `expected`: an untyped literal takes that
@@ -666,30 +698,17 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				span,
 				AccessKind::Read,
 			),
-			ast::Expression::Call {
-				callee, arguments, ..
-			} => self.build_call(
+			ast::Expression::Call { callee, arguments } => self.build_call(
 				callee,
-				Arguments {
-					kind: ArgumentList::Positional(ast.list(arguments)),
-					span: ast.arguments_span(expr),
-				},
-				Expected::Type(expected),
-				span,
-			),
-			ast::Expression::NamedCall {
-				callee, arguments, ..
-			} => self.build_call(
-				callee,
-				Arguments {
-					kind: ArgumentList::Named(ast.list(arguments)),
-					span: ast.arguments_span(expr),
-				},
+				Arguments::of(ast, arguments),
 				Expected::Type(expected),
 				span,
 			),
 			ast::Expression::Tuple { elements } => {
 				self.build_tuple(ast.list(elements), expected, span)
+			}
+			ast::Expression::BareBlock(block) => {
+				self.build_block(block, expected, span)
 			}
 			ast::Expression::Block { label, block } => {
 				// A name not written yet (`block : {`) declares nothing.
@@ -717,21 +736,25 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			ast::Expression::Break { label, value } => {
 				self.build_break(label, value, span)
 			}
-			ast::Expression::Continue { label, value } => {
-				self.build_continue(label, value, span)
+			ast::Expression::Continue { label, arguments } => {
+				let arguments =
+					arguments.map(|arguments| Arguments::of(ast, arguments));
+				self.build_continue(label, arguments, span)
 			}
-			ast::Expression::NamedList { arguments, .. } => {
+			ast::Expression::NamedList { arguments, braces } => {
 				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::NamedListWithoutNames.code())
 						.with_message("a named list needs names to give")
 						.with_label(
-							Label::primary(self.scope.file_id, span)
-								.with_message("nothing here has these names"),
+							Label::primary(self.scope.file_id, braces)
+								.with_message(
+									"nothing here declares these names",
+								),
 						)
 						.with_note(
-							"a named list gives a loop's next state: the \
-							 body's result, or `continue`'s value",
+							"a named list gives the arguments of a call or of \
+							 a `continue`, by the names they declare",
 						),
 				);
 				self.build_named_values(ast.list(arguments), span)
@@ -3128,11 +3151,14 @@ struct Arguments<'e> {
 	span: TextSpan,
 }
 
-/// A call's arguments, by position or by name.
-#[derive(Clone, Copy)]
-enum ArgumentList<'e> {
-	Positional(&'e [ast::ExprId]),
-	Named(&'e [ast::NamedArgument]),
+impl<'e> Arguments<'e> {
+	/// The argument list `arguments` of `ast`.
+	fn of(ast: &'e AST, arguments: ast::ExprId) -> Self {
+		Self {
+			kind: ast.argument_list(arguments),
+			span: ast.arguments_span(arguments),
+		}
+	}
 }
 
 #[cfg(test)]
@@ -3820,12 +3846,11 @@ mod tests {
 
 		/// A jump's target: its label, else its kind.
 		fn target_name(&self, body: &Body, target: super::TargetIdx) -> String {
-			let target = body.target(target);
-			match target.label {
+			match body.target(target).label {
 				Some(label) => {
 					self.strings.resolve(label.inner).unwrap().to_string()
 				}
-				None => format!("{:?}", target.kind).to_lowercase(),
+				None => body.target_kind(target).keyword().as_str().to_string(),
 			}
 		}
 
@@ -4223,23 +4248,23 @@ mod tests {
 	}
 
 	/// A parameter's type is written, or its initial value's; the body's
-	/// result and each `continue`'s value are the next state, positionally or
-	/// by name.
+	/// result is the next state, and a `continue` gives it as a call's
+	/// arguments, by position or by name.
 	#[test]
 	fn a_loop_state_is_typed_by_its_parameters() {
 		let case = TestCase::new(indoc! {"
 				func sum(n: u32) -> u32 {
 					loop (i: u32 = 0, total = n) {
 						if i == n { break total };
-						if i == 7 { continue (i + 2, total) };
-						({ total: total + i, i: i + 1 })
+						if i == 7 { continue(i + 2, total) };
+						continue({ total: total + i, i: i + 1 })
 					}
 				}
 				func count() -> u32 {
 					loop (mut i: u32 = 0) {
 						i += 1;
 						if i > 3 { break i };
-						({ i })
+						continue({ i })
 					}
 				}
 			"});
@@ -4257,7 +4282,7 @@ mod tests {
 			"(block => (loop (i#1 total#2) = (tuple 0 n#0) \
 			 (if (== i#1 n#0) (block => (break loop total#2))) \
 			 (if (== i#1 7) (block => (continue loop (tuple (+ i#1 2) total#2)))) \
-			 => (tuple 1=(+ total#2 i#1) 0=(+ i#1 1))))"
+			 => (continue loop (tuple 1=(+ total#2 i#1) 0=(+ i#1 1)))))"
 		);
 	}
 
@@ -4310,7 +4335,7 @@ mod tests {
 				func f(c: Bool) {
 					loop (i: u32 = 0) {
 						if c { continue };
-						if c { continue c };
+						if c { continue(c) };
 						if c { break };
 					}
 				}
@@ -4330,16 +4355,16 @@ mod tests {
 		case.diagnostics().assert_none();
 	}
 
-	/// A named next state follows a call by name's rules: every parameter
+	/// A `continue` by name follows a call by name's rules: every parameter
 	/// once, and nothing else.
 	#[test]
 	fn a_named_state_gives_every_parameter_once() {
 		let case = TestCase::new(indoc! {"
 				func f(c: Bool) {
 					loop (a: u32 = 0, b: u32 = 0) {
-						if c { continue ({ a: 1, x: 2, b }) };
-						if c { continue ({ a: 1, a: 2, b }) };
-						({ a: 1 })
+						if c { continue({ a: 1, x: 2, b }) };
+						if c { continue({ a: 1, a: 2, b }) };
+						continue({ a: 1 })
 					}
 				}
 			"});
@@ -4366,7 +4391,7 @@ mod tests {
 				func named() -> u32 {
 					loop (a: u32 = 1, a: u64 = 2) {
 						if a == 1 { break a };
-						({ a: a + 1 })
+						continue({ a: a + 1 })
 					}
 				}
 			"});
@@ -4385,7 +4410,7 @@ mod tests {
 					loop :rows (row: u32 = 0) {
 						if row == n { break row };
 						loop (col: u32 = 0) {
-							if col == n { continue :rows ({ row: row + 1 }) };
+							if col == n { continue :rows({ row: row + 1 }) };
 							col + 1
 						}
 					}
@@ -4394,16 +4419,19 @@ mod tests {
 		case.diagnostics().assert_none();
 	}
 
-	/// Outside a loop's next state, a named list's names mean nothing: it
-	/// is reported once, and its values are still checked.
+	/// A named list's names mean something only as a call's or a
+	/// `continue`'s arguments: anywhere else, a loop body's result or one
+	/// inside the arguments included, it is reported once, and its values
+	/// are still checked, against nothing.
 	#[test]
-	fn a_named_list_elsewhere_is_reported_once() {
+	fn a_named_list_outside_arguments_is_reported_once() {
 		let case = TestCase::new(indoc! {"
 				func f(x: u32) -> u32 {
 					local y = ({ a: x, b: missing });
 					loop (i: u32 = 0) {
 						if i == 0 { break ({ i }) };
-						if i == 1 { ({ i }) } else { i }
+						if i == 1 { continue(({ i: i + 2 })) };
+						({ i })
 					}
 				}
 			"});
@@ -4412,26 +4440,54 @@ mod tests {
 			DiagnosticCode::UndeclaredIdentifier,
 			DiagnosticCode::NamedListWithoutNames,
 			DiagnosticCode::NamedListWithoutNames,
+			DiagnosticCode::NamedListWithoutNames,
 		]);
 	}
 
-	/// Only a named list written directly is a next state by name: one in
-	/// parentheses is a parenthesized value, as anywhere else.
+	/// A loop body's result is its next state by position, as any block's
+	/// result is its value; `continue` is called with the same list.
 	#[test]
-	fn a_named_state_is_written_directly() {
+	fn continue_is_called_with_the_loops_parameters() {
 		let case = TestCase::new(indoc! {"
 				func f() -> u32 {
-					loop (i: u32 = 0) {
-						if i == 3 { break i };
-						if i == 1 { continue (({ i: i + 2 })) };
-						(({ i: i + 1 }))
+					loop (i: u32 = 0, total: u32 = 0) {
+						if i == 3 { break total };
+						if i == 1 { continue(i + 2, total) };
+						if i == 2 { continue({ total: total + i, i: i + 1 }) };
+						(i + 1, total + i)
+					}
+				}
+				func pair() -> u32 {
+					loop (p: (u32, u32) = (0, 0)) {
+						local (a, b) = p;
+						if a == 3 { break b };
+						continue(a + 1, b + 2)
+					}
+				}
+				func unit() {
+					loop {
+						continue();
 					}
 				}
 			"});
-		case.diagnostics().assert_codes(&[
-			DiagnosticCode::NamedListWithoutNames,
-			DiagnosticCode::NamedListWithoutNames,
-		]);
+		case.diagnostics().assert_none();
+	}
+
+	/// `continue` takes its arguments as a call does, in parentheses: one
+	/// written without them is reported, and read as the one argument.
+	#[test]
+	fn continue_without_parentheses_is_reported() {
+		let (case, parser) = TestCase::recovered(indoc! {"
+				func f() -> u32 {
+					loop (i: u32 = 0) {
+						if i == 3 { break i };
+						continue i + 1
+					}
+				}
+			"});
+		DiagnosticView::new("parse", &parser, &case.files)
+			.assert_codes(&[DiagnosticCode::ContinueArgumentsNeedParentheses]);
+		case.diagnostics().assert_none();
 	}
 
 	#[test]
@@ -4646,9 +4702,12 @@ mod tests {
 			))
 		};
 		let target = |keyword| match case.sema.resolutions.get(site(keyword)) {
-			Some(Reference::Jump { owner, target }) => {
+			Some(
+				Reference::Break { owner, target }
+				| Reference::Continue { owner, target },
+			) => {
 				let body = case.sema.owner_body(owner).unwrap();
-				let at = body.target(target).keyword;
+				let at = body.target_keyword_span(target).start;
 				&SOURCE[u32::from(at) as usize..]
 			}
 			other => panic!("`{keyword}` recorded {other:?}"),

@@ -279,6 +279,9 @@ fn classify(
 		Definition::JumpTarget { .. } => {
 			unreachable!("a jump target is written as its keyword")
 		}
+		Definition::FunctionBody(_) => {
+			unreachable!("a function's body is written as its `func` keyword")
+		}
 	};
 	Some((kind, modifiers | default_library))
 }

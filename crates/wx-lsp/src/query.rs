@@ -296,6 +296,9 @@ pub(crate) fn definitions(
 				});
 			}
 		}
+		if sema.owner_body(owner).is_some() {
+			add(Definition::FunctionBody(function));
+		}
 		add_body_definitions(sema, owner, &mut add);
 	}
 	for index in 0..decls.constants.len() {

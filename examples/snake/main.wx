@@ -71,7 +71,7 @@ func pop_back() {
             curr.as_ptr().next = RawPtr::null();
             break;
         }
-        continue next;
+        continue(next);
     }
 }
 
@@ -80,7 +80,7 @@ func contains(x: i32, y: i32) -> Bool {
         if curr.is_null() { break False };
         local n = curr.as_ref();
         if n.x == x && n.y == y { break True };
-        continue n.next;
+        continue(n.next);
     }
 }
 

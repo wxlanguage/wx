@@ -1237,11 +1237,21 @@ fn a_loops_parameters_are_not_patterns() {
 }
 
 #[test]
-fn a_continue_takes_a_value_after_its_label() {
-	assert_eq!(shape_of("continue i + 1"), "(continue (+ i 1))");
-	assert_eq!(shape_of("continue :rows row"), "(continue :rows row)");
+fn continue_takes_its_arguments_as_a_call_does() {
+	assert_eq!(shape_of("continue(i + 1)"), "(continue (+ i 1))");
+	assert_eq!(shape_of("continue(i, 0)"), "(continue i 0)");
+	assert_eq!(shape_of("continue :rows(row)"), "(continue :rows row)");
+	assert_eq!(
+		shape_of("continue :rows({ row: row + 1 })"),
+		"(continue :rows (named (row (+ row 1))))"
+	);
+	assert_eq!(shape_of("continue()"), "(continue)");
 	assert_eq!(shape_of("continue :rows"), "(continue :rows)");
 	assert_eq!(shape_of("continue"), "(continue)");
+	// A value without parentheses is reported, and read as the argument.
+	let case = TestCase::new("func f() { continue i + 1 }");
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::ContinueArgumentsNeedParentheses]);
 }
 
 #[test]
@@ -1250,12 +1260,8 @@ fn a_named_list_is_an_expression_on_its_own() {
 		shape_of("({ i: i + 1, total })"),
 		"(named (i (+ i 1)) total)"
 	);
-	assert_eq!(
-		shape_of("continue :rows ({ row: row + 1 })"),
-		"(continue :rows (named (row (+ row 1))))"
-	);
 	// Named and positional values do not mix in one list, either way round.
-	for body in ["({ a: 1 }, 2)", "(1, { a: 2 })"] {
+	for body in ["f({ a: 1 }, 2)", "f(1, { a: 2 })", "continue({ a: 1 }, 2)"] {
 		let case = TestCase::new(&format!("func f() {{ {body} }}"));
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::MixedCallArguments]);
@@ -1323,21 +1329,13 @@ fn a_missing_expression_is_reported_once_where_it_was_expected() {
 }
 
 #[test]
-fn a_labelled_if_is_reported_and_read_as_a_labelled_block_around_it() {
+fn a_labelled_if_is_reported_and_read_without_its_label() {
 	let case =
 		TestCase::new("func f(c: bool) -> u8 { if :l c { 1 } else { 2 } }");
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::LabelOnIf]);
-	let Expression::Block {
-		label: Some(label),
-		block,
-	} = case.statement_expression(&case.function_block(0), 0)
-	else {
-		panic!("expected a labelled block")
-	};
-	assert_eq!(case.name(label.inner), "l");
 	assert!(matches!(
-		case.statement_expression(&case.entries(block), 0),
+		case.statement_expression(&case.function_block(0), 0),
 		Expression::IfElse { .. }
 	));
 }
@@ -1370,9 +1368,14 @@ fn an_ascription_is_only_an_element() {
 	// Inside braces, `:` still names an argument.
 	let case = TestCase::new("func f() { g({ x: 1 }) }");
 	case.diagnostics().assert_none();
+	let Expression::Call { arguments, .. } =
+		case.statement_expression(&case.function_block(0), 0)
+	else {
+		panic!("expected a call")
+	};
 	assert!(matches!(
-		case.statement_expression(&case.function_block(0), 0),
-		Expression::NamedCall { .. }
+		case.ast.argument_list(arguments),
+		ArgumentList::Named(_)
 	));
 }
 
@@ -1382,16 +1385,27 @@ impl TestCase {
 		&self,
 		expression: Expression,
 	) -> (&[PathSegment], &[NamedArgument]) {
-		let Expression::NamedCall {
-			callee, arguments, ..
-		} = expression
+		let Expression::Call { callee, arguments } = expression else {
+			panic!("expected a call")
+		};
+		let ArgumentList::Named(arguments) = self.ast.argument_list(arguments)
 		else {
 			panic!("expected a named call")
 		};
 		let Expression::Path(path) = self.ast.expr(callee) else {
 			panic!("expected a path callee")
 		};
-		(self.ast.list(path), self.ast.list(arguments))
+		(self.ast.list(path), arguments)
+	}
+
+	/// A positional argument list's arguments.
+	fn positional(&self, arguments: ExprId) -> &[ExprId] {
+		let ArgumentList::Positional(arguments) =
+			self.ast.argument_list(arguments)
+		else {
+			panic!("expected positional arguments")
+		};
+		arguments
 	}
 }
 
@@ -1419,13 +1433,16 @@ fn a_call_keeps_the_span_of_its_delimiters() {
 	let case = TestCase::new(source);
 	case.diagnostics().assert_none();
 	let statements = case.function_block(0);
-	let call = case.entry_expr(&statements, 0);
-	assert_eq!(case.ast.arguments_span(call).extract_str(source), "(1, 2)");
-	let call = case.entry_expr(&statements, 1);
-	assert_eq!(
-		case.ast.arguments_span(call).extract_str(source),
-		"{ a: 1 }"
-	);
+	let arguments = |at: usize| {
+		let Expression::Call { arguments, .. } =
+			case.ast.expr(case.entry_expr(&statements, at))
+		else {
+			panic!("expected a call")
+		};
+		case.ast.arguments_span(arguments).extract_str(source)
+	};
+	assert_eq!(arguments(0), "(1, 2)");
+	assert_eq!(arguments(1), "{ a: 1 }");
 }
 
 #[test]
@@ -1464,7 +1481,8 @@ fn test_named_call() {
 	// No arguments at all is the positional form.
 	assert!(matches!(
 		case.local_definition_value(&statements, 3),
-		Expression::Call { arguments, .. } if arguments.is_empty()
+		Expression::Call { arguments, .. }
+			if case.positional(arguments).is_empty()
 	));
 }
 
@@ -1485,9 +1503,12 @@ fn test_named_method_call_and_turbofish() {
 	assert_eq!(path[0].type_args.len(), 1);
 	assert_eq!(arguments.len(), 2);
 
-	let Expression::NamedCall {
-		callee, arguments, ..
-	} = case.statement_expression(&stmts, 1)
+	let Expression::Call { callee, arguments } =
+		case.statement_expression(&stmts, 1)
+	else {
+		panic!("expected a named method call")
+	};
+	let ArgumentList::Named(arguments) = case.ast.argument_list(arguments)
 	else {
 		panic!("expected a named method call")
 	};
@@ -1558,13 +1579,14 @@ fn a_plain_block_is_written_with_its_keyword() {
 		Expression::Block { label: Some(_), .. }
 	));
 
-	// Without the keyword, `{` is reported and still read as a block.
+	// Without the keyword, `{` is reported and read as the braces it is,
+	// which nothing jumps out of.
 	let case = TestCase::new("func f() { local x = { 1 }; }");
 	case.diagnostics()
 		.assert_codes(&[DiagnosticCode::BlockNeedsKeyword]);
 	assert!(matches!(
 		case.local_definition_value(&case.function_block(0), 0),
-		Expression::Block { .. }
+		Expression::BareBlock(_)
 	));
 }
 
@@ -1849,7 +1871,7 @@ fn test_call_field_namespace() {
 	else {
 		panic!("expected a call")
 	};
-	assert_eq!(arguments.len(), 2);
+	assert_eq!(case.positional(arguments).len(), 2);
 }
 
 #[test]
@@ -3204,7 +3226,7 @@ fn test_turbofish_call() {
 	else {
 		panic!("expected a call")
 	};
-	assert_eq!(arguments.len(), 1);
+	assert_eq!(case.positional(arguments).len(), 1);
 	let Expression::Path(segments) = case.ast.expr(callee) else {
 		panic!("expected a path callee")
 	};
@@ -3238,7 +3260,7 @@ fn test_turbofish_method_call() {
 	let method = case.ast.segment(member);
 	assert_eq!(case.name(method.ident.inner), "transform");
 	assert_eq!(method.type_args.len(), 1);
-	assert!(arguments.is_empty());
+	assert!(case.positional(arguments).is_empty());
 }
 
 #[test]
@@ -4985,10 +5007,7 @@ fn unfinished_calls_keep_the_cursor_and_the_following_statement() {
 			_ => panic!("no call in {call}"),
 		};
 		assert!(
-			matches!(
-				case.ast.expr(expr),
-				Expression::Call { .. } | Expression::NamedCall { .. }
-			),
+			matches!(case.ast.expr(expr), Expression::Call { .. }),
 			"{call}"
 		);
 		assert_eq!(

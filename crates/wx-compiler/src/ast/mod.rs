@@ -208,26 +208,19 @@ pub enum Expression {
 		left: ExprId,
 		right: ExprId,
 	},
-	/// `{expr}(a, b)`: a call, or the construction of a struct, by
-	/// position. A callee that is an [`Expression::ObjectAccess`] makes it
-	/// a method call (`x.m::<T>(a)`); a parenthesized one, `(x.f)(a)`, is a
-	/// call of the field's value. The arguments are spanned from the `(` at
-	/// `open` to the end of the call ([`AST::arguments_span`]).
+	/// `{expr}(a, b)` or `{expr}({ x: a, y })`: a call, or the
+	/// construction of a struct. `arguments` is its argument list
+	/// ([`AST::argument_list`]). A callee that is an
+	/// [`Expression::ObjectAccess`] makes it a method call (`x.m::<T>(a)`);
+	/// a parenthesized one, `(x.f)(a)`, is a call of the field's value.
 	Call {
 		callee: ExprId,
-		arguments: List<ExprId>,
-		open: TextOffset,
+		arguments: ExprId,
 	},
-	/// `{expr}({ x: a, y })`: the same, naming each parameter (or field).
-	/// The named list is the call's only argument, spanned by its braces.
-	NamedCall {
-		callee: ExprId,
-		arguments: List<NamedArgument>,
-		braces: TextSpan,
-	},
-	/// `({ x: a, y })`: a named list on its own, outside a call. It has no
-	/// type of its own; where its names are known (a loop's next state) it
-	/// is arranged by them. Spanned by its parentheses, the list by its
+	/// `({ x: a, y })`: a list by name, the named form of a
+	/// [`Expression::Tuple`]. Its names mean something only as a call's or
+	/// a `continue`'s arguments, where a declaration gives them; TIR reports
+	/// one anywhere else. Spanned by its parentheses, the list by its
 	/// braces.
 	NamedList {
 		arguments: List<NamedArgument>,
@@ -260,6 +253,10 @@ pub enum Expression {
 		label: Option<Spanned<SymbolU32>>,
 		block: BlockId,
 	},
+	/// `{ ... }` where an expression starts, without the `block` keyword:
+	/// reported, and read as its statements in a scope of their own. It is
+	/// no `Block`: nothing jumps out of it.
+	BareBlock(BlockId),
 	/// `break (:{label})? {expr}?`
 	Break {
 		label: Option<Spanned<SymbolU32>>,
@@ -277,11 +274,12 @@ pub enum Expression {
 		scrutinee: ExprId,
 		arms: List<MatchArm>,
 	},
-	/// `continue (:{label})? {expr}?`: the value is the next state of the
-	/// loop it restarts.
+	/// `continue (:{label})? ({arguments})?`: a call of the loop it
+	/// restarts, whose argument list ([`AST::argument_list`]) is its next
+	/// state. Without one it gives none, as `continue()` does.
 	Continue {
 		label: Option<Spanned<SymbolU32>>,
-		value: Option<ExprId>,
+		arguments: Option<ExprId>,
 	},
 	/// `loop :label { ... }`, or `loop :label (p: T = e) { ... }` with
 	/// parameters ([`LoopHeader`]).
@@ -316,7 +314,8 @@ pub enum Expression {
 		segments: List<PathSegment>,
 	},
 	/// `(a, b, c)`, `(a)`, `(a,)` or `()`: any parenthesized list, as
-	/// written. One element is that element, which TIR unwraps.
+	/// written, a call's positional arguments included. One element is that
+	/// element, which TIR unwraps.
 	Tuple {
 		elements: List<ExprId>,
 	},
@@ -344,6 +343,13 @@ pub enum Expression {
 }
 
 const _: () = assert!(size_of::<Expression>() <= 24);
+
+/// A call's or a `continue`'s arguments, by position or by name.
+#[derive(Clone, Copy)]
+pub enum ArgumentList<'a> {
+	Positional(&'a [ExprId]),
+	Named(&'a [NamedArgument]),
+}
 
 /// `name: expr`, or the shorthand `name` for `name: name`, in a named list.
 #[derive(Clone, Copy)]
@@ -486,6 +492,7 @@ impl Expression {
 		matches!(
 			self,
 			Expression::Block { .. }
+				| Expression::BareBlock(_)
 				| Expression::IfElse { .. }
 				| Expression::Loop { .. }
 				| Expression::Match { .. }
@@ -964,6 +971,7 @@ impl TraitItem {
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct FunctionSignature {
+	pub func_at: TextOffset,
 	pub name: Spanned<SymbolU32>,
 	/// Generic type parameters `<T, U: Bound>`. Empty = monomorphic.
 	pub type_params: List<TypeParam>,
@@ -1905,15 +1913,25 @@ impl AST {
 		TextSpan::new(start, start + text.len() as u32)
 	}
 
-	/// Where a call's arguments are written: from the `(` to the end of the
-	/// call for a positional list, the braces of a named one.
-	pub fn arguments_span(&self, id: ExprId) -> TextSpan {
-		match self.expr(id) {
-			Expression::Call { open, .. } => {
-				TextSpan::new(open, self.expr_span(id).end)
+	/// The argument list `arguments` of a call or a `continue`.
+	pub fn argument_list(&self, arguments: ExprId) -> ArgumentList<'_> {
+		match self.expr(arguments) {
+			Expression::Tuple { elements } => {
+				ArgumentList::Positional(self.list(elements))
 			}
-			Expression::NamedCall { braces, .. } => braces,
-			_ => unreachable!("only a call has arguments"),
+			Expression::NamedList { arguments, .. } => {
+				ArgumentList::Named(self.list(arguments))
+			}
+			_ => unreachable!("an argument list is a tuple or a named list"),
+		}
+	}
+
+	/// Where the argument list `arguments` is written: its parentheses when
+	/// positional, its braces when named.
+	pub fn arguments_span(&self, arguments: ExprId) -> TextSpan {
+		match self.expr(arguments) {
+			Expression::NamedList { braces, .. } => braces,
+			_ => self.expr_span(arguments),
 		}
 	}
 

@@ -11,14 +11,15 @@ use string_interner::symbol::SymbolU32;
 
 use super::calls::{NamedMatch, NamedOwner};
 use super::patterns::PatternContext;
-use super::{BodyBuilder, ScopeType};
+use super::{Arguments, BodyBuilder, OpenTarget, ScopeType};
+use crate::ast::ArgumentList;
 use crate::ast::{self, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextOffset, TextSpan};
 use crate::symbols::Keyword;
 use crate::tir::body::{
-	self, Body, ElementOrder, ExprIdx, ExprKind, ExprObligation, JumpTarget,
-	LocalIdx, Obligations, ParamIdx, ScopeIdx, ScopeKind, TargetIdx,
-	TargetKind,
+	self, Body, BodyOwner, ElementOrder, ExprIdx, ExprKind, ExprObligation,
+	JumpTarget, LocalIdx, Obligations, ParamIdx, ScopeIdx, ScopeKind,
+	TargetIdx, TargetKind,
 };
 use crate::tir::decls::{FunctionIdx, report_duplicate_parameter};
 use crate::tir::resolutions::{AccessKind, Reference, Site};
@@ -59,8 +60,8 @@ impl BodyBuilder<'_, '_> {
 			});
 			self.body.push_param(local);
 		}
-		self.build_block_in(ScopeIdx::ROOT, block, span, BlockResult::Value);
-		(self.body, self.obligations)
+		self.build_block_in(ScopeIdx::ROOT, block, span);
+		self.finish()
 	}
 
 	/// Enters a new scope inside the current one; `leave_scope` returns to
@@ -85,28 +86,41 @@ impl BodyBuilder<'_, '_> {
 		self.current = self.body.scope(scope).parent.unwrap();
 	}
 
-	/// Enters a jump target inside the current one, owning `scope`;
-	/// `leave_target` returns to its parent.
+	/// Enters a jump target inside the current one, owning `scope`, and
+	/// gives it the next index; `leave_target` returns to its parent.
 	fn enter_target(
 		&mut self,
 		kind: TargetKind,
-		keyword: TextOffset,
 		label: Option<Spanned<SymbolU32>>,
 		scope: ScopeIdx,
 	) -> TargetIdx {
-		let target = self.body.push_target(JumpTarget {
+		let count = self.open_targets.len() + self.finished_targets.len();
+		let index = TargetIdx::new(u32::try_from(count).unwrap());
+		self.open_targets.push(OpenTarget {
+			index,
 			kind,
-			keyword,
 			label,
-			parent: self.current_target,
 			scope,
 		});
-		self.current_target = Some(target);
-		target
+		index
 	}
 
-	fn leave_target(&mut self, target: TargetIdx) {
-		self.current_target = self.body.target(target).parent;
+	/// Leaves `target`, the innermost one, whose node is `construct`.
+	fn leave_target(&mut self, target: TargetIdx, construct: ExprIdx) {
+		let OpenTarget { index, label, .. } = self
+			.open_targets
+			.pop()
+			.expect("a target is left once entered");
+		debug_assert_eq!(index, target);
+		let parent = self.open_targets.last().map(|parent| parent.index);
+		self.finished_targets.push((
+			index,
+			JumpTarget {
+				label,
+				parent,
+				construct,
+			},
+		));
 	}
 
 	/// Declares a local in the current scope. It is visible from here on, and
@@ -132,7 +146,7 @@ impl BodyBuilder<'_, '_> {
 		span: TextSpan,
 	) -> ExprIdx {
 		let scope = self.enter_scope(ScopeKind::Ordinary, span, expected);
-		let block = self.build_block_in(scope, block, span, BlockResult::Value);
+		let block = self.build_block_in(scope, block, span);
 		self.leave_scope(scope);
 		block
 	}
@@ -146,10 +160,9 @@ impl BodyBuilder<'_, '_> {
 		span: TextSpan,
 	) -> ExprIdx {
 		let scope = self.enter_scope(ScopeKind::Ordinary, span, expected);
-		let target =
-			self.enter_target(TargetKind::Block, span.start, label, scope);
-		let block = self.build_block_in(scope, block, span, BlockResult::Value);
-		self.leave_target(target);
+		let target = self.enter_target(TargetKind::Block, label, scope);
+		let block = self.build_block_in(scope, block, span);
+		self.leave_target(target, block);
 		self.leave_scope(scope);
 		block
 	}
@@ -161,7 +174,6 @@ impl BodyBuilder<'_, '_> {
 		scope: ScopeIdx,
 		block: ast::BlockId,
 		span: TextSpan,
-		result_kind: BlockResult,
 	) -> ExprIdx {
 		let ast = self.ast();
 		let ast::Block { statements, tail } = ast.block(block);
@@ -169,12 +181,7 @@ impl BodyBuilder<'_, '_> {
 		let (built, flow) = self.build_statements(statements, result, span.end);
 		let result = result.map(|result| {
 			let hint = self.scope_hint(scope);
-			let value = match result_kind {
-				BlockResult::LoopState(target) => {
-					self.build_state(target, result, hint)
-				}
-				BlockResult::Value => self.build(result, hint),
-			};
+			let value = self.build(result, hint);
 			self.give(scope, value, true)
 		});
 		if result.is_none() {
@@ -702,18 +709,8 @@ impl BodyBuilder<'_, '_> {
 			self.pack(values, ElementOrder::InOrder, state, span)
 		});
 		let state = self.scope_types[usize::from(scope)].state;
-		let target =
-			self.enter_target(TargetKind::Loop, span.start, label, scope);
-		let body_scope =
-			self.enter_scope(ScopeKind::Ordinary, block_span, state);
-		let body = self.build_block_in(
-			body_scope,
-			block,
-			block_span,
-			BlockResult::LoopState(scope),
-		);
-		self.leave_scope(body_scope);
-		self.leave_target(target);
+		let target = self.enter_target(TargetKind::Loop, label, scope);
+		let body = self.build_block(block, state, block_span);
 		self.leave_scope(scope);
 		// A first state that never arrives never starts the loop.
 		let ty = match entry {
@@ -722,8 +719,11 @@ impl BodyBuilder<'_, '_> {
 			}
 			_ => self.scope_type(scope),
 		};
-		self.body
-			.push(ExprKind::Loop { scope, entry, body }, ty, span)
+		let construct =
+			self.body
+				.push(ExprKind::Loop { scope, entry, body }, ty, span);
+		self.leave_target(target, construct);
+		construct
 	}
 
 	/// Declares a loop's parameters in the current scope, the loop's, of
@@ -769,29 +769,9 @@ impl BodyBuilder<'_, '_> {
 		}
 	}
 
-	/// A next state given to the loop `target`: its body's result or a
-	/// `continue`'s value, positionally (`expected` hints it) or by name,
-	/// written directly. The caller holds it to the state.
-	fn build_state(
-		&mut self,
-		target: ScopeIdx,
-		value: ast::ExprId,
-		expected: TypeIndex,
-	) -> ExprIdx {
-		let ast = self.ast();
-		match ast.expr(value) {
-			ast::Expression::NamedList { arguments, .. } => self
-				.build_named_state(
-					target,
-					ast.list(arguments),
-					ast.expr_span(value),
-				),
-			_ => self.build(value, expected),
-		}
-	}
-
-	/// `({ b: 2, a })` as the state of the loop `target`: each value gives the
-	/// parameter of its name (`match_names`), held to its type.
+	/// `continue({ b: 2, a })`, a call by name of the loop `target`: each
+	/// value gives the parameter of its name (`match_names`), held to its
+	/// type.
 	fn build_named_state(
 		&mut self,
 		target: ScopeIdx,
@@ -870,7 +850,7 @@ impl BodyBuilder<'_, '_> {
 			}
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
-		let scope = self.body.target(target).scope;
+		let scope = target.scope;
 		let value = value.map(|value| {
 			let hint = self.scope_hint(scope);
 			let value = self.build(value, hint);
@@ -880,39 +860,54 @@ impl BodyBuilder<'_, '_> {
 			self.give_unit(scope, span);
 		}
 		self.body.push(
-			ExprKind::Break { target, value },
+			ExprKind::Break {
+				target: target.index,
+				value,
+			},
 			TypeIndex::NEVER,
 			span,
 		)
 	}
 
-	/// `continue`, restarting the nearest loop, or the loop `label` names,
-	/// with `value` as its next state (`()` without one).
+	/// `continue`, restarting the nearest loop, or the loop `label` names: a
+	/// call of it, whose arguments are its next state, by position or by
+	/// name. Without any (`continue`, `continue()`) the state is `()`.
 	pub(super) fn build_continue(
 		&mut self,
 		label: Option<Spanned<SymbolU32>>,
-		value: Option<ast::ExprId>,
+		arguments: Option<Arguments<'_>>,
 		span: TextSpan,
 	) -> ExprIdx {
+		let arguments = arguments.filter(|arguments| {
+			!matches!(arguments.kind, ArgumentList::Positional([]))
+		});
 		let Some(target) = self.jump_target(label, span, Jump::Continue) else {
-			// Its value is still checked, against nothing.
-			if let Some(value) = value {
-				let ast = self.ast();
-				match ast.expr(value) {
-					ast::Expression::NamedList { arguments, .. } => self
-						.build_named_values(
-							ast.list(arguments),
-							ast.expr_span(value),
-						),
-					_ => self.build(value, TypeIndex::ERROR),
-				};
+			// Its arguments are still checked, against nothing.
+			match arguments.map(|arguments| (arguments.kind, arguments.span)) {
+				Some((ArgumentList::Positional(values), _)) => {
+					for &value in values {
+						self.build(value, TypeIndex::ERROR);
+					}
+				}
+				Some((ArgumentList::Named(arguments), span)) => {
+					self.build_named_values(arguments, span);
+				}
+				None => {}
 			}
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
-		let scope = self.body.target(target).scope;
+		let scope = target.scope;
 		let state = self.scope_types[usize::from(scope)].state;
-		let value = value.map(|value| {
-			let value = self.build_state(scope, value, state);
+		let value = arguments.map(|arguments| {
+			// The list is one value of the parameters, as a call's is.
+			let value = match arguments.kind {
+				ArgumentList::Positional(values) => {
+					self.build_tuple(values, state, arguments.span)
+				}
+				ArgumentList::Named(named) => {
+					self.build_named_state(scope, named, arguments.span)
+				}
+			};
 			self.expect(value, state)
 		});
 		if value.is_none()
@@ -924,7 +919,10 @@ impl BodyBuilder<'_, '_> {
 			self.sema.diagnostics.push(diagnostic);
 		}
 		self.body.push(
-			ExprKind::Continue { target, value },
+			ExprKind::Continue {
+				target: target.index,
+				value,
+			},
 			TypeIndex::NEVER,
 			span,
 		)
@@ -944,6 +942,15 @@ impl BodyBuilder<'_, '_> {
 		if value.is_none() {
 			self.give_unit(ScopeIdx::ROOT, span);
 		}
+		if let BodyOwner::Function(function) = self.owner {
+			self.sema.resolutions.record(
+				Site::Label(SourceSpan::new(
+					self.scope.file_id,
+					Keyword::Return.span_at(span.start),
+				)),
+				Reference::Return { function },
+			);
+		}
 		self.body
 			.push(ExprKind::Return { value }, TypeIndex::NEVER, span)
 	}
@@ -957,19 +964,12 @@ impl BodyBuilder<'_, '_> {
 		label: Option<Spanned<SymbolU32>>,
 		span: TextSpan,
 		jump: Jump,
-	) -> Option<TargetIdx> {
+	) -> Option<OpenTarget> {
 		if label.is_some_and(|name| name.inner == Keyword::Error.symbol()) {
 			return None;
 		}
-		let mut at = self.current_target;
-		while let Some(target) = at {
-			let JumpTarget {
-				kind,
-				label: target_label,
-				parent,
-				..
-			} = *self.body.target(target);
-			let found = match (label, target_label) {
+		let found = self.open_targets.iter().rev().copied().find(|open| {
+			match (label, open.label) {
 				(Some(name), Some(target_label)) => {
 					target_label.inner == name.inner
 				}
@@ -978,23 +978,21 @@ impl BodyBuilder<'_, '_> {
 				// nearest loop.
 				(None, _) => match jump {
 					Jump::Break => true,
-					Jump::Continue => kind == TargetKind::Loop,
+					Jump::Continue => open.kind == TargetKind::Loop,
 				},
-			};
-			if !found {
-				at = parent;
-				continue;
 			}
+		});
+		if let Some(target) = found {
 			if let Some(name) = label {
 				self.sema.resolutions.record(
 					Site::Label(SourceSpan::new(self.scope.file_id, name.span)),
 					Reference::Label {
 						owner: self.owner,
-						target,
+						target: target.index,
 					},
 				);
 			}
-			if jump == Jump::Continue && kind != TargetKind::Loop {
+			if jump == Jump::Continue && target.kind != TargetKind::Loop {
 				self.sema.diagnostics.push(
 					Diagnostic::error()
 						.with_code(DiagnosticCode::ContinueOutsideOfLoop.code())
@@ -1008,10 +1006,7 @@ impl BodyBuilder<'_, '_> {
 					self.scope.file_id,
 					jump.keyword().span_at(span.start),
 				)),
-				Reference::Jump {
-					owner: self.owner,
-					target,
-				},
+				jump.reference(self.owner, target.index),
 			);
 			return Some(target);
 		}
@@ -1130,16 +1125,6 @@ enum StatementFlow {
 	Unknown,
 }
 
-/// What a block's tail is.
-#[derive(Clone, Copy)]
-enum BlockResult {
-	/// The block's value.
-	Value,
-	/// The next state of the loop whose parameters the scope declares: the
-	/// block is its body.
-	LoopState(ScopeIdx),
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Jump {
 	Break,
@@ -1151,6 +1136,14 @@ impl Jump {
 		match self {
 			Jump::Break => Keyword::Break,
 			Jump::Continue => Keyword::Continue,
+		}
+	}
+
+	/// What its keyword refers to: `target`, of the body `owner`.
+	fn reference(self, owner: BodyOwner, target: TargetIdx) -> Reference {
+		match self {
+			Jump::Break => Reference::Break { owner, target },
+			Jump::Continue => Reference::Continue { owner, target },
 		}
 	}
 }

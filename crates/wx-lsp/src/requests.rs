@@ -87,15 +87,35 @@ pub(crate) fn hover(
 	let (snapshot, file) = state.resolve_uri(&position.text_document.uri)?;
 	let files = &snapshot.compilation.files;
 	let offset = position_to_offset(files, file, position.position)?;
-	let (name, definition) = snapshot.definition_at(file, offset)?;
-	let signature =
-		hover::signature(&snapshot.sema, &snapshot.strings, definition)?;
-	let signature =
-		match hover::owner(&snapshot.sema, &snapshot.strings, definition) {
-			Some(owner) => format!("{owner}\n{signature}"),
-			None => signature,
-		};
-	let doc = hover::documentation(&snapshot.sema, files, definition);
+	// A jump is a use of what it leaves with a signature of its own, and a
+	// branch has one without referring to anything.
+	let construct = query::symbol_at(&snapshot.sema, file, offset)
+		.and_then(|(name, reference)| {
+			hover::jump(&snapshot.sema, &snapshot.strings, reference)
+				.map(|signature| (name, signature))
+		})
+		.or_else(|| hover::branch(snapshot, file, offset));
+	let (name, signature, doc) = match construct {
+		Some((name, signature)) => (name, signature, None),
+		None => {
+			let (name, definition) = snapshot.definition_at(file, offset)?;
+			let signature = hover::signature(
+				&snapshot.sema,
+				&snapshot.strings,
+				definition,
+			)?;
+			let signature = match hover::owner(
+				&snapshot.sema,
+				&snapshot.strings,
+				definition,
+			) {
+				Some(owner) => format!("{owner}\n{signature}"),
+				None => signature,
+			};
+			let doc = hover::documentation(&snapshot.sema, files, definition);
+			(name, signature, doc)
+		}
+	};
 	let value = match doc {
 		Some(doc) => format!("```wx\n{signature}\n```\n\n---\n\n{doc}"),
 		None => format!("```wx\n{signature}\n```"),

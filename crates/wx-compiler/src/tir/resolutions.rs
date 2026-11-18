@@ -173,9 +173,14 @@ pub enum Reference {
 	/// The label of a jump target of the body `owner`, named by a `break`
 	/// or `continue`.
 	Label { owner: BodyOwner, target: TargetIdx },
-	/// A `break` or `continue` keyword: the jump target of the body `owner`
-	/// it leaves or restarts, whether or not a label names it.
-	Jump { owner: BodyOwner, target: TargetIdx },
+	/// A `break` keyword: the jump target of the body `owner` it leaves,
+	/// whether or not a label names it.
+	Break { owner: BodyOwner, target: TargetIdx },
+	/// A `continue` keyword: the loop of the body `owner` it restarts; see
+	/// `Break`.
+	Continue { owner: BodyOwner, target: TargetIdx },
+	/// A `return` keyword: the function whose body it leaves.
+	Return { function: FunctionIdx },
 	/// `Self` inside an inherent impl, which names the impl's target and is
 	/// not a parameter of it.
 	InherentImplSelf(InherentImplIdx),
@@ -242,6 +247,9 @@ pub enum Definition {
 		owner: BodyOwner,
 		target: TargetIdx,
 	},
+	/// A function's body, which a `return` leaves; declared by its `func`
+	/// keyword.
+	FunctionBody(FunctionIdx),
 	/// What `Self` names in an inherent impl: the target type written in its
 	/// header.
 	InherentImplTarget(InherentImplIdx),
@@ -286,8 +294,12 @@ impl Reference {
 			Reference::Label { owner, target } => {
 				Definition::Label { owner, target }
 			}
-			Reference::Jump { owner, target } => {
+			Reference::Break { owner, target }
+			| Reference::Continue { owner, target } => {
 				Definition::JumpTarget { owner, target }
+			}
+			Reference::Return { function } => {
+				Definition::FunctionBody(function)
 			}
 			Reference::InherentImplSelf(index) => {
 				Definition::InherentImplTarget(index)
@@ -338,10 +350,17 @@ impl Semantics {
 				Some(SourceSpan::new(self.owner_file(owner), label.span))
 			}
 			Definition::JumpTarget { owner, target } => {
-				let target = self.owner_body(owner)?.target(target);
+				let body = self.owner_body(owner)?;
 				Some(SourceSpan::new(
 					self.owner_file(owner),
-					target.keyword_span(),
+					body.target_keyword_span(target),
+				))
+			}
+			Definition::FunctionBody(function) => {
+				let decl = &decls.functions[usize::from(function)];
+				Some(SourceSpan::new(
+					decls.file_id(decl.loc),
+					Keyword::Func.span_at(decl.func_at),
 				))
 			}
 			Definition::Local { owner, local } => {

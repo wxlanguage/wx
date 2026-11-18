@@ -7,8 +7,11 @@ loop's parameters (`loop (i: u32 = 0, total = n) { .. }`, each iteration
 entered with the next state, given by the body's value or `continue`'s,
 positionally or by name), lowered to Wasm loop parameters. Revised the same
 day: each parameter takes its own initial value, in place of one initializer
-for the whole state (`loop (i, total) = (0, n)`). Open: whether `while` takes
-parameters.
+for the whole state (`loop (i, total) = (0, n)`). Revised 2026-11-18:
+`continue` is a call of the loop it restarts, `continue(args)`, whose argument
+list, by position or by name, is the next state; the body's result gives it
+by position only, as any block's result is a value (see "`continue` is a
+call"). Open: whether `while` takes parameters.
 
 ## Problem
 
@@ -171,8 +174,8 @@ loop :label (a: A = x, b = y, mut c: C = z) { body }
 - **The state's type** is the tuple of the parameters' types, one parameter's
   type for one parameter, `()` for none. It is fixed by the header.
 - **The body's value is the next state.** Falling off the end of the body
-  starts the next iteration with the body's result; `continue v` starts it
-  with `v`. Either way the whole state is given.
+  starts the next iteration with the body's result; `continue(a, b)` starts
+  it with its arguments. Either way the whole state is given.
 - **The parameters hold the current state for one iteration.** They are
   immutable unless `mut`, which lets the body assign them within the
   iteration; the next iteration still takes its state from the body's value,
@@ -182,25 +185,26 @@ loop :label (a: A = x, b = y, mut c: C = z) { body }
 - **Their scope is the loop's body**, and nothing after it.
 
 A loop without parameters is the case of the state `()`: its result is `()`,
-and a bare `continue` is `continue ()`.
+and a bare `continue` is `continue()`.
 
 Each iteration is entered like a call of the body, with the header as its
 parameters: the initial values are the arguments of the first call, and the
-body's result and `continue`'s value those of each next one. Writing each
+body's result and `continue`'s arguments those of each next one. Writing each
 initial value beside its parameter keeps a name, its type and where it starts
 together, as `local i: u32 = 0` does, instead of matching a header's
 positions against a separate tuple.
 
 ### Giving the next state
 
-The next state is a whole value, given in one of two forms, as a call's
-arguments are:
+The next state is a whole value. The body's result gives it by position, as a
+value of the state's type: `(i + 1, total + x)`, or `i + 1` for one
+parameter. `continue` gives it as a call's arguments, in one of two forms:
 
-- **Positionally**, as a value of the state's type: `(i + 1, total + x)`, or
-  `i + 1` for one parameter (a one-element tuple is its element).
-- **By name**, as a named list: `({ i: i + 1, total: total + x })`, with the
-  shorthand `({ i: i + 1, total })` for a value handed on unchanged. Each name
-  is a parameter of the loop.
+- **Positionally**: `continue(i + 1, total + x)`. As in a call, a lone
+  parameter takes the whole list (`continue(a, b)` for one tuple parameter).
+- **By name**: `continue({ i: i + 1, total: total + x })`, with the
+  shorthand `continue({ i: i + 1, total })` for a value handed on unchanged.
+  Each name is a parameter of the loop.
 
 The named form follows the rules of a call by name, with the same
 diagnostics: every name is required (E2122 for a missing one), an unknown name
@@ -212,34 +216,29 @@ state share their matching (`match_names` in `tir/typecheck/calls.rs`).
 All of the next state is computed before any parameter takes it, so the
 update is simultaneous: `(b, a + b)` reads the old `a` and `b`.
 
-### `({ .. })`: parsed anywhere, meaningful only written directly
+### `continue` is a call
 
-A parenthesized list that starts with `{` is a named list, and the parser
-accepts it wherever an expression can start. It has no type of its own: tuple
-types have no names, so no expected type can say what its names mean. The
-checker gives its names a meaning only where it is written directly as a
-loop's next state:
+A loop's header declares a signature, as a function's parameter list does,
+and `continue` calls it: its target supplies the names a named list gives, as
+a call's callee does. A block's result, a `break`'s value and a `return`'s
+are only values of a type, and tuple types have no names, so none of them can
+say what a name means.
 
-- the body's result, and
-- `continue`'s value, naming that loop (or the nearest one).
-
-Anywhere else it is E2144, with its values still checked. That includes a
-named list in a branch of an `if` or `match` that is the body's result, and
-one in parentheses (`(({ .. }))`, a one-element tuple). A branch gives the
-state by name with `continue`:
+A named list `({ .. })` is parsed wherever a tuple is, as the named form of a
+parenthesized list. A call and a `continue` hold their argument list as one
+expression node, a `Tuple` or a `NamedList` (`AST::argument_list`). The
+checker gives a named list's names a meaning only there; anywhere else,
+including a loop body's result and one in parentheses inside the arguments
+(`continue(({ .. }))`), it is E2144, with its values still checked. A branch
+gives the state by name with `continue`:
 
 ```wx
 match arr[mid].cmp(target) {
-    Ordering::Less => continue ({ low: mid + 1, high }),
-    Ordering::Greater => continue ({ low, high: mid }),
+    Ordering::Less => continue({ low: mid + 1, high }),
+    Ordering::Greater => continue({ low, high: mid }),
     Ordering::Equal => return (True, mid),
 }
 ```
-
-Letting the names flow through branches as the expected type does would take
-a context carried beside every expected type, for this one use. If the type
-system gains types that carry names, a named list could be checked against
-them like any value, and this restriction would fall away.
 
 ### Parsing
 
@@ -247,8 +246,9 @@ The parser reads an optional label, then a parameter list if the next token
 is not `{`, then the block. Each parameter is read with the parameter list's
 own slot parser (`parse_binding_and_type`, the same recovery), then `=` and
 its initial value; a missing one is reported (E1010) and kept as an error
-node. `continue` takes an optional value after its optional label, as `break`
-does.
+node. `continue` takes an optional argument list after its optional label,
+parenthesized as a call's: a value written without parentheses is E1031, and
+read as the one argument.
 
 The AST's `LoopHeader` holds two lists, the parameters (a
 `List<FunctionParam>`) and their initial values (a `List<ExprId>`), in the
@@ -320,7 +320,7 @@ loop (i: u32 = 0) {
 func sum(xs: heap::&[u32]) -> u32 {
     loop (i: u32 = 0, total: u32 = 0) {
         if i == xs.len() { break total };
-        ({ i: i + 1, total: total + xs[i] })
+        continue({ i: i + 1, total: total + xs[i] })
     }
 }
 ```
@@ -333,9 +333,9 @@ loop (next: u32 = 0, start: u32 = 0, at: u32 = 0) {
     if at == text.len() { break };
     if text[at] == '\0' {
         arguments[next] = slices::slice_at(text, start, at - start);
-        continue ({ next: next + 1, start: at + 1, at: at + 1 });
+        continue({ next: next + 1, start: at + 1, at: at + 1 });
     }
-    ({ next, start, at: at + 1 })
+    continue({ next, start, at: at + 1 })
 }
 ```
 
@@ -351,7 +351,7 @@ loop (mut next: u32 = 0, mut start: u32 = 0, mut at: u32 = 0) {
         start = at + 1;
     }
     at += 1;
-    ({ next, start, at })
+    continue({ next, start, at })
 }
 ```
 
@@ -374,9 +374,9 @@ loop :rows (row: u32 = 0) {
     if row == height { break };
     loop (col: u32 = 0) {
         if col == width { break };
-        if skip(row, col) { continue col + 1 };
+        if skip(row, col) { continue(col + 1) };
         if done(row, col) { break :rows };
-        if next_row(row, col) { continue :rows row + 1 };
+        if next_row(row, col) { continue :rows(row + 1) };
         visit(row, col);
         col + 1
     }
@@ -400,10 +400,10 @@ loop :rows (row: u32 = 0) {
    body's end). A body whose every path breaks, returns or continues is `!`,
    and fits.
 5. **A bare `continue` in a loop with parameters is a mismatch**, as
-   `continue ()` against the state's type. It never means "carry on
+   `continue()` against the state's type. It never means "carry on
    unchanged".
 6. **A labelled `continue` gives the named loop's state**
-   (`continue :rows row + 1` from an inner loop), and a named list there takes
+   (`continue :rows(row + 1)` from an inner loop), and a named list there takes
    that loop's names.
 7. **The state is not the loop's value.** The loop's type is what its
    `break`s give, `!` without one.

@@ -808,6 +808,8 @@ pub struct FunctionDecl {
 	/// Its row, in the table of the scope it, or its trait or impl, is
 	/// written in.
 	pub loc: ItemLoc,
+	/// Where its `func` keyword is written.
+	pub func_at: TextOffset,
 	pub owner: MemberOwner,
 	/// Its parameters' run of `Declarations::params`.
 	pub params: ParamRange,
@@ -3823,6 +3825,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				);
 				self.functions.push(FunctionDecl {
 					loc,
+					func_at: signature.func_at,
 					owner: MemberOwner::Free,
 					params,
 					function_impls,
@@ -4322,6 +4325,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 							);
 							self.functions.push(FunctionDecl {
 								loc,
+								func_at: signature.func_at,
 								owner: MemberOwner::Trait(trait_index),
 								params,
 								function_impls,
@@ -4561,6 +4565,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 							);
 							self.functions.push(FunctionDecl {
 								loc,
+								func_at: signature.func_at,
 								owner: MemberOwner::InherentImpl(block_index),
 								params,
 								function_impls,
@@ -4808,6 +4813,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 							);
 							self.functions.push(FunctionDecl {
 								loc,
+								func_at: signature.func_at,
 								owner: MemberOwner::Free,
 								params,
 								function_impls,
@@ -5057,6 +5063,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 							);
 							self.functions.push(FunctionDecl {
 								loc,
+								func_at: signature.func_at,
 								owner: MemberOwner::TraitImpl(block_index),
 								params,
 								function_impls,

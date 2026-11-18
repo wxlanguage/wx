@@ -16,7 +16,7 @@
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 
 use super::calls::{Callee, Dispatch};
-use super::{ArgumentList, Arguments, BodyBuilder};
+use super::{Arguments, BodyBuilder};
 use crate::ast::{self, Ownership};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceKind};
@@ -393,25 +393,9 @@ impl BodyBuilder<'_, '_> {
 		let ast = self.ast();
 		let span = ast.expr_span(object);
 		match ast.expr(object) {
-			ast::Expression::Call {
-				callee, arguments, ..
-			} => self.build_call(
+			ast::Expression::Call { callee, arguments } => self.build_call(
 				callee,
-				Arguments {
-					kind: ArgumentList::Positional(ast.list(arguments)),
-					span: ast.arguments_span(object),
-				},
-				Expected::Receiver(receiver_of),
-				span,
-			),
-			ast::Expression::NamedCall {
-				callee, arguments, ..
-			} => self.build_call(
-				callee,
-				Arguments {
-					kind: ArgumentList::Named(ast.list(arguments)),
-					span: ast.arguments_span(object),
-				},
+				Arguments::of(ast, arguments),
 				Expected::Receiver(receiver_of),
 				span,
 			),

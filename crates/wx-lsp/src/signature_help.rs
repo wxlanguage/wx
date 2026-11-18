@@ -6,7 +6,7 @@ use tower_lsp_server::ls_types::{
 	Documentation, MarkupContent, MarkupKind, ParameterInformation,
 	ParameterLabel, SignatureHelp, SignatureHelpParams, SignatureInformation,
 };
-use wx_compiler::ast::{ExprId, Expression};
+use wx_compiler::ast::{ArgumentList, ExprId, Expression};
 use wx_compiler::tir::{DeclKind, Definition, Type};
 
 use crate::call;
@@ -37,27 +37,27 @@ pub(crate) fn signature_help(
 	}
 	// A child is stored before its parent. Choosing the narrowest argument
 	// list finds the innermost call, even when the surrounding file is broken.
-	let call = (0..ast.exprs.kinds.len())
+	let (call, arguments) = (0..ast.exprs.kinds.len())
 		.map(|index| ExprId(index as u32))
-		.filter(|&expr| {
-			let (close, last) = match ast.expr(expr) {
-				Expression::Call { arguments, .. } => (
-					')',
-					ast.list(arguments)
-						.last()
-						.map(|&arg| ast.expr_span(arg).end),
-				),
-				Expression::NamedCall { arguments, .. } => (
+		.filter_map(|expr| match ast.expr(expr) {
+			Expression::Call { arguments, .. } => Some((expr, arguments)),
+			_ => None,
+		})
+		.filter(|&(_, arguments)| {
+			let (close, last) = match ast.argument_list(arguments) {
+				ArgumentList::Positional(values) => {
+					(')', values.last().map(|&arg| ast.expr_span(arg).end))
+				}
+				ArgumentList::Named(named) => (
 					'}',
-					ast.list(arguments).last().map(|arg| {
+					named.last().map(|arg| {
 						arg.value.map_or(arg.name.span.end, |value| {
 							ast.expr_span(value).end
 						})
 					}),
 				),
-				_ => return false,
 			};
-			let span = ast.arguments_span(expr);
+			let span = ast.arguments_span(arguments);
 			let closed = source[..usize::from(span.end)].ends_with(close)
 				&& last.is_none_or(|last| last < span.end)
 				&& !comments.iter().any(|comment| {
@@ -67,8 +67,8 @@ pub(crate) fn signature_help(
 			span.start < offset
 				&& (offset < span.end || (!closed && offset == span.end))
 		})
-		.min_by_key(|&expr| {
-			let span = ast.arguments_span(expr);
+		.min_by_key(|&(_, arguments)| {
+			let span = ast.arguments_span(arguments);
 			span.end - span.start
 		})?;
 	let owner = snapshot.expression_owner(file, call)?;
@@ -79,10 +79,8 @@ pub(crate) fn signature_help(
 		ast,
 		call,
 	)?;
-	let callee = match ast.expr(call) {
-		Expression::Call { callee, .. }
-		| Expression::NamedCall { callee, .. } => callee,
-		_ => unreachable!(),
+	let Expression::Call { callee, .. } = ast.expr(call) else {
+		unreachable!()
 	};
 	let name = match ast.expr(callee) {
 		Expression::Path(segments)
@@ -96,9 +94,8 @@ pub(crate) fn signature_help(
 			.to_owned(),
 		_ => ast.expr_span(callee).extract_str(source).trim().to_owned(),
 	};
-	let active = match ast.expr(call) {
-		Expression::NamedCall { arguments, .. } => ast
-			.list(arguments)
+	let active = match ast.argument_list(arguments) {
+		ArgumentList::Named(arguments) => arguments
 			.iter()
 			.find(|arg| {
 				arg.name.span.start <= offset
@@ -113,8 +110,7 @@ pub(crate) fn signature_help(
 					.iter()
 					.position(|(name, _)| *name == Some(arg.name.inner))
 			}),
-		Expression::Call { arguments, .. } => {
-			let arguments = ast.list(arguments);
+		ArgumentList::Positional(arguments) => {
 			if signature.parameters.len() > 1 && signature.whole_argument {
 				None
 			} else if signature.parameters.len() == 1
@@ -148,7 +144,6 @@ pub(crate) fn signature_help(
 				(at < signature.parameters.len()).then_some(at)
 			}
 		}
-		_ => unreachable!(),
 	};
 	let formatter = snapshot.sema.type_formatter(&snapshot.strings);
 	let prefix = match signature.definition {

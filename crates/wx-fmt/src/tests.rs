@@ -2774,18 +2774,30 @@ impl Roles<'_> {
 				}
 			}
 			(
-				E::NamedCall {
+				E::Call {
 					callee: ac,
 					arguments: a,
-					..
 				},
-				E::NamedCall {
+				E::Call {
 					callee: bc,
 					arguments: b,
-					..
 				},
 			) => {
 				self.expr(ac, bc);
+				self.expr(a, b);
+			}
+			(
+				E::Continue { arguments: a, .. },
+				E::Continue { arguments: b, .. },
+			) => {
+				if let (Some(a), Some(b)) = (a, b) {
+					self.expr(a, b);
+				}
+			}
+			(
+				E::NamedList { arguments: a, .. },
+				E::NamedList { arguments: b, .. },
+			) => {
 				let (a, b) = (self.a.list(a), self.b.list(b));
 				assert_eq!(a.len(), b.len());
 				for (a, b) in a.iter().zip(b) {
@@ -3790,10 +3802,10 @@ fn loop_parameters_and_a_continue_value_are_printed_after_their_labels() {
 	let source = indoc! {"
         func f(n: u32) -> u32 {
             loop :rows (mut a: u32 = 0, b = n) {
-                if a == b { continue :rows (a, b + 1) };
+                if a == b { continue :rows(a, b + 1) };
                 loop (i = (0: u32)) {
                     if i == n { break };
-                    continue i + 1;
+                    continue(i + 1);
                 }
                 (b, a)
             }
@@ -3802,8 +3814,8 @@ fn loop_parameters_and_a_continue_value_are_printed_after_their_labels() {
 	assert_eq!(checked_format(source, 80, 4), source);
 	for (source, expected) in [
 		(
-			"loop(i:u32=0){ continue  i+1 }",
-			"loop (i: u32 = 0) { continue i + 1 }",
+			"loop(i:u32=0){ continue ( i+1 ) }",
+			"loop (i: u32 = 0) { continue(i + 1) }",
 		),
 		("loop (i: u32 = 0,) { }", "loop (i: u32 = 0) {}"),
 		// No parameters are no list.
@@ -3845,7 +3857,7 @@ fn loop_parameters_too_long_for_a_line_are_printed_one_per_line() {
 fn a_named_list_is_printed_as_a_call_by_names_arguments() {
 	for (source, expected) in [
 		("({i:i+1,total})", "({ i: i + 1, total })"),
-		("continue :l ({ i })", "continue :l ({ i })"),
+		("continue :l ({ i })", "continue :l({ i })"),
 	] {
 		assert_eq!(
 			checked_format(&format!("func f() {{ {source} }}"), 80, 4),
@@ -3855,7 +3867,7 @@ fn a_named_list_is_printed_as_a_call_by_names_arguments() {
 	// Too long: one name per line, the braces hugging the parentheses.
 	let source = indoc! {"
         func f() {
-            continue ({
+            continue({
                 next: next_index + 1,
                 start: at_position + 1,
                 at: at_position + 1,

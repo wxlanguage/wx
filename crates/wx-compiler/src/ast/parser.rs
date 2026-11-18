@@ -1358,6 +1358,7 @@ impl<'ctx> Parser<'ctx> {
 
 		Ok(Spanned {
 			inner: FunctionSignature {
+				func_at: fn_span.span.start,
 				name,
 				type_params,
 				params: params.inner,
@@ -2418,7 +2419,7 @@ impl<'ctx> Parser<'ctx> {
 				Ok(self.ast.push_expr(Expression::Char, span))
 			}
 			Token::OpenBrace => self.parse_bare_block_expression(),
-			Token::OpenParen => self.parse_tuple_expression(),
+			Token::OpenParen => self.parse_argument_list(),
 			Token::OpenBracket => self.parse_array_expression(),
 			Token::LeftArrow => self.parse_qualified_path_expression(),
 			Token::Minus | Token::Bang | Token::Caret => {
@@ -2751,14 +2752,16 @@ impl<'ctx> Parser<'ctx> {
 				.with_label(Label::primary(self.file_id, span))
 				.with_note("write `Name({ field: value, ... })`"),
 		);
-		Ok(self.ast.push_expr(
-			Expression::NamedCall {
-				callee,
+		let arguments = self.ast.push_expr(
+			Expression::NamedList {
 				arguments: named.inner,
 				braces: named.span,
 			},
-			span,
-		))
+			named.span,
+		);
+		Ok(self
+			.ast
+			.push_expr(Expression::Call { callee, arguments }, span))
 	}
 
 	fn parse_object_access_expression(
@@ -2964,29 +2967,54 @@ impl<'ctx> Parser<'ctx> {
 		))
 	}
 
+	/// `continue`, with its label and its argument list as a call's. A value
+	/// written without parentheses is reported, and read as the one
+	/// argument it stands for.
 	fn parse_continue_expression(&mut self) -> Result<ExprId, ()> {
 		let continue_keyword = self.lexer.next();
 		let label = self.parse_label();
 		let token = self.lexer.peek();
-		let value = if Self::starts_expression(token.inner) {
-			Some(self.parse_expression(BindingPower::Default)?)
+		let arguments = if token.inner == Token::OpenParen {
+			Some(self.parse_argument_list()?)
+		} else if Self::starts_expression(token.inner) {
+			let value = self.parse_expression(BindingPower::Default)?;
+			let span = self.ast.exprs.spans[usize::from(value)];
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(
+						DiagnosticCode::ContinueArgumentsNeedParentheses.code(),
+					)
+					.with_message(
+						"the arguments of `continue` are written in parentheses",
+					)
+					.with_label(Label::primary(self.file_id, span))
+					.with_note(
+						"`continue` is called as a function is: `continue(a, b)`",
+					),
+			);
+			let elements = self.ast.push_list([value]);
+			Some(self.ast.push_expr(Expression::Tuple { elements }, span))
 		} else {
 			None
 		};
-		let end = match (label, value) {
-			(_, Some(value)) => self.ast.exprs.spans[usize::from(value)].end,
+		let end = match (label, arguments) {
+			(_, Some(arguments)) => {
+				self.ast.exprs.spans[usize::from(arguments)].end
+			}
 			(Some(label), None) => label.span.end,
 			(None, None) => continue_keyword.span.end,
 		};
 		Ok(self.ast.push_expr(
-			Expression::Continue { label, value },
+			Expression::Continue { label, arguments },
 			TextSpan::new(continue_keyword.span.start, end),
 		))
 	}
 
-	/// `(a, b)`, or a named list `({ x: a, y })`, decided on the token after
-	/// `(` as a call's arguments are.
-	fn parse_tuple_expression(&mut self) -> Result<ExprId, ()> {
+	/// A parenthesized list, a call's arguments or a tuple, `(a, b)` or
+	/// `({ x: a, y })`, decided on the token after `(`: `{` opens a named list (a plain block is spelled
+	/// `block { }`, so nothing else starts with `{` here), anything else a
+	/// positional one.
+	fn parse_argument_list(&mut self) -> Result<ExprId, ()> {
 		let open = self.next_expect(Token::OpenParen)?.span;
 		if self.lexer.peek().inner == Token::OpenBrace {
 			let (arguments, end) = self.parse_named_call_arguments(open)?;
@@ -3102,7 +3130,8 @@ impl<'ctx> Parser<'ctx> {
 
 	/// `{ ... }` where an expression starts: the plain block without its
 	/// keyword. `{` is reserved for named arguments in a call, so this is
-	/// reported, and read as the block it was meant to be.
+	/// reported, and read as the braces it is: no `block`, so no target of a
+	/// jump.
 	fn parse_bare_block_expression(&mut self) -> Result<ExprId, ()> {
 		let brace_span = self.lexer.peek().span;
 		self.diagnostics.push(
@@ -3116,9 +3145,7 @@ impl<'ctx> Parser<'ctx> {
 		);
 		let block = self.parse_block()?;
 		let span = self.ast.blocks.spans[usize::from(block)];
-		Ok(self
-			.ast
-			.push_expr(Expression::Block { label: None, block }, span))
+		Ok(self.ast.push_expr(Expression::BareBlock(block), span))
 	}
 
 	/// `{ statement; ... tail }`: the statements, and the expression written
@@ -3268,43 +3295,28 @@ impl<'ctx> Parser<'ctx> {
 			None => self.ast.blocks.spans[usize::from(then_block)].end,
 		};
 		let span = TextSpan::new(if_keyword.span.start, end);
-		let if_else = self.ast.push_expr(
+		// An `if` is no jump target: a label on it is reported, and the `if`
+		// read without it.
+		if let Some(label) = label {
+			self.diagnostics.push(
+				Diagnostic::error()
+					.with_code(DiagnosticCode::LabelOnIf.code())
+					.with_message("an `if` cannot be labelled")
+					.with_label(
+						Label::primary(self.file_id, label.span).with_message(
+							"a label names a `block` or a `loop`",
+						),
+					)
+					.with_note(
+						"write it on a block around the `if`: `block :label { if .. }`",
+					),
+			);
+		}
+		Ok(self.ast.push_expr(
 			Expression::IfElse {
 				condition,
 				then_block,
 				else_block,
-			},
-			span,
-		);
-		let Some(label) = label else {
-			return Ok(if_else);
-		};
-		// Read as the block it would be written in, so a `break` to the label
-		// still finds it.
-		self.diagnostics.push(
-			Diagnostic::error()
-				.with_code(DiagnosticCode::LabelOnIf.code())
-				.with_message("an `if` cannot be labelled")
-				.with_label(
-					Label::primary(self.file_id, label.span)
-						.with_message("a label names a `block` or a `loop`"),
-				)
-				.with_note(
-					"write it on a block around the `if`: `block :label { if .. }`",
-				),
-		);
-		// No braces are written: the block is the `if` alone.
-		let block = self.ast.push_block(
-			Block {
-				statements: List::EMPTY,
-				tail: Some(if_else),
-			},
-			span,
-		);
-		Ok(self.ast.push_expr(
-			Expression::Block {
-				label: Some(label),
-				block,
 			},
 			span,
 		))
@@ -3397,37 +3409,15 @@ impl<'ctx> Parser<'ctx> {
 		Err(())
 	}
 
-	/// `callee(a, b)` or `callee({ x: a, y })`, decided on the token after
-	/// `(`: `{` opens a named list (a plain block is spelled `block { }`, so
-	/// nothing else starts with `{` here), anything else a positional one.
-	/// A callee that names a method on an object makes it a method call.
+	/// `callee(a, b)` or `callee({ x: a, y })`. A callee that names a
+	/// method on an object makes it a method call.
 	fn parse_call_expression(&mut self, callee: ExprId) -> Result<ExprId, ()> {
 		let start = self.ast.exprs.spans[usize::from(callee)].start;
-		let open = self.next_expect(Token::OpenParen)?.span;
-		if self.lexer.peek().inner == Token::OpenBrace {
-			let (arguments, end) = self.parse_named_call_arguments(open)?;
-			return Ok(self.ast.push_expr(
-				Expression::NamedCall {
-					callee,
-					arguments: arguments.inner,
-					braces: arguments.span,
-				},
-				TextSpan::new(start, end),
-			));
-		}
-		let arguments = self.separated_after(
-			PARENS,
-			open,
-			Parser::parse_positional_argument,
-		);
-		let arguments = self.push_delimited(arguments);
+		let arguments = self.parse_argument_list()?;
+		let end = self.ast.exprs.spans[usize::from(arguments)].end;
 		Ok(self.ast.push_expr(
-			Expression::Call {
-				callee,
-				arguments: arguments.inner,
-				open: open.start,
-			},
-			TextSpan::new(start, arguments.span.end),
+			Expression::Call { callee, arguments },
+			TextSpan::new(start, end),
 		))
 	}
 
@@ -4203,6 +4193,7 @@ impl<'ctx> Parser<'ctx> {
 						pub_at,
 						attributes: attrs,
 						signature: FunctionSignature {
+							func_at: fn_span.start,
 							name: Spanned {
 								inner: name_symbol,
 								span: name_span,

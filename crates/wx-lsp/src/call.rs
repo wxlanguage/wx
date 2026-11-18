@@ -3,7 +3,7 @@
 //! no extra information is recorded while checking.
 
 use string_interner::symbol::SymbolU32;
-use wx_compiler::ast::{AST, ExprId, Expression, StringInterner};
+use wx_compiler::ast::{AST, ArgumentList, ExprId, Expression, StringInterner};
 use wx_compiler::tir::{
 	BodyOwner, Call, Definition, Operand, Semantics, Type, TypeIndex,
 };
@@ -26,10 +26,8 @@ pub(crate) fn signature(
 	ast: &AST,
 	call: ExprId,
 ) -> Option<CallSignature> {
-	let callee = match ast.expr(call) {
-		Expression::Call { callee, .. }
-		| Expression::NamedCall { callee, .. } => callee,
-		_ => return None,
+	let Expression::Call { callee, arguments } = ast.expr(call) else {
+		return None;
 	};
 	let body = sema.owner_body(owner)?;
 	let Operand::Value(value) = body.operand_of(ast, call)? else {
@@ -41,17 +39,14 @@ pub(crate) fn signature(
 		| Call::Reference { arguments, .. } => *arguments,
 		Call::Constructor { fields, .. } => *fields,
 	};
-	let whole_argument = match ast.expr(call) {
-		Expression::Call { arguments, .. } => match ast.list(arguments) {
-			&[arg] => {
-				body.operand_of(ast, arg) == Some(packed)
-					&& matches!(
-						*sema.types.resolve(body.operand_ty(packed)),
-						Type::Tuple { .. }
-					)
-			}
-			_ => false,
-		},
+	let whole_argument = match ast.argument_list(arguments) {
+		ArgumentList::Positional(&[arg]) => {
+			body.operand_of(ast, arg) == Some(packed)
+				&& matches!(
+					*sema.types.resolve(body.operand_ty(packed)),
+					Type::Tuple { .. }
+				)
+		}
 		_ => false,
 	};
 	let (definition, env, names, params, args, skipped, result) = match checked

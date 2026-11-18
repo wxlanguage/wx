@@ -1321,7 +1321,7 @@ impl<'a> Lowerer<'a> {
 					Some(value) => Some(self.lower_expr(body, state, value)?),
 					None => None,
 				};
-				let label = state.label(body.target(target).scope);
+				let label = state.label(body.target_scope(target));
 				Ok(state.push(mir::ExprKind::Break { label, value }, ty))
 			}
 			ExprKind::Continue { target, value } => {
@@ -1335,7 +1335,7 @@ impl<'a> Lowerer<'a> {
 					}
 					None => None,
 				};
-				let label = state.label(body.target(target).scope);
+				let label = state.label(body.target_scope(target));
 				Ok(state.push(mir::ExprKind::Continue { label, value }, ty))
 			}
 			ExprKind::IfElse {
@@ -7441,8 +7441,8 @@ mod tests {
             func sum(n: u32) -> u32 {
                 loop (i: u32 = 0, total: u32 = 0) {
                     if i == n { break total };
-                    if i == 2 { continue ({ total, i: i + 1 }) };
-                    ({ i: i + 1, total: total + i })
+                    if i == 2 { continue({ total, i: i + 1 }) };
+                    continue({ i: i + 1, total: total + i })
                 }
             }
             export { sum as "sum" }
@@ -7476,7 +7476,7 @@ mod tests {
                     if at >= n { break taken };
                     at += 1;
                     if at % 3 == 0 { at += 1 };
-                    ({ at, taken: taken + 1 })
+                    continue({ at, taken: taken + 1 })
                 }
             }
             export { steps as "steps" }

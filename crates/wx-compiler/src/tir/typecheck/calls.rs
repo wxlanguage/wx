@@ -19,8 +19,8 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 use string_interner::symbol::SymbolU32;
 
 use super::members::Expected;
-use super::{ArgumentList, Arguments, BodyBuilder};
-use crate::ast::{self, StringInterner};
+use super::{Arguments, BodyBuilder};
+use crate::ast::{self, ArgumentList, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::body::{ElementOrder, ExprIdx, ExprKind, ParamIdx, ScopeIdx};
 use crate::tir::decls::{

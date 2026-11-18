@@ -120,7 +120,7 @@ impl Fd {
             io_vecs[0] = rest;
             local error = sys::fd_write(self, io_vecs, count);
             if error != Errno::SUCCESS { break error };
-            continue slices::slice_at(rest, count.*, rest.len() - count.*);
+            continue(slices::slice_at(rest, count.*, rest.len() - count.*));
         };
         arena.release(mark);
         error
@@ -199,7 +199,7 @@ pub func try_args(arena: heap::*Arena) -> (Errno, heap::&[heap::&[u8]]) {
         if at == text.len() { break };
         if text[at] == '\0' {
             arguments[next] = slices::slice_at(text, start, at - start);
-            continue (next + 1, at + 1, at + 1);
+            continue(next + 1, at + 1, at + 1);
         }
         (next, start, at + 1)
     }

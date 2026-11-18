@@ -556,6 +556,7 @@ fn a_jump_keyword_and_its_label_lead_to_different_declarations() {
 	let source = indoc::indoc! {"
 		func f(c: Bool) -> u32 {
 			local x: u32 = block { break 2; };
+			if c { return x; }
 			loop :outer {
 				loop {
 					if c { continue :outer; }
@@ -596,6 +597,9 @@ fn a_jump_keyword_and_its_label_lead_to_different_declarations() {
 	assert_eq!(definition("continue", 0), position_of(source, "loop", 0));
 	assert_eq!(definition("break", 1), position_of(source, "loop", 1));
 	assert_eq!(definition("break", 2), position_of(source, "loop", 0));
+	// A `return` leads to the keyword of the function it leaves, not to its
+	// name, as a `break` leads to its loop's keyword and not its label.
+	assert_eq!(definition("return", 0), position_of(source, "func", 0));
 	// A label leads to the label.
 	assert_eq!(definition("outer", 1), position_of(source, "outer", 0));
 	assert_eq!(definition("outer", 2), position_of(source, "outer", 0));
@@ -609,6 +613,7 @@ fn a_jump_keyword_and_its_label_lead_to_different_declarations() {
 	);
 	assert_eq!(references("loop", 1), [position_of(source, "break", 1)]);
 	assert_eq!(references("block", 0), [position_of(source, "break", 0)]);
+	assert_eq!(references("func", 0), [position_of(source, "return", 0)]);
 	assert_eq!(
 		references("outer", 0),
 		[
@@ -849,7 +854,11 @@ fn references_return_empty_for_unused_symbols_and_none_for_unresolved_names() {
 		requests::references(&state, &params("missing", false)),
 		None
 	);
-	assert_eq!(requests::references(&state, &params("func", false)), None);
+	// A function's keyword declares its body, which no `return` leaves.
+	assert_eq!(
+		requests::references(&state, &params("func", false)),
+		Some(vec![])
+	);
 }
 
 #[tokio::test]
@@ -985,6 +994,86 @@ fn hover_text(
 		panic!("expected markup contents");
 	};
 	Some(markup.value)
+}
+
+#[test]
+fn hover_renders_a_jump_and_its_target_as_signatures() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		func f(n: u32) -> u32 {
+			local x: u32 = block :done { if n == 0 { break :done 1 }; 2 };
+			loop :outer (i: u32 = 0, mut total: u32 = x) {
+				if i == n { break total };
+				loop {
+					if i == 1 { continue :outer(i + 1, total) };
+					break;
+				}
+				continue({ i: i + 1, total: total + i })
+			}
+		}
+		func pair() -> (u32, u32) {
+			loop { break (1, 2) }
+		}
+		func spin() {
+			loop {}
+		}
+		func pick(c: Bool, d: Bool) -> u8 {
+			if c { 1 } else if d { 2 } else { 3 }
+		}
+		func split(a: u8, b: Bool) -> (u8, Bool) {
+			if b { return (a, b) };
+			match (a, b) {
+				(0, _) => (1, b),
+				_ => return (0, b),
+			}
+		}
+		func stop() {
+			return;
+		}
+	"};
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(root).unwrap();
+	let hover = |needle, occurrence| {
+		hover_text(&state, &uri, source, needle, occurrence)
+			.unwrap_or_else(|| panic!("no hover on `{needle}` #{occurrence}"))
+	};
+	let wx = |signature: &str| format!("```wx\n{signature}\n```");
+
+	// A target: its parameters and the type leaving it gives.
+	assert_eq!(hover("block", 0), wx("block :done() -> u32"));
+	assert_eq!(
+		hover("loop", 0),
+		wx("loop :outer(i: u32, mut total: u32) -> u32")
+	);
+	assert_eq!(hover("loop", 1), wx("loop() -> ()"));
+	assert_eq!(hover("loop", 2), wx("loop() -> (u32, u32)"));
+	assert_eq!(hover("loop", 3), wx("loop() -> !"));
+	// A `break` takes the values its target gives, a `continue` its loop's
+	// parameters; neither falls through.
+	assert_eq!(hover("break", 0), wx("break :done(u32) -> !"));
+	assert_eq!(hover("break", 1), wx("break :outer(u32) -> !"));
+	assert_eq!(hover("break", 2), wx("break() -> !"));
+	assert_eq!(hover("break", 3), wx("break(u32, u32) -> !"));
+	assert_eq!(
+		hover("continue", 0),
+		wx("continue :outer(i: u32, mut total: u32) -> !")
+	);
+	assert_eq!(
+		hover("continue", 1),
+		wx("continue :outer(i: u32, mut total: u32) -> !")
+	);
+	// An `if` takes its condition and gives its branches' value; it is no
+	// target, and one without `else` gives `()`.
+	assert_eq!(hover("if", 0), wx("if(Bool) -> ()"));
+	assert_eq!(hover("if c", 0), wx("if(Bool) -> u8"));
+	assert_eq!(hover("if d", 0), wx("if(Bool) -> u8"));
+	// A `match` takes the value it matches, a tuple as its values.
+	assert_eq!(hover("match", 0), wx("match(u8, Bool) -> (u8, Bool)"));
+	// A `return` takes the values its body gives.
+	assert_eq!(hover("return", 0), wx("return(u8, Bool) -> !"));
+	assert_eq!(hover("return", 2), wx("return() -> !"));
+	// The keyword declaring a body reads as its owner.
+	assert_eq!(hover("func", 3), wx("func pick(c: Bool, d: Bool) -> u8"));
 }
 
 #[test]
@@ -1745,6 +1834,7 @@ fn semantic_tokens_colour_resolved_and_declared_names() {
 			"y:property.declaration",
 			"i32:type.defaultLibrary",
 			"Point:struct",
+			"func:keyword",
 			"sum:method.declaration",
 			"self:keyword",
 			"Self:keyword",
@@ -1753,9 +1843,11 @@ fn semantic_tokens_colour_resolved_and_declared_names() {
 			"x:property",
 			"self:keyword",
 			"y:property",
+			"func:keyword",
 			"origin:function.declaration",
 			"Self:keyword",
 			"Self:keyword",
+			"func:keyword",
 			"limit:function.declaration",
 			"u32:type.defaultLibrary",
 			"super:keyword",
@@ -1768,6 +1860,7 @@ fn semantic_tokens_colour_resolved_and_declared_names() {
 			"u32:type.defaultLibrary",
 			"LIMIT:variable.declaration.readonly",
 			"u32:type.defaultLibrary",
+			"func:keyword",
 			"id:function.declaration",
 			"T:typeParameter.declaration",
 			"StackValue:interface",
@@ -1775,6 +1868,7 @@ fn semantic_tokens_colour_resolved_and_declared_names() {
 			"T:typeParameter",
 			"T:typeParameter",
 			"value:parameter",
+			"func:keyword",
 			"main:function.declaration",
 			"i32:type.defaultLibrary",
 			"total:variable.declaration",
@@ -1870,6 +1964,7 @@ fn semantic_tokens_mark_only_what_the_compiler_provides() {
 	assert_eq!(
 		semantic_tokens(&state, &uri, source, None),
 		[
+			"func:keyword",
 			"main:function.declaration",
 			"i32:type.defaultLibrary",
 			"same:variable.declaration",
@@ -3142,25 +3237,24 @@ fn completion_of_a_named_state_offers_the_loops_parameters() {
 		)
 	};
 	for (site, expected, absent) in [
-		("continue ({ $0 })", &["i"][..], &["low", "high"][..]),
-		("continue :outer ({ $0 })", &["low", "high"], &["i"]),
-		("continue :outer ({ low: 1, $0 })", &["high"], &["low"]),
-		("({ $0 })", &["i"], &["low", "high"]),
+		("continue({ $0 })", &["i"][..], &["low", "high"][..]),
+		("continue :outer({ $0 })", &["low", "high"], &["i"]),
+		("continue :outer({ low: 1, $0 })", &["high"], &["low"]),
 	] {
 		let labels = completions(&source(site))
 			.unwrap_or_else(|| panic!("nothing offered in {site:?}"));
 		assert_offers(&labels, expected, absent);
 	}
 	let items =
-		completion_items(&source("continue :outer ({ $0 })"), false).unwrap();
+		completion_items(&source("continue :outer({ $0 })"), false).unwrap();
 	let mut details: Vec<_> =
 		items.iter().map(|item| item.detail.as_deref()).collect();
 	details.sort();
 	assert_eq!(details, [Some("high: u32"), Some("low: u32")]);
 
-	// A named list anywhere else, wrapped in parentheses included, gives
-	// no loop's state.
-	for site in ["local x = ({ $0 });", "continue (({ $0 }))"] {
+	// A named list anywhere else, a body's result or one wrapped in
+	// parentheses included, gives no loop's state.
+	for site in ["local x = ({ $0 });", "({ $0 })", "continue(({ $0 }))"] {
 		let labels = completions(&source(site)).unwrap_or_default();
 		assert_offers(&labels, &[], &["i", "low", "high"]);
 	}
@@ -4410,4 +4504,38 @@ fn semantic_tokens_leave_a_package_key_a_string() {
 		"{tokens:?}"
 	);
 	assert!(tokens.contains(&"lib:namespace.declaration".to_owned()));
+}
+
+/// Only a written `block` or loop is a jump target, so nothing claims a
+/// keyword that is not written: not braces the parser read without their
+/// `block` (here, after an unfinished `local`), nor an `if` read without the
+/// label it cannot take.
+#[test]
+fn semantic_tokens_survive_recovered_blocks_and_labels() {
+	for source in [
+		indoc::indoc! {"
+			func f(n: i32) -> i32 {
+			    local
+
+			    loop (a: i32 = 0, k = n) {
+			        if k == 1 { break a };
+			        (a + 1, k - 1)
+			    }
+			}
+		"},
+		indoc::indoc! {"
+			func f(c: Bool) -> u8 {
+			    if :l c { 1 } else { 2 }
+			}
+		"},
+	] {
+		let root = PathBuf::from("/test/main.wx");
+		let (state, _) = analyzed(&root, source);
+		let uri = Uri::from_file_path(&root).unwrap();
+		let tokens = semantic_tokens(&state, &uri, source, None);
+		assert!(
+			!tokens.iter().any(|token| token.starts_with('{')),
+			"{tokens:?}"
+		);
+	}
 }

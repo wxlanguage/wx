@@ -2272,11 +2272,17 @@ impl<'a> Builder<'a> {
 		match self.ast.expr(expr) {
 			kind if kind.is_block_like() => true,
 			ast::Expression::Call { arguments, .. } => {
-				matches!(self.ast.list(arguments), &[argument] if self.is_huggable(argument))
+				match self.ast.argument_list(arguments) {
+					ast::ArgumentList::Positional(&[argument]) => {
+						self.is_huggable(argument)
+					}
+					ast::ArgumentList::Positional(_) => false,
+					// A call by name is its own braces: they break open in
+					// place.
+					ast::ArgumentList::Named(_) => true,
+				}
 			}
-			// A call by name is its own braces: they break open in place.
-			ast::Expression::NamedCall { .. }
-			| ast::Expression::NamedList { .. } => true,
+			ast::Expression::NamedList { .. } => true,
 			_ => false,
 		}
 	}
@@ -2310,6 +2316,23 @@ impl<'a> Builder<'a> {
 	/// list on its own. The braces hug the parentheses and are a delimited
 	/// list, so they break onto one field per line once they don't fit,
 	/// keeping the comments written in them.
+	/// A call's or a `continue`'s argument list, by position or by name.
+	fn build_arguments(
+		&mut self,
+		out: &mut Vec<NodeId>,
+		arguments: ast::ExprId,
+	) {
+		match self.ast.expr(arguments) {
+			ast::Expression::Tuple { elements } => {
+				self.build_call_args(out, self.ast.list(elements));
+			}
+			ast::Expression::NamedList { arguments, braces } => {
+				self.build_named_call_args(out, arguments, braces);
+			}
+			_ => unreachable!("an argument list is a tuple or a named list"),
+		}
+	}
+
 	fn build_named_call_args(
 		&mut self,
 		out: &mut Vec<NodeId>,
@@ -2480,6 +2503,8 @@ impl<'a> Builder<'a> {
 				let content = self.build_block_content(block, span);
 				self.arena.concat2(keyword, content)
 			}
+			// A file the parser reported is not formatted.
+			ast::Expression::BareBlock(_) => unreachable!(),
 			ast::Expression::Placeholder => self.text(Text::Underscore),
 			ast::Expression::IfElse {
 				condition,
@@ -2589,17 +2614,17 @@ impl<'a> Builder<'a> {
 				}
 				self.arena.concat(items)
 			}
-			ast::Expression::Continue { label, value } => {
+			ast::Expression::Continue { label, arguments } => {
 				let mut items: Vec<NodeId> = vec![self.text(Text::Continue)];
 				if let Some(label) = label {
 					items.push(self.text(Text::LabelColon));
 					items.push(self.symbol(label.inner));
 				}
-				if let Some(value) = value {
-					items.push(self.text(Text::Space));
-					items.push(self.build_expression(value));
+				if let Some(arguments) = arguments {
+					self.build_arguments(&mut items, arguments);
 				}
-				self.arena.concat(items)
+				let concat = self.arena.concat(items);
+				self.arena.group(concat)
 			}
 			ast::Expression::Int { .. } | ast::Expression::Float => {
 				self.source_text(span)
@@ -2614,23 +2639,10 @@ impl<'a> Builder<'a> {
 				let close = self.text(Text::RParen);
 				self.arena.concat3(open, val, close)
 			}
-			ast::Expression::Call {
-				callee, arguments, ..
-			} => {
+			ast::Expression::Call { callee, arguments } => {
 				let callee_id = self.build_expression(callee);
 				let mut items: Vec<NodeId> = vec![callee_id];
-				self.build_call_args(&mut items, ast.list(arguments));
-				let concat = self.arena.concat(items);
-				self.arena.group(concat)
-			}
-			ast::Expression::NamedCall {
-				callee,
-				arguments,
-				braces,
-			} => {
-				let callee_id = self.build_expression(callee);
-				let mut items: Vec<NodeId> = vec![callee_id];
-				self.build_named_call_args(&mut items, arguments, braces);
+				self.build_arguments(&mut items, arguments);
 				let concat = self.arena.concat(items);
 				self.arena.group(concat)
 			}

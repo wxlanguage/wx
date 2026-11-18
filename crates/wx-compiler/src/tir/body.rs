@@ -568,7 +568,8 @@ pub enum TargetKind {
 }
 
 impl TargetKind {
-	fn keyword(self) -> Keyword {
+	/// The keyword it is written with.
+	pub fn keyword(self) -> Keyword {
 		match self {
 			TargetKind::Block => Keyword::Block,
 			TargetKind::Loop => Keyword::Loop,
@@ -577,26 +578,18 @@ impl TargetKind {
 }
 
 /// A loop or a `block`: what a `break` leaves or a `continue` restarts.
-/// Targets nest by control flow, as scopes nest by visibility.
+/// Targets nest by control flow, as scopes nest by visibility. What its node
+/// records, its kind, its scope and where its keyword is written, is read
+/// from the node (`Body::target_kind` and the rest).
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct JumpTarget {
-	pub kind: TargetKind,
-	/// Where its `loop` or `block` keyword is written.
-	pub keyword: TextOffset,
 	/// `loop :outer { .. }` or `block :outer { .. }`.
 	pub label: Option<Spanned<SymbolU32>>,
 	/// The target it is written in.
 	pub parent: Option<TargetIdx>,
-	/// The scope it owns: a loop's parameters, or a `block`'s braces. A jump
-	/// gives its value to it.
-	pub scope: ScopeIdx,
-}
-
-impl JumpTarget {
-	pub fn keyword_span(&self) -> TextSpan {
-		self.kind.keyword().span_at(self.keyword)
-	}
+	/// Its `Loop` or `Block` node.
+	pub(super) construct: ExprIdx,
 }
 
 /// A function's parameter, or a name a `local` declares.
@@ -886,8 +879,10 @@ impl Body {
 	/// name: for each label, the one its lookup finds there
 	/// (`BodyBuilder::jump_target`), innermost first.
 	pub fn labels_at(&self, offset: TextOffset) -> Vec<TargetIdx> {
-		let innermost = self.targets.iter().rposition(|target| {
-			let span = self.scope(target.scope).span;
+		let innermost = (0..self.targets.len()).rposition(|at| {
+			let span = self
+				.scope(self.target_scope(TargetIdx::new(at as u32)))
+				.span;
 			span.start < offset && offset < span.end
 		});
 		let mut found: Vec<TargetIdx> = Vec::new();
@@ -906,6 +901,37 @@ impl Body {
 			}
 		}
 		found
+	}
+
+	/// The type of the value leaving `target` gives: what its `break`s and,
+	/// for a `block`, its result give.
+	pub fn target_type(&self, target: TargetIdx) -> TypeIndex {
+		self.ty(self.target(target).construct)
+	}
+
+	pub fn target_kind(&self, target: TargetIdx) -> TargetKind {
+		self.target_node(target).0
+	}
+
+	/// The scope `target` owns: a loop's parameters, or a `block`'s braces.
+	/// A jump gives its value to it.
+	pub fn target_scope(&self, target: TargetIdx) -> ScopeIdx {
+		self.target_node(target).1
+	}
+
+	/// The `loop` or `block` keyword `target` is written with, where its node
+	/// starts.
+	pub fn target_keyword_span(&self, target: TargetIdx) -> TextSpan {
+		let start = self.span(self.target(target).construct).start;
+		self.target_kind(target).keyword().span_at(start)
+	}
+
+	fn target_node(&self, target: TargetIdx) -> (TargetKind, ScopeIdx) {
+		match self.kind(self.target(target).construct) {
+			ExprKind::Loop { scope, .. } => (TargetKind::Loop, scope),
+			ExprKind::Block { scope, .. } => (TargetKind::Block, scope),
+			_ => unreachable!("a target's node is a loop or a block"),
+		}
 	}
 
 	/// Every loop and `block`, in `TargetIdx` order.
@@ -937,19 +963,20 @@ impl Body {
 		self.operand_with_span(ast.expr_span(expr))
 	}
 
-	/// The loop the expression `expr` of `ast` gives its next state to, as
-	/// it was checked: a `continue`'s target, or a loop itself. `None` for a
-	/// `continue` with no target, which was checked as an error.
-	pub fn loop_of(&self, ast: &AST, expr: ExprId) -> Option<ScopeIdx> {
+	/// The loop the `continue` written as `expr` of `ast` restarts, as it
+	/// was checked. `None` for one with no target, which was checked as an
+	/// error.
+	pub fn continue_target(
+		&self,
+		ast: &AST,
+		expr: ExprId,
+	) -> Option<TargetIdx> {
 		let Operand::Value(at) = self.operand_with_span(ast.expr_span(expr))?
 		else {
 			return None;
 		};
 		match self.kind(at) {
-			ExprKind::Continue { target, .. } => {
-				Some(self.target(target).scope)
-			}
-			ExprKind::Loop { scope, .. } => Some(scope),
+			ExprKind::Continue { target, .. } => Some(target),
 			_ => None,
 		}
 	}
@@ -1069,10 +1096,12 @@ impl Body {
 		index
 	}
 
-	pub(super) fn push_target(&mut self, target: JumpTarget) -> TargetIdx {
-		let index = TargetIdx::new(u32::try_from(self.targets.len()).unwrap());
-		self.targets.push(target);
-		index
+	/// Gives the body its jump targets, in `TargetIdx` order. A target is
+	/// complete only once its node is built, after the jumps inside it that
+	/// name it, so the checker gives them all when the body is.
+	pub(super) fn set_targets(&mut self, targets: Vec<JumpTarget>) {
+		debug_assert!(self.targets.is_empty());
+		self.targets = targets;
 	}
 
 	/// Records the local the next parameter binds, if it has a name.
@@ -1536,7 +1565,14 @@ mod tests {
 				.position(|&span| span == body.span(value))
 				.map(|index| ExprId(index as u32))
 				.unwrap();
-			assert_eq!(body.span(args), ast.arguments_span(expr), "{object}");
+			let Expression::Call { arguments, .. } = ast.expr(expr) else {
+				panic!("`{object}` is not written as a call");
+			};
+			assert_eq!(
+				body.span(args),
+				ast.arguments_span(arguments),
+				"{object}"
+			);
 		}
 	}
 
@@ -1712,7 +1748,8 @@ mod tests {
 		body.labels_at(TextOffset::from(offset as u32))
 			.into_iter()
 			.map(|target| {
-				let JumpTarget { kind, label, .. } = *body.target(target);
+				let kind = body.target_kind(target);
+				let label = body.target(target).label;
 				let name = case.strings.resolve(label.unwrap().inner);
 				format!("{} {kind:?}", name.unwrap())
 			})

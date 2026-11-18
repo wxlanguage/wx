@@ -5,14 +5,18 @@
 //! how that reads on screen is decided in this module.
 
 use string_interner::symbol::SymbolU32;
+use wx_compiler::ast::{ExprId, Expression};
 use wx_compiler::ast::{Keyword, Spanned, StringInterner};
-use wx_compiler::diagnostics::TextOffset;
+use wx_compiler::diagnostics::{SourceSpan, TextOffset};
 use wx_compiler::tir::{
-	AssocTypeIdx, ConstIdx, ConstScalar, DeclKind, Definition, FieldIdx,
-	FieldOwner, FunctionIdx, GenericEnvIdx, GenericEnvOwner, MemberKind,
-	MemberOwner, Semantics, StructIdx, Type, TypesetIdx, Val,
+	AssocTypeIdx, Body, BodyOwner, ConstIdx, ConstScalar, DeclKind, Definition,
+	FieldIdx, FieldOwner, FunctionIdx, GenericEnvIdx, GenericEnvOwner,
+	MemberKind, MemberOwner, Reference, ScopeIdx, Semantics, StructIdx,
+	TargetIdx, Type, TypeIndex, TypesetIdx, Val,
 };
-use wx_compiler::vfs::Files;
+use wx_compiler::vfs::{FileId, Files};
+
+use crate::snapshot::Snapshot;
 
 /// A definition's signature as `wx` source; its owner is separate context.
 pub(crate) fn signature(
@@ -147,7 +151,15 @@ pub(crate) fn signature(
 			let header = sema.trait_impls[usize::from(index)].as_ref()?;
 			Some(format!("type Self = {}", renderer.ty(header.target.inner)))
 		}
-		Definition::Label { .. } | Definition::JumpTarget { .. } => None,
+		Definition::Label { .. } => None,
+		Definition::JumpTarget { owner, target } => {
+			renderer.jump_target(owner, target)
+		}
+		Definition::FunctionBody(function) => signature(
+			sema,
+			strings,
+			Definition::Item(sema.decls.functions[usize::from(function)].loc),
+		),
 		Definition::Local { owner, local } => {
 			let body = sema.owner_body(owner)?;
 			let local_data = body.local(local);
@@ -170,6 +182,73 @@ pub(crate) fn signature(
 			parameter,
 		} => renderer.parameter(function, usize::from(parameter)),
 	}
+}
+
+/// The signature of the `break`, `continue` or `return` `reference` is:
+/// the values it takes, which its target gives, and `!`, since it never
+/// falls through. `None` for any other reference.
+pub(crate) fn jump(
+	sema: &Semantics,
+	strings: &StringInterner,
+	reference: Reference,
+) -> Option<String> {
+	let renderer = Renderer { sema, strings };
+	let (head, values) = match reference {
+		Reference::Break { owner, target } => {
+			let body = sema.owner_body(owner)?;
+			let head = renderer.labelled(Keyword::Break, body, target);
+			(head, renderer.values(body.target_type(target)))
+		}
+		Reference::Continue { owner, target } => {
+			let body = sema.owner_body(owner)?;
+			let head = renderer.labelled(Keyword::Continue, body, target);
+			(head, renderer.loop_params(body, body.target_scope(target)))
+		}
+		Reference::Return { function } => {
+			let result = sema.functions[usize::from(function)].return_type;
+			(Keyword::Return.as_str().to_owned(), renderer.values(result))
+		}
+		_ => return None,
+	};
+	Some(renderer.arrow(&head, &values, TypeIndex::NEVER))
+}
+
+/// The signature of the `if` or `match` whose keyword is written at
+/// `offset`: the value it branches on and the value its branches give,
+/// with the keyword's span.
+pub(crate) fn branch(
+	snapshot: &Snapshot,
+	file: FileId,
+	offset: TextOffset,
+) -> Option<(SourceSpan, String)> {
+	let ast = snapshot.compilation.ast(file);
+	let (expr, keyword, on) = (0..ast.exprs.kinds.len())
+		.map(|index| ExprId(index as u32))
+		.filter_map(|expr| match ast.expr(expr) {
+			Expression::IfElse { condition, .. } => {
+				Some((expr, Keyword::If, condition))
+			}
+			Expression::Match { scrutinee, .. } => {
+				Some((expr, Keyword::Match, scrutinee))
+			}
+			_ => None,
+		})
+		.find(|&(expr, keyword, _)| {
+			let span = keyword.span_at(ast.expr_span(expr).start);
+			span.start <= offset && offset <= span.end
+		})?;
+	let owner = snapshot.expression_owner(file, expr)?;
+	let body = snapshot.sema.owner_body(owner)?;
+	let ty = |expr| Some(body.operand_ty(body.operand_of(ast, expr)?));
+	let renderer = Renderer {
+		sema: &snapshot.sema,
+		strings: &snapshot.strings,
+	};
+	let span = keyword.span_at(ast.expr_span(expr).start);
+	Some((
+		SourceSpan::new(file, span),
+		renderer.arrow(keyword.as_str(), &renderer.values(ty(on)?), ty(expr)?),
+	))
 }
 
 /// A compact callable type for a completion's right-hand description. The
@@ -281,6 +360,74 @@ impl Renderer<'_> {
 
 	fn ty(&self, ty: wx_compiler::tir::TypeIndex) -> String {
 		self.sema.type_formatter(self.strings).display_type(ty)
+	}
+
+	/// The values a value of `ty` is on the stack, as a list: a tuple's
+	/// elements, none for `()`, else the value itself.
+	fn values(&self, ty: TypeIndex) -> String {
+		match *self.sema.types.resolve(ty) {
+			Type::Tuple { elements } => self
+				.sema
+				.types
+				.list(elements)
+				.iter()
+				.map(|&element| self.ty(element))
+				.collect::<Vec<_>>()
+				.join(", "),
+			_ => self.ty(ty),
+		}
+	}
+
+	/// `head(inputs) -> output`: what a construct takes and what it gives.
+	fn arrow(&self, head: &str, inputs: &str, output: TypeIndex) -> String {
+		format!("{head}({inputs}) -> {}", self.ty(output))
+	}
+
+	/// `keyword :label`, with the label of `target`, if it has one.
+	fn labelled(
+		&self,
+		keyword: Keyword,
+		body: &Body,
+		target: TargetIdx,
+	) -> String {
+		match body.target(target).label {
+			Some(label) => {
+				format!("{} :{}", keyword.as_str(), self.name(label))
+			}
+			None => keyword.as_str().to_owned(),
+		}
+	}
+
+	/// A loop's parameters, the locals `scope` declares, as a parameter
+	/// list.
+	fn loop_params(&self, body: &Body, scope: ScopeIdx) -> String {
+		body.scope_locals(scope)
+			.map(|param| {
+				let local = body.local(param);
+				let mutable =
+					if local.mut_span.is_some() { "mut " } else { "" };
+				format!(
+					"{mutable}{}: {}",
+					self.name(local.name),
+					self.ty(local.ty)
+				)
+			})
+			.collect::<Vec<_>>()
+			.join(", ")
+	}
+
+	/// A loop's or a `block`'s signature: its parameters, none for a
+	/// `block`, and the type of the value leaving it gives.
+	fn jump_target(
+		&self,
+		owner: BodyOwner,
+		target: TargetIdx,
+	) -> Option<String> {
+		let body = self.sema.owner_body(owner)?;
+		let head =
+			self.labelled(body.target_kind(target).keyword(), body, target);
+		let params = self.loop_params(body, body.target_scope(target));
+		Some(self.arrow(&head, &params, body.target_type(target)))
 	}
 
 	/// `<A, B>`, or nothing when the declaration has no parameters of its own.

@@ -29,11 +29,11 @@ func binary_search<M: Memory, T: Ord>(
 
         local mid = low + (high - low) / 2;
         match arr[mid].cmp(target) {
-            Ordering::Less => continue ({
+            Ordering::Less => continue({
                 low: mid + 1,
                 high,
             }),
-            Ordering::Greater => continue ({
+            Ordering::Greater => continue({
                 low,
                 high: mid,
             }),

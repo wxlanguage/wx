@@ -856,25 +856,11 @@ impl<'a> Printer<'a> {
 				operator.as_str(),
 				[self.expr(left), self.expr(right)],
 			),
-			Expression::Call {
-				callee, arguments, ..
-			} => Sexp::head(
+			Expression::Call { callee, arguments } => Sexp::head(
 				"call",
-				[self.expr(callee)].into_iter().chain(
-					self.ast
-						.list(arguments)
-						.iter()
-						.map(|&argument| self.expr(argument)),
-				),
-			),
-			Expression::NamedCall {
-				callee, arguments, ..
-			} => Sexp::head(
-				"call",
-				[
-					self.expr(callee),
-					Sexp::head("named", self.named(arguments)),
-				],
+				[self.expr(callee)]
+					.into_iter()
+					.chain(self.arguments(arguments)),
 			),
 			Expression::NamedList { arguments, .. } => {
 				Sexp::head("named", self.named(arguments))
@@ -898,17 +884,20 @@ impl<'a> Printer<'a> {
 			Expression::Block { label, block } => {
 				self.block("block", label, block)
 			}
+			Expression::BareBlock(block) => self.block("braces", None, block),
 			Expression::Break { label, value } => Sexp::head(
 				"break",
 				self.label(label)
 					.into_iter()
 					.chain(value.map(|value| self.expr(value))),
 			),
-			Expression::Continue { label, value } => Sexp::head(
+			Expression::Continue { label, arguments } => Sexp::head(
 				"continue",
-				self.label(label)
-					.into_iter()
-					.chain(value.map(|value| self.expr(value))),
+				self.label(label).into_iter().chain(
+					arguments
+						.into_iter()
+						.flat_map(|arguments| self.arguments(arguments)),
+				),
 			),
 			Expression::IfElse {
 				condition,
@@ -975,6 +964,23 @@ impl<'a> Printer<'a> {
 	}
 
 	/// A named list's entries: `(x value)`, or `x` for the shorthand.
+	/// A call's or a `continue`'s argument list: each positional argument,
+	/// or the named list as one.
+	fn arguments(&self, arguments: ExprId) -> Vec<Sexp> {
+		match self.ast.expr(arguments) {
+			Expression::Tuple { elements } => self
+				.ast
+				.list(elements)
+				.iter()
+				.map(|&element| self.expr(element))
+				.collect(),
+			Expression::NamedList { arguments, .. } => {
+				vec![Sexp::head("named", self.named(arguments))]
+			}
+			_ => unreachable!("an argument list is a tuple or a named list"),
+		}
+	}
+
 	fn named(
 		&self,
 		arguments: List<NamedArgument>,

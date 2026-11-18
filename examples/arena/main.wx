@@ -98,6 +98,6 @@ func test() {
     loop (i: u32 = 0) {
         local x = range_iter.next();
         if i > 10 { break };
-        continue i + 1;
+        continue(i + 1);
     };
 }

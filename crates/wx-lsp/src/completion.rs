@@ -196,7 +196,7 @@ pub(crate) fn completion(
 					Jump::Break => true,
 					// A `continue` restarts only a loop.
 					Jump::Continue => {
-						body.target(target).kind == TargetKind::Loop
+						body.target_kind(target) == TargetKind::Loop
 					}
 				})
 				.map(|target| {
@@ -245,10 +245,10 @@ pub(crate) fn completion(
 		} => {
 			let owner = query::body_of(sema, declaration?)?;
 			let body = sema.owner_body(owner)?;
-			let target = body.loop_of(ast, jump)?;
+			let target = body.continue_target(ast, jump)?;
 			let mut names = Vec::new();
 			let mut types = Vec::new();
-			for local in body.scope_locals(target) {
+			for local in body.scope_locals(body.target_scope(target)) {
 				let name = body.local(local).name.inner;
 				types.push((Some(name), body.local(local).ty));
 				// A name the parser reported missing is no name to give.
@@ -526,8 +526,8 @@ pub(crate) enum ArgumentTarget {
 		callee: TextSpan,
 		given: usize,
 	},
-	/// The loop the `continue`, or the `loop` whose body's result the list
-	/// is, written as `jump` gives its next state to, as it was checked.
+	/// The loop the `continue` written as `jump` restarts, as it was
+	/// checked.
 	Loop { jump: ExprId },
 }
 
@@ -556,8 +556,8 @@ fn item(
 			(CompletionItemKind::STRUCT, 0)
 		}
 		Definition::Label { .. } => (CompletionItemKind::REFERENCE, 0),
-		Definition::JumpTarget { .. } => {
-			unreachable!("a jump target has no name to complete")
+		Definition::JumpTarget { .. } | Definition::FunctionBody(_) => {
+			unreachable!("a jump's destination has no name to complete")
 		}
 		// An argument's name: what a call by name may give, in order.
 		Definition::Parameter { .. } => (CompletionItemKind::VARIABLE, 0),
@@ -1320,22 +1320,25 @@ impl Cursor<'_> {
 			}
 			// Before the braces is the keyword and the label, where nothing
 			// is looked up.
-			Expression::Block { block, .. } => self.block(block),
+			Expression::Block { block, .. } | Expression::BareBlock(block) => {
+				self.block(block)
+			}
 			Expression::Unary { operand, .. } => self.expression(operand),
 			Expression::Binary { left, right, .. } => {
 				self.expression(left).or_else(|| self.expression(right))
 			}
-			Expression::Call {
-				callee, arguments, ..
-			} => self.expression(callee).or_else(|| {
-				self.list(ast.arguments_span(expression), ast.list(arguments))
-			}),
-			// A method's object gives its receiver, one argument given.
-			Expression::NamedCall {
-				callee,
-				arguments,
-				braces,
-			} => {
+			Expression::Call { callee, arguments } => {
+				let (named, braces) = match ast.expr(arguments) {
+					Expression::NamedList { arguments, braces } => {
+						(arguments, braces)
+					}
+					_ => {
+						return self
+							.expression(callee)
+							.or_else(|| self.positional(arguments));
+					}
+				};
+				// A method's object gives its receiver, one argument given.
 				let (name, given) = match ast.expr(callee) {
 					Expression::Path(segments)
 					| Expression::QualifiedPath { segments, .. } => (
@@ -1355,11 +1358,11 @@ impl Cursor<'_> {
 						callee,
 						given,
 					});
-					self.named(target, ast.list(arguments), braces)
+					self.named(target, ast.list(named), braces)
 				})
 			}
-			// Elsewhere than a loop's next state (`named_state`) its names
-			// mean nothing; only the values are walked.
+			// Outside a call's or a `continue`'s arguments its names mean
+			// nothing; only the values are walked.
 			Expression::NamedList { arguments, .. } => ast
 				.list(arguments)
 				.iter()
@@ -1378,11 +1381,20 @@ impl Cursor<'_> {
 			Expression::Break { label, value } => self
 				.label(label, Jump::Break)
 				.or_else(|| self.expression(value?)),
-			Expression::Continue { label, value } => {
+			Expression::Continue { label, arguments } => {
 				self.label(label, Jump::Continue).or_else(|| {
-					let value = value?;
-					self.named_state(value, expression)
-						.or_else(|| self.expression(value))
+					let arguments = arguments?;
+					match ast.expr(arguments) {
+						// Its names are the parameters of the loop it was
+						// checked to restart.
+						Expression::NamedList { arguments, braces } => self
+							.named(
+								Some(ArgumentTarget::Loop { jump: expression }),
+								ast.list(arguments),
+								braces,
+							),
+						_ => self.positional(arguments),
+					}
 				})
 			}
 			Expression::IfElse {
@@ -1417,9 +1429,6 @@ impl Cursor<'_> {
 								})?;
 							self.expression(*initial)
 						})
-				})
-				.or_else(|| {
-					self.named_state(ast.block(block).tail?, expression)
 				})
 				.or_else(|| self.block(block)),
 			Expression::QualifiedPath { root, segments } => self
@@ -1497,17 +1506,13 @@ impl Cursor<'_> {
 		})
 	}
 
-	/// A named list written directly as the next state of the `continue` or
-	/// `loop` written as `jump`: its names are the parameters of the loop it
-	/// was checked to give them to. `None` for any other value.
-	fn named_state(&self, value: ExprId, jump: ExprId) -> Option<Site> {
+	/// A positional argument list, a call's or a `continue`'s.
+	fn positional(&self, arguments: ExprId) -> Option<Site> {
 		let ast = self.ast;
-		let Expression::NamedList { arguments, braces } = ast.expr(value)
-		else {
-			return None;
+		let Expression::Tuple { elements } = ast.expr(arguments) else {
+			unreachable!("a positional argument list is a tuple")
 		};
-		let target = Some(ArgumentTarget::Loop { jump });
-		self.named(target, ast.list(arguments), braces)
+		self.list(ast.arguments_span(arguments), ast.list(elements))
 	}
 
 	fn ty(&self, ty: TypeId) -> Option<Site> {
