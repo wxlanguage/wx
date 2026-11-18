@@ -49,7 +49,7 @@ impl Snapshot {
 			trace,
 		)?;
 		let sema =
-			trace.step("check", || tir::check(&compilation, &mut strings));
+			trace.step("check", |_| tir::check(&compilation, &mut strings));
 		let definitions = query::definitions(&sema);
 		let impls = query::impls(&sema).collect();
 		Ok(Self {
@@ -196,7 +196,7 @@ pub(crate) fn load_compilation(
 ) -> std::result::Result<vfs::CompilationUnit, ()> {
 	let overlay = OverlayFileSource::new(open_documents);
 	let root = AbsolutePath::new(root.to_str().ok_or(())?);
-	trace.step("parse", || {
+	trace.step("parse", |_| {
 		// Eagerly load each newly encountered manifest, including dependencies.
 		// Keep invalid results too; only manifest events retry those reads.
 		let mut pending = vec![root.clone()];

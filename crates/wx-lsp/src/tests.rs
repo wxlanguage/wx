@@ -24,6 +24,7 @@ use crate::state::{
 	ClientConfig, ServerState, analyze_root, compute_active_refresh,
 	compute_refresh, refresh_project_manifest,
 };
+use crate::trace::Trace;
 use crate::{Backend, build_service};
 
 fn open_document(text: &str) -> OpenDocument {
@@ -63,13 +64,18 @@ fn open_synthetic_manifest(state: &mut ServerState, entry: &Path) -> PathBuf {
 
 /// Analyses `source` as the entry file of its own package and returns the
 /// state it was cached in, with the package's directory.
+/// A trace for a command the test performs directly.
+fn trace() -> Trace {
+	Trace::new("test", None)
+}
+
 fn analyzed(root: &Path, source: &str) -> (ServerState, PathBuf) {
 	let mut state = ServerState::default();
 	state
 		.open_documents
 		.insert(root.to_path_buf(), open_document(source));
 	let dir = open_synthetic_manifest(&mut state, root);
-	analyze_root(&mut state, &dir, root, &mut Vec::new());
+	analyze_root(&mut state, &dir, &mut trace());
 	assert!(state.cached.contains_key(&dir), "analysis failed");
 	(state, dir)
 }
@@ -214,21 +220,21 @@ fn editing_a_dependency_file_does_not_clear_the_dependent_root() {
 		open_document("pub func pow(base: i32, exp: i32) -> i32 { base }\n"),
 	);
 
-	compute_refresh(&mut state, &hashing_main, &mut Vec::new());
+	compute_refresh(&mut state, &hashing_main, &mut trace());
 	assert!(state.cached.contains_key(&hashing_dir));
 
 	state.open_documents.insert(
 		pow_main.clone(),
 		open_document("pub func pow(base: i32, exp: i32) -> Bool { True }"),
 	);
-	let mut logs = Vec::new();
+	let mut trace = trace();
 	let publications = compute_active_refresh(
 		&mut state,
 		vec![pow_main.clone(), pow_main],
-		&mut logs,
+		&mut trace,
 	);
 	assert_eq!(
-		logs.len(),
+		trace.count("check"),
 		2,
 		"each active root must compile once per batch"
 	);
@@ -255,7 +261,7 @@ fn analyze_root_updates_multi_file_diagnostics_when_overlay_changes() {
 	);
 	let dir = open_synthetic_manifest(&mut state, &root);
 
-	let broken = analyze_root(&mut state, &dir, &root, &mut Vec::new());
+	let broken = analyze_root(&mut state, &dir, &mut trace());
 	assert!(broken.owned_files.contains(&root));
 	assert!(broken.owned_files.contains(&child));
 	assert!(
@@ -270,7 +276,7 @@ fn analyze_root_updates_multi_file_diagnostics_when_overlay_changes() {
 		child.clone(),
 		open_document("pub func add() -> i32 {\n    1\n}\n"),
 	);
-	let fixed = analyze_root(&mut state, &dir, &root, &mut Vec::new());
+	let fixed = analyze_root(&mut state, &dir, &mut trace());
 	assert!(
 		fixed
 			.diagnostics_by_file
@@ -306,7 +312,7 @@ fn refresh_from_a_child_path_discovers_the_root_and_republishes_its_diagnostics(
 	);
 	open_synthetic_manifest(&mut state, &root);
 
-	let broken = compute_refresh(&mut state, &child, &mut Vec::new());
+	let broken = compute_refresh(&mut state, &child, &mut trace());
 	assert_eq!(
 		state.own_root.get(&child),
 		root.parent().map(PathBuf::from).as_ref()
@@ -321,7 +327,7 @@ fn refresh_from_a_child_path_discovers_the_root_and_republishes_its_diagnostics(
 		child.clone(),
 		open_document("pub func add() -> i32 {\n    1\n}\n"),
 	);
-	let fixed = compute_refresh(&mut state, &child, &mut Vec::new());
+	let fixed = compute_refresh(&mut state, &child, &mut trace());
 	assert!(
 		fixed.iter().any(|(path, diagnostics)| path == &root
 			&& !diagnostics.iter().any(is_error)),
@@ -407,7 +413,7 @@ fn a_shared_file_resolves_to_its_own_project_whatever_the_hash_order() {
 		.open_documents
 		.insert(dep_main.clone(), open_document("pub func helper() {}\n"));
 	for file in ["/a/main.wx", "/b/main.wx", "/dep/main.wx"] {
-		compute_refresh(&mut state, Path::new(file), &mut Vec::new());
+		compute_refresh(&mut state, Path::new(file), &mut trace());
 	}
 	assert_eq!(state.cached.len(), 3);
 
@@ -806,7 +812,7 @@ fn references_search_loaded_modules_and_include_the_module_name_not_file_start()
 	state
 		.open_documents
 		.insert(child.clone(), open_document(child_source));
-	analyze_root(&mut state, &dir, &root, &mut Vec::new());
+	analyze_root(&mut state, &dir, &mut trace());
 	let uri = Uri::from_file_path(&root).unwrap();
 	let child_uri = Uri::from_file_path(&child).unwrap();
 	let refs = requests::references(
@@ -912,7 +918,7 @@ fn references_reach_dependencies_without_comparing_ids_from_other_snapshots() {
 		lib.parent().unwrap().join("wx.json"),
 		open_document(r#"{"entry":"main.wx"}"#),
 	);
-	compute_refresh(&mut state, &app, &mut Vec::new());
+	compute_refresh(&mut state, &app, &mut trace());
 	assert_eq!(state.cached.len(), 2);
 	let uri = Uri::from_file_path(&app).unwrap();
 	let lib_uri = Uri::from_file_path(&lib).unwrap();
@@ -1439,7 +1445,7 @@ fn a_module_in_its_own_file_leads_to_that_file() {
 		open_document("pub func one() -> u32 { 1 }"),
 	);
 	let dir = open_synthetic_manifest(&mut state, &root);
-	analyze_root(&mut state, &dir, &root, &mut Vec::new());
+	analyze_root(&mut state, &dir, &mut trace());
 	let uri = Uri::from_file_path(&root).unwrap();
 	let shared = Uri::from_file_path("/test/shared.wx").unwrap();
 	for occurrence in [0, 1] {
@@ -1473,7 +1479,7 @@ fn watched_manifest_creation_and_deletion_moves_open_file_ownership() {
 		outer.join("wx.json"),
 		open_document(r#"{"entry":"nested/main.wx"}"#),
 	);
-	compute_refresh(&mut state, &file, &mut Vec::new());
+	compute_refresh(&mut state, &file, &mut trace());
 	assert_eq!(state.own_root.get(&file), Some(&outer));
 
 	let manifest = inner.join("wx.json");
@@ -1483,14 +1489,14 @@ fn watched_manifest_creation_and_deletion_moves_open_file_ownership() {
 	compute_active_refresh(
 		&mut state,
 		vec![manifest.clone(), manifest.clone()],
-		&mut Vec::new(),
+		&mut trace(),
 	);
 	assert_eq!(state.own_root.get(&file), Some(&inner));
 	assert!(state.cached.contains_key(&outer));
 	assert!(state.cached.contains_key(&inner));
 
 	state.open_documents.remove(&manifest);
-	compute_refresh(&mut state, &manifest, &mut Vec::new());
+	compute_refresh(&mut state, &manifest, &mut trace());
 	assert_eq!(state.own_root.get(&file), Some(&outer));
 	assert!(state.cached.contains_key(&outer));
 	assert!(!state.cached.contains_key(&inner));
@@ -1575,7 +1581,7 @@ async fn formatting_reuses_project_manifests() {
 	state.open_documents.get_mut(&manifest_path).unwrap().text = "{".into();
 	state.open_documents.get_mut(&dep_path).unwrap().text = "{".into();
 	assert_eq!(format(&mut state, client).await.unwrap(), first);
-	compute_refresh(&mut state, &source_path, &mut Vec::new());
+	compute_refresh(&mut state, &source_path, &mut trace());
 	assert_eq!(format(&mut state, client).await.unwrap(), first);
 
 	let change = |text: String, version| Command::DidChange {
@@ -1626,7 +1632,7 @@ async fn watched_file_events_skip_documents_the_editor_already_owns() {
 		file.clone(),
 		open_document("func main() {} export { main }"),
 	);
-	compute_refresh(&mut state, &file, &mut Vec::new());
+	compute_refresh(&mut state, &file, &mut trace());
 	assert!(state.cached.contains_key(&root));
 
 	// Saving an open buffer is reported by the watcher, but the overlay
@@ -1698,8 +1704,8 @@ fn a_repeated_refresh_publishes_each_file_once() {
 		open_document("func main() -> i32 { True }\nexport { main }"),
 	);
 
-	compute_refresh(&mut state, &main, &mut Vec::new());
-	let publications = compute_refresh(&mut state, &main, &mut Vec::new());
+	compute_refresh(&mut state, &main, &mut trace());
+	let publications = compute_refresh(&mut state, &main, &mut trace());
 
 	let for_main: Vec<_> = publications
 		.iter()
@@ -2205,7 +2211,7 @@ fn rename_refuses_a_module_in_a_file_of_its_own() {
 		open_document("pub func two() -> i32 { 2 }\n"),
 	);
 	open_synthetic_manifest(&mut state, &main);
-	analyze_root(&mut state, &dir, &main, &mut Vec::new());
+	analyze_root(&mut state, &dir, &mut trace());
 	let uri = Uri::from_file_path(&main).unwrap();
 	let refusal = renamed(&state, &uri, source, "geo::", 0, "shapes")
 		.expect_err("refused");
@@ -4364,7 +4370,7 @@ fn package_keys_state(text: &str) -> ServerState {
 		lib.parent().unwrap().join("wx.json"),
 		open_document(r#"{"entry":"main.wx"}"#),
 	);
-	compute_refresh(&mut state, &app, &mut Vec::new());
+	compute_refresh(&mut state, &app, &mut trace());
 	state
 }
 

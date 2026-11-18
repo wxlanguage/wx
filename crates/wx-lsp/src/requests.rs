@@ -197,7 +197,7 @@ pub(crate) fn format(
 		return None;
 	};
 	let config = wx_fmt::RendererConfig::from_manifest(manifest.format);
-	let formatted = trace.step("render", || {
+	let formatted = trace.step("render", |_| {
 		wx_fmt::format(
 			ast,
 			compilation.comments(module.file_id),

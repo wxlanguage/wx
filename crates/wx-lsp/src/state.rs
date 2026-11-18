@@ -164,7 +164,7 @@ pub(crate) fn refresh_project_manifest(
 pub(crate) fn compute_active_refresh(
 	state: &mut ServerState,
 	paths: Vec<PathBuf>,
-	logs: &mut Vec<String>,
+	trace: &mut Trace,
 ) -> Vec<(PathBuf, Vec<Diagnostic>)> {
 	if paths.is_empty() {
 		return Vec::new();
@@ -239,7 +239,7 @@ pub(crate) fn compute_active_refresh(
 	let mut roots: Vec<_> = roots.into_iter().collect();
 	roots.sort();
 	for root in roots {
-		let analysis = analyze_root(state, &root, &root.join("wx.json"), logs);
+		let analysis = analyze_root(state, &root, trace);
 		for (file, diagnostics) in
 			collect_publish_operations(state, &root, analysis)
 		{
@@ -262,42 +262,43 @@ pub(crate) fn compute_active_refresh(
 pub(crate) fn compute_refresh(
 	state: &mut ServerState,
 	file_path: &Path,
-	logs: &mut Vec<String>,
+	trace: &mut Trace,
 ) -> Vec<(PathBuf, Vec<Diagnostic>)> {
 	let mut publications = refresh_project_manifest(state, file_path);
 	publications.extend(compute_active_refresh(
 		state,
 		vec![file_path.to_path_buf()],
-		logs,
+		trace,
 	));
 	publications
 }
 
+/// Checks the package at `root` again, timed in `trace` as one part named
+/// after it.
 pub(crate) fn analyze_root(
 	state: &mut ServerState,
 	root: &Path,
-	file_path: &Path,
-	logs: &mut Vec<String>,
+	trace: &mut Trace,
 ) -> AnalysisResult {
-	let mut trace = Trace::new(file_path.to_path_buf());
-	let snapshot = Snapshot::build(
-		&state.open_documents,
-		&mut state.projects,
-		root,
-		&mut trace,
-	);
-	logs.push(trace.finish("typecheck"));
-	match snapshot {
-		Ok(snapshot) => {
-			let result = snapshot.analysis();
-			state.cached.insert(root.to_path_buf(), snapshot);
-			result
+	trace.step(root.display().to_string(), |trace| {
+		let snapshot = Snapshot::build(
+			&state.open_documents,
+			&mut state.projects,
+			root,
+			trace,
+		);
+		match snapshot {
+			Ok(snapshot) => {
+				let result = trace.step("diagnostics", |_| snapshot.analysis());
+				state.cached.insert(root.to_path_buf(), snapshot);
+				result
+			}
+			Err(()) => {
+				state.cached.remove(root);
+				analysis_from_missing_entry_file(root)
+			}
 		}
-		Err(()) => {
-			state.cached.remove(root);
-			analysis_from_missing_entry_file(root)
-		}
-	}
+	})
 }
 
 fn collect_publish_operations(

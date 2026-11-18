@@ -19,13 +19,13 @@ use tower_lsp_server::ls_types::{
 	Uri, WorkspaceEdit,
 };
 
-use crate::convert::path_to_file_uri;
+use crate::convert::{path_to_file_uri, uri_to_path};
 use crate::documents::OpenDocument;
 use crate::state::{
 	ClientConfig, ServerState, compute_active_refresh, compute_refresh,
 	refresh_project_manifest,
 };
-use crate::trace::{Trace, flush_logs};
+use crate::trace::{self, Trace};
 use crate::{completion, rename, requests, signature_help};
 
 pub(crate) enum Command {
@@ -116,10 +116,95 @@ async fn run_actor(mut rx: mpsc::UnboundedReceiver<Command>, client: Client) {
 	}
 }
 
+impl Command {
+	/// The LSP method this command serves, and the file it is about, when
+	/// it is about one: what its trace is headed with.
+	fn describe(&self) -> (&'static str, Option<PathBuf>) {
+		let document = |uri: &Uri| uri_to_path(uri);
+		match self {
+			Command::Initialize(_) => ("initialize", None),
+			Command::DidChangeWatchedFiles(_) => {
+				("workspace/didChangeWatchedFiles", None)
+			}
+			Command::DidOpen { path, .. } => {
+				("textDocument/didOpen", Some(path.clone()))
+			}
+			Command::DidChange { path, .. } => {
+				("textDocument/didChange", Some(path.clone()))
+			}
+			Command::DidClose { path } => {
+				("textDocument/didClose", Some(path.clone()))
+			}
+			Command::GotoDefinition(params, _) => (
+				"textDocument/definition",
+				document(
+					&params.text_document_position_params.text_document.uri,
+				),
+			),
+			Command::Hover(params, _) => (
+				"textDocument/hover",
+				document(
+					&params.text_document_position_params.text_document.uri,
+				),
+			),
+			Command::Completion(params, _) => (
+				"textDocument/completion",
+				document(&params.text_document_position.text_document.uri),
+			),
+			Command::SignatureHelp(params, _) => (
+				"textDocument/signatureHelp",
+				document(
+					&params.text_document_position_params.text_document.uri,
+				),
+			),
+			Command::References(params, _) => (
+				"textDocument/references",
+				document(&params.text_document_position.text_document.uri),
+			),
+			Command::PrepareRename(params, _) => (
+				"textDocument/prepareRename",
+				document(&params.text_document.uri),
+			),
+			Command::Rename(params, _) => (
+				"textDocument/rename",
+				document(&params.text_document_position.text_document.uri),
+			),
+			Command::SemanticTokensFull(params, _) => (
+				"textDocument/semanticTokens/full",
+				document(&params.text_document.uri),
+			),
+			Command::SemanticTokensRange(params, _) => (
+				"textDocument/semanticTokens/range",
+				document(&params.text_document.uri),
+			),
+			Command::Formatting(params, _) => (
+				"textDocument/formatting",
+				document(&params.text_document.uri),
+			),
+			Command::FullDiagnostic(uri, ..) => {
+				("wx/fullDiagnostic", document(uri))
+			}
+		}
+	}
+}
+
+/// Performs `command` and logs how long it took, with its timed parts.
 pub(crate) async fn handle_command(
 	command: Command,
 	state: &mut ServerState,
 	client: &Client,
+) {
+	let (method, path) = command.describe();
+	let mut trace = Trace::new(method, path);
+	perform(command, state, client, &mut trace).await;
+	trace::flush(client, trace).await;
+}
+
+async fn perform(
+	command: Command,
+	state: &mut ServerState,
+	client: &Client,
+	trace: &mut Trace,
 ) {
 	match command {
 		Command::Initialize(client) => {
@@ -138,7 +223,6 @@ pub(crate) async fn handle_command(
 			if paths.is_empty() {
 				return;
 			}
-			let mut logs = Vec::new();
 			let mut publications = Vec::new();
 			for path in &paths {
 				publications.extend(refresh_project_manifest(state, path));
@@ -146,9 +230,8 @@ pub(crate) async fn handle_command(
 			publications.extend(compute_active_refresh(
 				state,
 				paths.into_iter().collect(),
-				&mut logs,
+				trace,
 			));
-			flush_logs(client, logs).await;
 			publish(client, state, publications).await;
 			refresh_semantic_tokens(client, state);
 		}
@@ -165,17 +248,13 @@ pub(crate) async fn handle_command(
 			state
 				.open_documents
 				.insert(path.clone(), OpenDocument { text, version });
-			let mut logs = Vec::new();
-			let publications = compute_refresh(state, &path, &mut logs);
-			flush_logs(client, logs).await;
+			let publications = compute_refresh(state, &path, trace);
 			publish(client, state, publications).await;
 			refresh_semantic_tokens(client, state);
 		}
 		Command::DidClose { path } => {
 			state.open_documents.remove(&path);
-			let mut logs = Vec::new();
-			let publications = compute_refresh(state, &path, &mut logs);
-			flush_logs(client, logs).await;
+			let publications = compute_refresh(state, &path, trace);
 			publish(client, state, publications).await;
 			refresh_semantic_tokens(client, state);
 		}
@@ -207,12 +286,8 @@ pub(crate) async fn handle_command(
 			let _ = reply.send(requests::semantic_tokens_range(state, &params));
 		}
 		Command::Formatting(params, reply) => {
-			let mut trace = Trace::new(PathBuf::from(
-				params.text_document.uri.path().as_str(),
-			));
 			let edits =
-				requests::format(state, &params.text_document.uri, &mut trace);
-			flush_logs(client, vec![trace.finish("format")]).await;
+				requests::format(state, &params.text_document.uri, trace);
 			let _ = reply.send(edits);
 		}
 		Command::FullDiagnostic(uri, index, reply) => {
