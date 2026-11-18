@@ -147,7 +147,7 @@ pub(crate) fn signature(
 			let header = sema.trait_impls[usize::from(index)].as_ref()?;
 			Some(format!("type Self = {}", renderer.ty(header.target.inner)))
 		}
-		Definition::Label { .. } => None,
+		Definition::Label { .. } | Definition::JumpTarget { .. } => None,
 		Definition::Local { owner, local } => {
 			let body = sema.owner_body(owner)?;
 			let local_data = body.local(local);

@@ -16,8 +16,9 @@ use crate::ast::{self, Spanned};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextOffset, TextSpan};
 use crate::symbols::Keyword;
 use crate::tir::body::{
-	self, Body, ElementOrder, ExprIdx, ExprKind, ExprObligation, LabelIdx,
-	LocalIdx, Obligations, ParamIdx, Scope, ScopeIdx, ScopeKind,
+	self, Body, ElementOrder, ExprIdx, ExprKind, ExprObligation, JumpTarget,
+	LocalIdx, Obligations, ParamIdx, ScopeIdx, ScopeKind, TargetIdx,
+	TargetKind,
 };
 use crate::tir::decls::{FunctionIdx, report_duplicate_parameter};
 use crate::tir::resolutions::{AccessKind, Reference, Site};
@@ -58,7 +59,7 @@ impl BodyBuilder<'_, '_> {
 			});
 			self.body.push_param(local);
 		}
-		self.build_block_in(ScopeIdx::ROOT, block, span);
+		self.build_block_in(ScopeIdx::ROOT, block, span, BlockResult::Value);
 		(self.body, self.obligations)
 	}
 
@@ -67,11 +68,10 @@ impl BodyBuilder<'_, '_> {
 	pub(super) fn enter_scope(
 		&mut self,
 		kind: ScopeKind,
-		label: Option<LabelIdx>,
 		span: TextSpan,
 		expected: TypeIndex,
 	) -> ScopeIdx {
-		let scope = self.body.push_scope(kind, Some(self.current), label, span);
+		let scope = self.body.push_scope(kind, Some(self.current), span);
 		self.scope_types.push(ScopeType {
 			expected,
 			ty: TypeIndex::INFER,
@@ -83,6 +83,30 @@ impl BodyBuilder<'_, '_> {
 
 	pub(super) fn leave_scope(&mut self, scope: ScopeIdx) {
 		self.current = self.body.scope(scope).parent.unwrap();
+	}
+
+	/// Enters a jump target inside the current one, owning `scope`;
+	/// `leave_target` returns to its parent.
+	fn enter_target(
+		&mut self,
+		kind: TargetKind,
+		keyword: TextOffset,
+		label: Option<Spanned<SymbolU32>>,
+		scope: ScopeIdx,
+	) -> TargetIdx {
+		let target = self.body.push_target(JumpTarget {
+			kind,
+			keyword,
+			label,
+			parent: self.current_target,
+			scope,
+		});
+		self.current_target = Some(target);
+		target
+	}
+
+	fn leave_target(&mut self, target: TargetIdx) {
+		self.current_target = self.body.target(target).parent;
 	}
 
 	/// Declares a local in the current scope. It is visible from here on, and
@@ -100,19 +124,32 @@ impl BodyBuilder<'_, '_> {
 		local
 	}
 
-	/// `{ .. }` in a scope of its own, of `kind`, held to `expected`: a
-	/// written `block` (`ScopeKind::Block`), or braces a construct owns
-	/// (`ScopeKind::Body`), which take no label.
+	/// `{ .. }` in a scope of its own, held to `expected`.
 	pub(super) fn build_block(
 		&mut self,
-		kind: ScopeKind,
 		block: ast::BlockId,
 		expected: TypeIndex,
-		label: Option<LabelIdx>,
 		span: TextSpan,
 	) -> ExprIdx {
-		let scope = self.enter_scope(kind, label, span, expected);
-		let block = self.build_block_in(scope, block, span);
+		let scope = self.enter_scope(ScopeKind::Ordinary, span, expected);
+		let block = self.build_block_in(scope, block, span, BlockResult::Value);
+		self.leave_scope(scope);
+		block
+	}
+
+	/// `block :label { .. }`, a block a `break` can leave.
+	pub(super) fn build_written_block(
+		&mut self,
+		label: Option<Spanned<SymbolU32>>,
+		block: ast::BlockId,
+		expected: TypeIndex,
+		span: TextSpan,
+	) -> ExprIdx {
+		let scope = self.enter_scope(ScopeKind::Ordinary, span, expected);
+		let target =
+			self.enter_target(TargetKind::Block, span.start, label, scope);
+		let block = self.build_block_in(scope, block, span, BlockResult::Value);
+		self.leave_target(target);
 		self.leave_scope(scope);
 		block
 	}
@@ -124,6 +161,7 @@ impl BodyBuilder<'_, '_> {
 		scope: ScopeIdx,
 		block: ast::BlockId,
 		span: TextSpan,
+		result_kind: BlockResult,
 	) -> ExprIdx {
 		let ast = self.ast();
 		let ast::Block { statements, tail } = ast.block(block);
@@ -131,9 +169,11 @@ impl BodyBuilder<'_, '_> {
 		let (built, flow) = self.build_statements(statements, result, span.end);
 		let result = result.map(|result| {
 			let hint = self.scope_hint(scope);
-			let value = match self.loop_of_body(scope) {
-				Some(target) => self.build_state(target, result, hint),
-				None => self.build(result, hint),
+			let value = match result_kind {
+				BlockResult::LoopState(target) => {
+					self.build_state(target, result, hint)
+				}
+				BlockResult::Value => self.build(result, hint),
 			};
 			self.give(scope, value, true)
 		});
@@ -292,7 +332,7 @@ impl BodyBuilder<'_, '_> {
 	/// takes the value's, which must be known: an untyped literal needs an
 	/// annotation. What the pattern binds is declared in the rest of the
 	/// block, up to `block_end`, a scope opened after the value is built
-	/// (`ScopeKind::Remainder`).
+	/// (`ScopeKind::Ordinary`).
 	fn build_local(
 		&mut self,
 		pattern: ast::PatId,
@@ -310,8 +350,7 @@ impl BodyBuilder<'_, '_> {
 			TypeIndex::UNIT
 		};
 		self.enter_scope(
-			ScopeKind::Remainder,
-			None,
+			ScopeKind::Ordinary,
 			TextSpan::new(span.end, block_end),
 			TypeIndex::INFER,
 		);
@@ -401,8 +440,7 @@ impl BodyBuilder<'_, '_> {
 		for &ast::MatchArm { pattern, body } in arms {
 			// Its bindings are in scope after its pattern.
 			let scope = self.enter_scope(
-				ScopeKind::Body,
-				None,
+				ScopeKind::Ordinary,
 				TextSpan::new(
 					ast.pattern_span(pattern).end,
 					ast.branch_span(body).end,
@@ -486,13 +524,8 @@ impl BodyBuilder<'_, '_> {
 		let condition = self.check(condition, TypeIndex::BOOL);
 		let then_span = self.ast().block_span(then_block);
 		let Some(else_block) = else_block else {
-			let then_block = self.build_block(
-				ScopeKind::Body,
-				then_block,
-				TypeIndex::INFER,
-				None,
-				then_span,
-			);
+			let then_block =
+				self.build_block(then_block, TypeIndex::INFER, then_span);
 			let then_ty = self.body.ty(then_block);
 			let mut ty = TypeIndex::UNIT;
 			if then_ty != TypeIndex::UNIT
@@ -525,13 +558,7 @@ impl BodyBuilder<'_, '_> {
 				span,
 			);
 		};
-		let then_block = self.build_block(
-			ScopeKind::Body,
-			then_block,
-			expected,
-			None,
-			then_span,
-		);
+		let then_block = self.build_block(then_block, expected, then_span);
 		let else_block = self.build_branch(else_block, expected);
 		let ty = self.join_branches(then_block, else_block);
 		self.body.push(
@@ -557,7 +584,7 @@ impl BodyBuilder<'_, '_> {
 		match branch {
 			ast::Branch::Block(block) => {
 				let span = self.ast().block_span(block);
-				self.build_block(ScopeKind::Body, block, expected, None, span)
+				self.build_block(block, expected, span)
 			}
 			ast::Branch::Expression(expr) => self.check(expr, expected),
 		}
@@ -626,15 +653,14 @@ impl BodyBuilder<'_, '_> {
 		header: Option<ast::LoopHeaderId>,
 		block: ast::BlockId,
 		expected: TypeIndex,
-		label: Option<LabelIdx>,
+		label: Option<Spanned<SymbolU32>>,
 		span: TextSpan,
 	) -> ExprIdx {
 		let ast = self.ast();
 		let block_span = ast.block_span(block);
 		let outer = self.current;
 		let scope = self.enter_scope(
-			ScopeKind::Loop,
-			label,
+			ScopeKind::Ordinary,
 			TextSpan::new(block_span.start, span.end),
 			expected,
 		);
@@ -676,8 +702,18 @@ impl BodyBuilder<'_, '_> {
 			self.pack(values, ElementOrder::InOrder, state, span)
 		});
 		let state = self.scope_types[usize::from(scope)].state;
-		let body =
-			self.build_block(ScopeKind::Body, block, state, None, block_span);
+		let target =
+			self.enter_target(TargetKind::Loop, span.start, label, scope);
+		let body_scope =
+			self.enter_scope(ScopeKind::Ordinary, block_span, state);
+		let body = self.build_block_in(
+			body_scope,
+			block,
+			block_span,
+			BlockResult::LoopState(scope),
+		);
+		self.leave_scope(body_scope);
+		self.leave_target(target);
 		self.leave_scope(scope);
 		// A first state that never arrives never starts the loop.
 		let ty = match entry {
@@ -731,13 +767,6 @@ impl BodyBuilder<'_, '_> {
 			};
 			self.body.push_local(self.current, local);
 		}
-	}
-
-	/// The loop whose next state `scope`'s result is: its body's.
-	fn loop_of_body(&self, scope: ScopeIdx) -> Option<ScopeIdx> {
-		let Scope { kind, parent, .. } = *self.body.scope(scope);
-		let parent = parent.filter(|_| kind == ScopeKind::Body)?;
-		(self.body.scope(parent).kind == ScopeKind::Loop).then_some(parent)
 	}
 
 	/// A next state given to the loop `target`: its body's result or a
@@ -834,13 +863,14 @@ impl BodyBuilder<'_, '_> {
 		value: Option<ast::ExprId>,
 		span: TextSpan,
 	) -> ExprIdx {
-		let Some(scope) = self.jump_target(label, span, Jump::Break) else {
+		let Some(target) = self.jump_target(label, span, Jump::Break) else {
 			// Its value is still checked, against nothing.
 			if let Some(value) = value {
 				self.build(value, TypeIndex::ERROR);
 			}
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
+		let scope = self.body.target(target).scope;
 		let value = value.map(|value| {
 			let hint = self.scope_hint(scope);
 			let value = self.build(value, hint);
@@ -849,8 +879,11 @@ impl BodyBuilder<'_, '_> {
 		if value.is_none() {
 			self.give_unit(scope, span);
 		}
-		self.body
-			.push(ExprKind::Break { scope, value }, TypeIndex::NEVER, span)
+		self.body.push(
+			ExprKind::Break { target, value },
+			TypeIndex::NEVER,
+			span,
+		)
 	}
 
 	/// `continue`, restarting the nearest loop, or the loop `label` names,
@@ -861,7 +894,7 @@ impl BodyBuilder<'_, '_> {
 		value: Option<ast::ExprId>,
 		span: TextSpan,
 	) -> ExprIdx {
-		let Some(scope) = self.jump_target(label, span, Jump::Continue) else {
+		let Some(target) = self.jump_target(label, span, Jump::Continue) else {
 			// Its value is still checked, against nothing.
 			if let Some(value) = value {
 				let ast = self.ast();
@@ -876,6 +909,7 @@ impl BodyBuilder<'_, '_> {
 			}
 			return self.body.push(ExprKind::Error, TypeIndex::ERROR, span);
 		};
+		let scope = self.body.target(target).scope;
 		let state = self.scope_types[usize::from(scope)].state;
 		let value = value.map(|value| {
 			let value = self.build_state(scope, value, state);
@@ -890,7 +924,7 @@ impl BodyBuilder<'_, '_> {
 			self.sema.diagnostics.push(diagnostic);
 		}
 		self.body.push(
-			ExprKind::Continue { scope, value },
+			ExprKind::Continue { target, value },
 			TypeIndex::NEVER,
 			span,
 		)
@@ -914,71 +948,72 @@ impl BodyBuilder<'_, '_> {
 			.push(ExprKind::Return { value }, TypeIndex::NEVER, span)
 	}
 
-	/// The scope a `break` or `continue` leaves: the one whose label it names,
-	/// else the nearest loop. Reports and gives `None` when there is none,
-	/// and gives `None` silently for a label not written yet (`break :`),
-	/// which the parser reported.
+	/// The target a `break` or `continue` leaves: the one whose label it
+	/// names, else the nearest one it can jump to. Reports and gives `None`
+	/// when there is none, and gives `None` silently for a label not written
+	/// yet (`break :`), which the parser reported.
 	fn jump_target(
 		&mut self,
 		label: Option<Spanned<SymbolU32>>,
 		span: TextSpan,
 		jump: Jump,
-	) -> Option<ScopeIdx> {
+	) -> Option<TargetIdx> {
 		if label.is_some_and(|name| name.inner == Keyword::Error.symbol()) {
 			return None;
 		}
-		let mut at = Some(self.current);
-		while let Some(scope) = at {
-			let Scope {
+		let mut at = self.current_target;
+		while let Some(target) = at {
+			let JumpTarget {
 				kind,
+				label: target_label,
 				parent,
-				label: scope_label,
 				..
-			} = *self.body.scope(scope);
-			let found = match (label, scope_label) {
-				(Some(name), Some(scope_label)) => {
-					self.body.label(scope_label).name.inner == name.inner
+			} = *self.body.target(target);
+			let found = match (label, target_label) {
+				(Some(name), Some(target_label)) => {
+					target_label.inner == name.inner
 				}
 				(Some(_), None) => false,
-				// A `break` leaves the nearest written `block` or loop, a
-				// `continue` the nearest loop.
+				// A `break` leaves the nearest target, a `continue` the
+				// nearest loop.
 				(None, _) => match jump {
-					Jump::Break => {
-						matches!(kind, ScopeKind::Block | ScopeKind::Loop)
-					}
-					Jump::Continue => kind == ScopeKind::Loop,
+					Jump::Break => true,
+					Jump::Continue => kind == TargetKind::Loop,
 				},
 			};
-			if found {
-				if let (Some(name), Some(scope_label)) = (label, scope_label) {
-					self.sema.resolutions.record(
-						Site::Label(SourceSpan::new(
-							self.scope.file_id,
-							name.span,
-						)),
-						Reference::Label {
-							owner: self.owner,
-							label: scope_label,
-						},
-					);
-				}
-				if jump == Jump::Continue && kind != ScopeKind::Loop {
-					self.sema.diagnostics.push(
-						Diagnostic::error()
-							.with_code(
-								DiagnosticCode::ContinueOutsideOfLoop.code(),
-							)
-							.with_message("`continue` can only restart a loop")
-							.with_label(Label::primary(
-								self.scope.file_id,
-								span,
-							)),
-					);
-					return None;
-				}
-				return Some(scope);
+			if !found {
+				at = parent;
+				continue;
 			}
-			at = parent;
+			if let Some(name) = label {
+				self.sema.resolutions.record(
+					Site::Label(SourceSpan::new(self.scope.file_id, name.span)),
+					Reference::Label {
+						owner: self.owner,
+						target,
+					},
+				);
+			}
+			if jump == Jump::Continue && kind != TargetKind::Loop {
+				self.sema.diagnostics.push(
+					Diagnostic::error()
+						.with_code(DiagnosticCode::ContinueOutsideOfLoop.code())
+						.with_message("`continue` can only restart a loop")
+						.with_label(Label::primary(self.scope.file_id, span)),
+				);
+				return None;
+			}
+			self.sema.resolutions.record(
+				Site::Label(SourceSpan::new(
+					self.scope.file_id,
+					jump.keyword().span_at(span.start),
+				)),
+				Reference::Jump {
+					owner: self.owner,
+					target,
+				},
+			);
+			return Some(target);
 		}
 		let diagnostic = match (label, jump) {
 			(Some(name), _) => {
@@ -1095,8 +1130,27 @@ enum StatementFlow {
 	Unknown,
 }
 
+/// What a block's tail is.
+#[derive(Clone, Copy)]
+enum BlockResult {
+	/// The block's value.
+	Value,
+	/// The next state of the loop whose parameters the scope declares: the
+	/// block is its body.
+	LoopState(ScopeIdx),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Jump {
 	Break,
 	Continue,
+}
+
+impl Jump {
+	fn keyword(self) -> Keyword {
+		match self {
+			Jump::Break => Keyword::Break,
+			Jump::Continue => Keyword::Continue,
+		}
+	}
 }

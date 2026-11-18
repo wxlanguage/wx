@@ -551,6 +551,74 @@ fn goto_definition_goes_to_the_declaring_name() {
 }
 
 #[test]
+fn a_jump_keyword_and_its_label_lead_to_different_declarations() {
+	let root = PathBuf::from("/test/main.wx");
+	let source = indoc::indoc! {"
+		func f(c: Bool) -> u32 {
+			local x: u32 = block { break 2; };
+			loop :outer {
+				loop {
+					if c { continue :outer; }
+					break;
+				}
+				break :outer x;
+			}
+		}
+	"};
+	let (state, _) = analyzed(&root, source);
+	let uri = Uri::from_file_path(root).unwrap();
+	let definition = |needle, occurrence| {
+		scalar(requests::goto_definition(
+			&state,
+			&definition_params(&uri, position_of(source, needle, occurrence)),
+		))
+		.range
+		.start
+	};
+	let references = |needle, occurrence| {
+		requests::references(
+			&state,
+			&reference_params(
+				&uri,
+				position_of(source, needle, occurrence),
+				false,
+			),
+		)
+		.unwrap()
+		.into_iter()
+		.map(|loc| loc.range.start)
+		.collect::<Vec<_>>()
+	};
+
+	// A keyword leads to the loop or block it leaves or restarts, labelled
+	// or not.
+	assert_eq!(definition("break", 0), position_of(source, "block", 0));
+	assert_eq!(definition("continue", 0), position_of(source, "loop", 0));
+	assert_eq!(definition("break", 1), position_of(source, "loop", 1));
+	assert_eq!(definition("break", 2), position_of(source, "loop", 0));
+	// A label leads to the label.
+	assert_eq!(definition("outer", 1), position_of(source, "outer", 0));
+	assert_eq!(definition("outer", 2), position_of(source, "outer", 0));
+
+	assert_eq!(
+		references("loop", 0),
+		[
+			position_of(source, "continue", 0),
+			position_of(source, "break", 2),
+		]
+	);
+	assert_eq!(references("loop", 1), [position_of(source, "break", 1)]);
+	assert_eq!(references("block", 0), [position_of(source, "break", 0)]);
+	assert_eq!(
+		references("outer", 0),
+		[
+			position_of(source, "outer", 1),
+			position_of(source, "outer", 2)
+		]
+	);
+}
+
+#[test]
 fn goto_definition_works_in_a_file_with_errors() {
 	// A type error elsewhere must not take navigation away: the snapshot
 	// keeps the partial semantic data of an erroneous program.
@@ -1719,6 +1787,8 @@ fn semantic_tokens_colour_resolved_and_declared_names() {
 			"total:variable.modification",
 			"id:function",
 			"i32:type.defaultLibrary",
+			"block:keyword",
+			"break:keyword",
 			"total:variable",
 			"main:function",
 			"COUNT:variable.readonly.static",

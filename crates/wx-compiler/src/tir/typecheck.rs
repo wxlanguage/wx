@@ -42,7 +42,7 @@ use string_interner::symbol::SymbolU32;
 
 use super::body::{
 	Body, BodyOwner, ElementOrder, ExprIdx, ExprKind, ExprObligation,
-	ExprRange, LocalIdx, Obligations, ScopeIdx, ScopeKind,
+	ExprRange, LocalIdx, Obligations, ScopeIdx, ScopeKind, TargetIdx,
 };
 use super::bounds::AssumptionEnvIdx;
 use super::decls::{
@@ -104,6 +104,9 @@ pub(super) struct BodyBuilder<'a, 'ast> {
 	owner: BodyOwner,
 	/// The block scope being checked.
 	current: ScopeIdx,
+	/// The innermost loop or `block` being checked, which an unlabelled
+	/// jump leaves.
+	current_target: Option<TargetIdx>,
 	/// The locals each scope declares, by name. A name is looked up in the
 	/// current scope, then in each enclosing one; a later declaration of the
 	/// same name in one scope replaces the entry, which shadows the earlier.
@@ -412,6 +415,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			scope,
 			owner,
 			current: ScopeIdx::ROOT,
+			current_target: None,
 			lookup: FxHashMap::default(),
 			scope_types: Vec::new(),
 		}
@@ -425,8 +429,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		span: TextSpan,
 		build: impl FnOnce(&mut Self) -> R,
 	) -> R {
-		let scope =
-			self.enter_scope(ScopeKind::Static, None, span, TypeIndex::INFER);
+		let scope = self.enter_scope(ScopeKind::Static, span, TypeIndex::INFER);
 		let built = build(self);
 		self.leave_scope(scope);
 		built
@@ -456,7 +459,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 
 	/// Pushes the root scope, which every body has.
 	fn enter_root(&mut self, span: TextSpan, expected: TypeIndex) {
-		let root = self.body.push_scope(ScopeKind::Body, None, None, span);
+		let root = self.body.push_scope(ScopeKind::Ordinary, None, span);
 		debug_assert_eq!(root, ScopeIdx::ROOT);
 		self.scope_types.push(ScopeType {
 			expected,
@@ -690,12 +693,9 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			}
 			ast::Expression::Block { label, block } => {
 				// A name not written yet (`block : {`) declares nothing.
-				let label = label
-					.filter(|name| name.inner != Keyword::Error.symbol())
-					.map(|name| {
-						self.body.push_label(super::body::Label { name })
-					});
-				self.build_block(ScopeKind::Block, block, expected, label, span)
+				let label =
+					label.filter(|name| name.inner != Keyword::Error.symbol());
+				self.build_written_block(label, block, expected, span)
 			}
 			ast::Expression::IfElse {
 				condition,
@@ -709,12 +709,9 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				header,
 				block,
 			} => {
-				// A name not written yet (`block : {`) declares nothing.
-				let label = label
-					.filter(|name| name.inner != Keyword::Error.symbol())
-					.map(|name| {
-						self.body.push_label(super::body::Label { name })
-					});
+				// A name not written yet (`loop : {`) declares nothing.
+				let label =
+					label.filter(|name| name.inner != Keyword::Error.symbol());
 				self.build_loop(header, block, expected, label, span)
 			}
 			ast::Expression::Break { label, value } => {
@@ -3598,12 +3595,12 @@ mod tests {
 					};
 					head + inner
 				}
-				ExprKind::Break { scope, value } => {
-					let target = self.scope_name(body, scope);
+				ExprKind::Break { target, value } => {
+					let target = self.target_name(body, target);
 					list(&format!("break {target}"), value.as_slice())
 				}
-				ExprKind::Continue { scope, value } => {
-					let target = self.scope_name(body, scope);
+				ExprKind::Continue { target, value } => {
+					let target = self.target_name(body, target);
 					list(&format!("continue {target}"), value.as_slice())
 				}
 				ExprKind::Return { value } => list("return", value.as_slice()),
@@ -3821,16 +3818,14 @@ mod tests {
 			self.strings.resolve(field).unwrap()
 		}
 
-		/// A jump's target: its label, else the kind of scope it leaves.
-		fn scope_name(&self, body: &Body, scope: super::ScopeIdx) -> String {
-			let scope = body.scope(scope);
-			match scope.label {
-				Some(label) => self
-					.strings
-					.resolve(body.label(label).name.inner)
-					.unwrap()
-					.to_string(),
-				None => format!("{:?}", scope.kind).to_lowercase(),
+		/// A jump's target: its label, else its kind.
+		fn target_name(&self, body: &Body, target: super::TargetIdx) -> String {
+			let target = body.target(target);
+			match target.label {
+				Some(label) => {
+					self.strings.resolve(label.inner).unwrap().to_string()
+				}
+				None => format!("{:?}", target.kind).to_lowercase(),
 			}
 		}
 
@@ -4628,8 +4623,38 @@ mod tests {
 		));
 		assert!(matches!(
 			case.sema.resolutions.get(site),
-			Some(Reference::Label { label, .. }) if u32::from(label) == 0
+			Some(Reference::Label { target, .. }) if u32::from(target) == 0
 		));
+	}
+
+	#[test]
+	fn a_jump_keyword_is_recorded_as_a_reference_to_its_target() {
+		const SOURCE: &str =
+			"func f() { loop :outer { loop { break; } continue :outer; } }";
+		let case = TestCase::new(SOURCE);
+		case.diagnostics().assert_none();
+		let file_id = case
+			.sema
+			.decls
+			.namespaces
+			.file_id(Scope::Package(case.sema.decls.root_package).into());
+		let site = |keyword: &str| {
+			let start = SOURCE.find(keyword).unwrap() as u32;
+			Site::Label(crate::diagnostics::SourceSpan::new(
+				file_id,
+				TextSpan::from(start..start + keyword.len() as u32),
+			))
+		};
+		let target = |keyword| match case.sema.resolutions.get(site(keyword)) {
+			Some(Reference::Jump { owner, target }) => {
+				let body = case.sema.owner_body(owner).unwrap();
+				let at = body.target(target).keyword;
+				&SOURCE[u32::from(at) as usize..]
+			}
+			other => panic!("`{keyword}` recorded {other:?}"),
+		};
+		assert!(target("break").starts_with("loop { break"));
+		assert!(target("continue").starts_with("loop :outer"));
 	}
 
 	#[test]

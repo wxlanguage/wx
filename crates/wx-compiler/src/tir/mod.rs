@@ -29,8 +29,8 @@ use crate::symbols::StringInterner;
 use crate::vfs::CompilationUnit;
 
 pub use self::body::{
-	Body, BodyOwner, Call, ExprIdx, Label, LabelIdx, LabelKind, Local,
-	LocalIdx, Operand, ParamIdx, PlaceIdx,
+	Body, BodyOwner, Call, ExprIdx, JumpTarget, Local, LocalIdx, Operand,
+	ParamIdx, PlaceIdx, ScopeIdx, TargetIdx, TargetKind,
 };
 use self::decls::Declarations;
 pub use self::decls::{

@@ -7,10 +7,11 @@
 //! diagnostics. A node's children are pushed before it, so every child index is
 //! smaller than its parent's and the root is the last node.
 //!
-//! Beside the expressions, a body keeps its lexical structure: the block
-//! scopes it is made of, the locals each declares and the labels written on
-//! them. A scope is allocated when the checker enters its block, before any
-//! node inside it, so a `break` can name the scope it leaves. Places, the
+//! Beside the expressions, a body keeps its lexical structure, the block
+//! scopes it is made of and the locals each declares, and its control flow
+//! structure, the loops and `block`s a jump can target, with their labels.
+//! Each is allocated when the checker enters it, before any node inside it,
+//! so a `break` can name the target it leaves. Places, the
 //! locations in linear memory an expression reads, writes or takes the address
 //! of, have an arena of their own, pushed children first like expressions.
 //!
@@ -32,6 +33,7 @@ use super::types::{GenericArgs, TypeIndex};
 use crate::ast::{AST, BinaryOp, ExprId, Expression, Spanned, UnaryOp};
 use crate::diagnostics::{TextOffset, TextSpan};
 use crate::index::index_newtype;
+use crate::symbols::Keyword;
 
 index_newtype!(BodyIdx);
 index_newtype!(ExprIdx);
@@ -40,7 +42,7 @@ index_newtype!(ExprIdx);
 index_newtype!(ParamIdx);
 index_newtype!(ScopeIdx);
 index_newtype!(LocalIdx);
-index_newtype!(LabelIdx);
+index_newtype!(TargetIdx);
 index_newtype!(PlaceIdx);
 index_newtype!(PatIdx);
 
@@ -442,15 +444,15 @@ pub(super) enum ExprKind {
 		entry: Option<ExprIdx>,
 		body: ExprIdx,
 	},
-	/// Leaves `scope`, a loop or a labelled block, giving it `value`.
+	/// Leaves `target`, a loop or a `block`, giving it `value`.
 	Break {
-		scope: ScopeIdx,
+		target: TargetIdx,
 		value: Option<ExprIdx>,
 	},
-	/// Starts the next iteration of `scope`, a loop, with `value` as its
+	/// Starts the next iteration of `target`, a loop, with `value` as its
 	/// state (`()` without one).
 	Continue {
-		scope: ScopeIdx,
+		target: TargetIdx,
 		value: Option<ExprIdx>,
 	},
 	Return {
@@ -526,22 +528,8 @@ pub(super) enum ExprKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum ScopeKind {
-	/// A block written with its keyword, `block { .. }`, which an unlabelled
-	/// `break` leaves.
-	Block,
-	/// The braces a construct owns, which no `break` leaves unless it is a
-	/// loop's: an `if`/`else` branch, a match arm (declaring its bindings,
-	/// from the end of its pattern), or the body itself (the root scope, the
-	/// one without a parent, declaring the parameters).
-	Body,
-	/// The rest of a block after a `local` statement, which declares what
-	/// the statement binds: from the statement's end to the block's. Each
-	/// `local` opens one inside the one before, so a later local of the
-	/// same name shadows by nesting, and the statement's own value, built
-	/// before it opens, sees the locals before it. Not a jump target.
-	Remainder,
-	/// A loop's block, which `continue` restarts.
-	Loop,
+	/// The locals of the scopes around it are in reach.
+	Ordinary,
 	/// A string or array literal's elements, or a repeat's value:
 	/// constant expressions, so the locals of the scopes around it are out
 	/// of reach. A name still finds them, so a local shadows an item here as
@@ -549,15 +537,19 @@ pub(super) enum ScopeKind {
 	Static,
 }
 
-/// One lexical scope: a block, or the rest of one after a `local`.
+/// One lexical scope: braces (the body, whose root scope declares the
+/// parameters, a block, a branch, a match arm from the end of its pattern),
+/// a loop's parameters from its block's start, or the rest of a block after
+/// a `local` statement, from the statement's end. Each `local` opens one
+/// inside the one before, so a later local of the same name shadows by
+/// nesting, and the statement's own value, built before it opens, sees the
+/// locals before it.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct Scope {
 	pub(super) kind: ScopeKind,
 	/// `None` only for the root.
 	pub(super) parent: Option<ScopeIdx>,
-	/// `loop :outer { .. }` or `block :outer { .. }`.
-	pub(super) label: Option<LabelIdx>,
 	/// Where what it declares is in scope: the offsets after its start, up
 	/// to its end.
 	pub(super) span: TextSpan,
@@ -566,20 +558,45 @@ pub(super) struct Scope {
 	locals: LocalRange,
 }
 
-/// What a label is written on: a `break` may leave either, a `continue`
+/// What a jump target is: a `break` may leave either, a `continue`
 /// restarts only a loop.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub enum LabelKind {
+pub enum TargetKind {
 	Block,
 	Loop,
 }
 
-/// A label written on a block or a loop.
+impl TargetKind {
+	fn keyword(self) -> Keyword {
+		match self {
+			TargetKind::Block => Keyword::Block,
+			TargetKind::Loop => Keyword::Loop,
+		}
+	}
+}
+
+/// A loop or a `block`: what a `break` leaves or a `continue` restarts.
+/// Targets nest by control flow, as scopes nest by visibility.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub struct Label {
-	pub name: Spanned<SymbolU32>,
+pub struct JumpTarget {
+	pub kind: TargetKind,
+	/// Where its `loop` or `block` keyword is written.
+	pub keyword: TextOffset,
+	/// `loop :outer { .. }` or `block :outer { .. }`.
+	pub label: Option<Spanned<SymbolU32>>,
+	/// The target it is written in.
+	pub parent: Option<TargetIdx>,
+	/// The scope it owns: a loop's parameters, or a `block`'s braces. A jump
+	/// gives its value to it.
+	pub scope: ScopeIdx,
+}
+
+impl JumpTarget {
+	pub fn keyword_span(&self) -> TextSpan {
+		self.kind.keyword().span_at(self.keyword)
+	}
 }
 
 /// A function's parameter, or a name a `local` declares.
@@ -715,7 +732,7 @@ pub struct Body {
 	extra: Vec<ExprIdx>,
 	arg_order: Vec<ParamIdx>,
 	scopes: Vec<Scope>,
-	labels: Vec<Label>,
+	targets: Vec<JumpTarget>,
 	locals: Vec<Local>,
 	/// The local each parameter binds, in order; `None` for an unnamed
 	/// parameter, which binds nothing. Empty for an initializer.
@@ -785,8 +802,8 @@ impl Body {
 		self.scopes.len()
 	}
 
-	pub fn label(&self, label: LabelIdx) -> &Label {
-		&self.labels[usize::from(label)]
+	pub fn target(&self, target: TargetIdx) -> &JumpTarget {
+		&self.targets[usize::from(target)]
 	}
 
 	pub fn local(&self, local: LocalIdx) -> &Local {
@@ -865,35 +882,35 @@ impl Body {
 			.find(|&local| self.local(local).name.inner == name)
 	}
 
-	/// The labels a `break` or `continue` written at `offset` can name: for
-	/// each name, the one its lookup finds there (`jump_target`), innermost
-	/// first, with what it is written on.
-	pub fn labels_at(&self, offset: TextOffset) -> Vec<(LabelIdx, LabelKind)> {
-		let mut found: Vec<(LabelIdx, LabelKind)> = Vec::new();
-		for (scope, _) in self.scopes_from(offset) {
-			let Some(label) = scope.label else {
+	/// The labelled targets a `break` or `continue` written at `offset` can
+	/// name: for each label, the one its lookup finds there
+	/// (`BodyBuilder::jump_target`), innermost first.
+	pub fn labels_at(&self, offset: TextOffset) -> Vec<TargetIdx> {
+		let innermost = self.targets.iter().rposition(|target| {
+			let span = self.scope(target.scope).span;
+			span.start < offset && offset < span.end
+		});
+		let mut found: Vec<TargetIdx> = Vec::new();
+		let chain = std::iter::successors(
+			innermost.map(|at| TargetIdx::new(at as u32)),
+			|&at| self.target(at).parent,
+		);
+		for target in chain {
+			let Some(label) = self.target(target).label else {
 				continue;
 			};
-			let name = self.label(label).name.inner;
-			if found
-				.iter()
-				.any(|&(kept, _)| self.label(kept).name.inner == name)
-			{
-				continue;
+			if !found.iter().any(|&kept| {
+				self.target(kept).label.unwrap().inner == label.inner
+			}) {
+				found.push(target);
 			}
-			// Only a `block` and a loop take a label.
-			let kind = match scope.kind {
-				ScopeKind::Loop => LabelKind::Loop,
-				_ => LabelKind::Block,
-			};
-			found.push((label, kind));
 		}
 		found
 	}
 
-	/// Every label, in declaration order (`LabelIdx` order).
-	pub fn labels(&self) -> &[Label] {
-		&self.labels
+	/// Every loop and `block`, in `TargetIdx` order.
+	pub fn targets(&self) -> &[JumpTarget] {
+		&self.targets
 	}
 
 	/// The local each parameter binds, `None` for an unnamed one.
@@ -929,9 +946,10 @@ impl Body {
 			return None;
 		};
 		match self.kind(at) {
-			ExprKind::Continue { scope, .. } | ExprKind::Loop { scope, .. } => {
-				Some(scope)
+			ExprKind::Continue { target, .. } => {
+				Some(self.target(target).scope)
 			}
+			ExprKind::Loop { scope, .. } => Some(scope),
 			_ => None,
 		}
 	}
@@ -1035,7 +1053,6 @@ impl Body {
 		&mut self,
 		kind: ScopeKind,
 		parent: Option<ScopeIdx>,
-		label: Option<LabelIdx>,
 		span: TextSpan,
 	) -> ScopeIdx {
 		debug_assert_eq!(self.scopes.is_empty(), parent.is_none());
@@ -1043,7 +1060,6 @@ impl Body {
 		self.scopes.push(Scope {
 			kind,
 			parent,
-			label,
 			span,
 			locals: LocalRange {
 				start: u32::try_from(self.locals.len()).unwrap(),
@@ -1053,9 +1069,9 @@ impl Body {
 		index
 	}
 
-	pub(super) fn push_label(&mut self, label: Label) -> LabelIdx {
-		let index = LabelIdx::new(u32::try_from(self.labels.len()).unwrap());
-		self.labels.push(label);
+	pub(super) fn push_target(&mut self, target: JumpTarget) -> TargetIdx {
+		let index = TargetIdx::new(u32::try_from(self.targets.len()).unwrap());
+		self.targets.push(target);
 		index
 	}
 
@@ -1695,8 +1711,9 @@ mod tests {
 		let body = case.body(function);
 		body.labels_at(TextOffset::from(offset as u32))
 			.into_iter()
-			.map(|(label, kind)| {
-				let name = case.strings.resolve(body.label(label).name.inner);
+			.map(|target| {
+				let JumpTarget { kind, label, .. } = *body.target(target);
+				let name = case.strings.resolve(label.unwrap().inner);
 				format!("{} {kind:?}", name.unwrap())
 			})
 			.collect()

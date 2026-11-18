@@ -1316,15 +1316,15 @@ impl<'a> Lowerer<'a> {
 				entry,
 				body: loop_body,
 			} => self.lower_loop(body, state, scope, entry, loop_body, ty),
-			ExprKind::Break { scope, value } => {
+			ExprKind::Break { target, value } => {
 				let value = match value {
 					Some(value) => Some(self.lower_expr(body, state, value)?),
 					None => None,
 				};
-				let label = state.label(scope);
+				let label = state.label(body.target(target).scope);
 				Ok(state.push(mir::ExprKind::Break { label, value }, ty))
 			}
-			ExprKind::Continue { scope, value } => {
+			ExprKind::Continue { target, value } => {
 				let value = match value {
 					Some(value) => {
 						let value = self.lower_expr(body, state, value)?;
@@ -1335,7 +1335,7 @@ impl<'a> Lowerer<'a> {
 					}
 					None => None,
 				};
-				let label = state.label(scope);
+				let label = state.label(body.target(target).scope);
 				Ok(state.push(mir::ExprKind::Continue { label, value }, ty))
 			}
 			ExprKind::IfElse {

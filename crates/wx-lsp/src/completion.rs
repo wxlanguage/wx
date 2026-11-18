@@ -28,8 +28,8 @@ use wx_compiler::ast::{
 use wx_compiler::diagnostics::{SourceSpan, TextOffset, TextSpan};
 use wx_compiler::symbols::Keyword;
 use wx_compiler::tir::{
-	BindingName, DeclKind, Definition, LabelKind, MemberKind, MemberOwner,
-	NameUse, Tier, TraitIdx,
+	BindingName, DeclKind, Definition, MemberKind, MemberOwner, NameUse,
+	TargetKind, Tier, TraitIdx,
 };
 use wx_compiler::vfs::FileId;
 
@@ -192,16 +192,16 @@ pub(crate) fn completion(
 			let body = sema.owner_body(owner)?;
 			body.labels_at(offset)
 				.into_iter()
-				.filter(|&(_, kind)| match jump {
+				.filter(|&target| match jump {
 					Jump::Break => true,
 					// A `continue` restarts only a loop.
-					Jump::Continue => kind == LabelKind::Loop,
+					Jump::Continue => {
+						body.target(target).kind == TargetKind::Loop
+					}
 				})
-				.map(|(label, _)| {
-					(
-						body.label(label).name.inner,
-						Definition::Label { owner, label },
-					)
+				.map(|target| {
+					let label = body.target(target).label.unwrap();
+					(label.inner, Definition::Label { owner, target })
 				})
 				.collect()
 		}
@@ -556,6 +556,9 @@ fn item(
 			(CompletionItemKind::STRUCT, 0)
 		}
 		Definition::Label { .. } => (CompletionItemKind::REFERENCE, 0),
+		Definition::JumpTarget { .. } => {
+			unreachable!("a jump target has no name to complete")
+		}
 		// An argument's name: what a call by name may give, in order.
 		Definition::Parameter { .. } => (CompletionItemKind::VARIABLE, 0),
 		Definition::Field { .. } => (CompletionItemKind::FIELD, 0),

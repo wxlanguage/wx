@@ -9,8 +9,8 @@ use string_interner::symbol::SymbolU32;
 use wx_compiler::diagnostics::{SourceSpan, TextOffset, TextSpan};
 use wx_compiler::tir::{
 	BodyOwner, ConstIdx, DeclKind, Definition, EnumIdx, FieldIdx, FieldOwner,
-	FunctionIdx, GlobalIdx, InherentImplIdx, LabelIdx, LocalIdx, MemberKind,
-	ParamIdx, Reference, Semantics, Site, StructIdx, TraitImplIdx,
+	FunctionIdx, GlobalIdx, InherentImplIdx, LocalIdx, MemberKind, ParamIdx,
+	Reference, Semantics, Site, StructIdx, TargetIdx, TraitImplIdx,
 };
 use wx_compiler::vfs::FileId;
 
@@ -326,11 +326,12 @@ fn add_body_definitions(
 			local: LocalIdx::new(index as u32),
 		});
 	}
-	for index in 0..body.labels().len() {
-		add(Definition::Label {
-			owner,
-			label: LabelIdx::new(index as u32),
-		});
+	for (index, jump_target) in body.targets().iter().enumerate() {
+		let target = TargetIdx::new(index as u32);
+		if jump_target.label.is_some() {
+			add(Definition::Label { owner, target });
+		}
+		add(Definition::JumpTarget { owner, target });
 	}
 }
 

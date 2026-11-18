@@ -276,6 +276,9 @@ fn classify(
 			(TokenType::Keyword, 0)
 		}
 		Definition::Label { .. } => return None,
+		Definition::JumpTarget { .. } => {
+			unreachable!("a jump target is written as its keyword")
+		}
 	};
 	Some((kind, modifiers | default_library))
 }

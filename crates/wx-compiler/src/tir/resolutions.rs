@@ -28,7 +28,7 @@
 
 use std::collections::BTreeMap;
 
-use super::body::{BodyOwner, LabelIdx, LocalIdx, ParamIdx};
+use super::body::{BodyOwner, LocalIdx, ParamIdx, TargetIdx};
 use super::decls::Declared;
 use super::decls::{
 	BindingKey, BindingLookup, DeclKind, FieldIdx, FieldOwner, FunctionIdx,
@@ -53,9 +53,10 @@ pub enum Site {
 	Type(SourceSpan),
 	/// Looked up among values.
 	Value(SourceSpan),
-	/// A name that picks out a declaration by where it is written: a named
-	/// argument's parameter or field, a `break`'s label, or by what a
-	/// manifest declares: a package instance's key, its package.
+	/// What picks out a declaration by where it is written: a named
+	/// argument's parameter or field, a `break`'s label, the `break` or
+	/// `continue` keyword itself, or by what a manifest declares: a package
+	/// instance's key, its package.
 	Label(SourceSpan),
 }
 
@@ -169,8 +170,12 @@ pub enum Reference {
 	TypeParam { env: GenericEnvIdx, index: u32 },
 	/// A member selected through a type: `T::A`, `<X as Tr>::A`.
 	Member(MemberKind),
-	/// A label of the body `owner`, named by a `break` or `continue`.
-	Label { owner: BodyOwner, label: LabelIdx },
+	/// The label of a jump target of the body `owner`, named by a `break`
+	/// or `continue`.
+	Label { owner: BodyOwner, target: TargetIdx },
+	/// A `break` or `continue` keyword: the jump target of the body `owner`
+	/// it leaves or restarts, whether or not a label names it.
+	Jump { owner: BodyOwner, target: TargetIdx },
 	/// `Self` inside an inherent impl, which names the impl's target and is
 	/// not a parameter of it.
 	InherentImplSelf(InherentImplIdx),
@@ -226,9 +231,16 @@ pub enum Definition {
 		index: u32,
 	},
 	Member(MemberKind),
+	/// A jump target's label.
 	Label {
 		owner: BodyOwner,
-		label: LabelIdx,
+		target: TargetIdx,
+	},
+	/// A loop or a `block`, which a `break` or `continue` jumps to; declared
+	/// by its keyword.
+	JumpTarget {
+		owner: BodyOwner,
+		target: TargetIdx,
 	},
 	/// What `Self` names in an inherent impl: the target type written in its
 	/// header.
@@ -271,8 +283,11 @@ impl Reference {
 				Definition::TypeParam { env, index }
 			}
 			Reference::Member(kind) => Definition::Member(kind),
-			Reference::Label { owner, label } => {
-				Definition::Label { owner, label }
+			Reference::Label { owner, target } => {
+				Definition::Label { owner, target }
+			}
+			Reference::Jump { owner, target } => {
+				Definition::JumpTarget { owner, target }
 			}
 			Reference::InherentImplSelf(index) => {
 				Definition::InherentImplTarget(index)
@@ -318,11 +333,15 @@ impl Semantics {
 			Definition::Member(kind) => {
 				Some(decls.declaration_span(kind.loc(decls)))
 			}
-			Definition::Label { owner, label } => {
-				let body = self.owner_body(owner)?;
+			Definition::Label { owner, target } => {
+				let label = self.owner_body(owner)?.target(target).label?;
+				Some(SourceSpan::new(self.owner_file(owner), label.span))
+			}
+			Definition::JumpTarget { owner, target } => {
+				let target = self.owner_body(owner)?.target(target);
 				Some(SourceSpan::new(
 					self.owner_file(owner),
-					body.label(label).name.span,
+					target.keyword_span(),
 				))
 			}
 			Definition::Local { owner, local } => {
