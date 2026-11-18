@@ -1582,7 +1582,6 @@ impl Semantics {
 	/// order, written at its place in the element type's layout. The values
 	/// are every element's, one after another, or one element's for a repeat,
 	/// which every element takes.
-	#[allow(clippy::too_many_arguments)]
 	fn place_static(
 		&mut self,
 		strings: &StringInterner,
@@ -1864,7 +1863,6 @@ impl Semantics {
 
 	/// The value of the constant a node of `owner`'s body names with `args`,
 	/// of type `ty`.
-	#[allow(clippy::too_many_arguments)]
 	fn read_reference(
 		&mut self,
 		strings: &StringInterner,

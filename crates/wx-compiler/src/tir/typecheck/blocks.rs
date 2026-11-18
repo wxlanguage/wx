@@ -416,11 +416,7 @@ impl BodyBuilder<'_, '_> {
 			);
 			let body = self.build_branch(body, expected);
 			self.leave_scope(scope);
-			built.push(body::Arm {
-				scope,
-				pattern,
-				body,
-			});
+			built.push(body::Arm { pattern, body });
 		}
 		let bodies: Vec<ExprIdx> = built.iter().map(|arm| arm.body).collect();
 		let ty = self.join_arms(&bodies);

@@ -1117,10 +1117,8 @@ pub fn verify(
 				]);
 				continue;
 			}
-			ExprKind::Break { label, .. } => {
-				if !open[usize::from(label)] {
-					return Err(VerifyError::BadTarget { expr });
-				}
+			ExprKind::Break { label, .. } if !open[usize::from(label)] => {
+				return Err(VerifyError::BadTarget { expr });
 			}
 			ExprKind::Continue { label, value } => {
 				if !is_open_loop(label) {

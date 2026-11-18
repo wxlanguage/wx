@@ -1519,7 +1519,6 @@ impl<'a> Lowerer<'a> {
 	/// A call of `function` with `type_args`, as `Call`/`AbstractCall` hold
 	/// it, or, with a `receiver`, as `MethodCall`/`AbstractMethodCall` do.
 	/// `args` is the value of the parameters after the receiver.
-	#[allow(clippy::too_many_arguments)]
 	fn lower_call(
 		&mut self,
 		body: &Body,
@@ -2096,7 +2095,6 @@ impl<'a> Lowerer<'a> {
 	/// or, for an abstract target, the one its type selects. The operand runs
 	/// first and is read back from a temporary; then the target is read as
 	/// the receiver, the method runs, and its result is stored.
-	#[allow(clippy::too_many_arguments)]
 	fn lower_compound_assign_call(
 		&mut self,
 		body: &Body,
@@ -4226,12 +4224,8 @@ mod tests {
 		let mir = crate::tir::lower(&mut sema, &strings).ok();
 		let diagnostics = sema.diagnostics();
 		assert!(mir.is_none());
-		crate::testing::DiagnosticView::new(
-			"build",
-			&diagnostics,
-			&graph.files,
-		)
-		.assert_error(DiagnosticCode::NonConstantGlobalInitializer);
+		crate::testing::DiagnosticView::new("build", diagnostics, &graph.files)
+			.assert_error(DiagnosticCode::NonConstantGlobalInitializer);
 	}
 
 	#[test]
@@ -9151,12 +9145,8 @@ mod tests {
 		let mir = crate::tir::lower(&mut sema, &strings).ok();
 		let diagnostics = sema.diagnostics();
 		assert!(mir.is_none());
-		crate::testing::DiagnosticView::new(
-			"lower",
-			&diagnostics,
-			&graph.files,
-		)
-		.assert_codes(&[DiagnosticCode::NotConstEvaluatable]);
+		crate::testing::DiagnosticView::new("lower", diagnostics, &graph.files)
+			.assert_codes(&[DiagnosticCode::NotConstEvaluatable]);
 	}
 
 	/// `Memory::DATA_END` is the address right after the memory's static

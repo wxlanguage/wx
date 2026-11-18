@@ -172,7 +172,7 @@ impl<'a> BodyContext<'a> {
 		scope: AssumptionEnvIdx,
 	) -> TypeIndex {
 		match self.sema.normalize(
-			&self.strings,
+			self.strings,
 			scope,
 			ty,
 			NormalizationDepth::Deep,
@@ -194,7 +194,7 @@ impl<'a> BodyContext<'a> {
 	) -> Result<TypeIndex, ()> {
 		let site = SourceSpan::new(self.scope.file_id, site);
 		match self.sema.normalize(
-			&self.strings,
+			self.strings,
 			self.scope.assumption_env,
 			ty,
 			NormalizationDepth::Deep,
@@ -211,7 +211,7 @@ impl<'a> BodyContext<'a> {
 			}
 			Err(SolverError::Cycle(cycle)) => {
 				let diagnostic =
-					self.sema.cycle_diagnostic(&self.strings, &cycle, site);
+					self.sema.cycle_diagnostic(self.strings, &cycle, site);
 				self.sema.diagnostics.push(diagnostic);
 				Err(())
 			}
@@ -367,7 +367,7 @@ impl<'a> BodyContext<'a> {
 			.with_code(DiagnosticCode::UnableToCoerce.code())
 			.with_message(format!(
 				"unable to coerce to type `{}`",
-				self.sema.type_formatter(&self.strings).display_type(target)
+				self.sema.type_formatter(self.strings).display_type(target)
 			))
 			.with_label(self.source_span(expr).primary_label())
 	}
@@ -378,7 +378,7 @@ impl<'a> BodyContext<'a> {
 		actual: TypeIndex,
 		span: TextSpan,
 	) -> Diagnostic<FileId> {
-		let formatter = self.sema.type_formatter(&self.strings);
+		let formatter = self.sema.type_formatter(self.strings);
 		Diagnostic::error()
 			.with_code(DiagnosticCode::TypeMistmatch.code())
 			.with_message("type mismatch")
@@ -6219,7 +6219,8 @@ mod tests {
 		case.diagnostics().assert_none();
 		let (scope, named) = first_param(&case, "named");
 		let (_, written) = first_param(&case, "written");
-		let without_values = RewriteFlags::ALL.without(RewriteFlags::VALUES);
+		let without_values =
+			RewriteFlags::EQUALITIES.union(RewriteFlags::DEFINITIONS);
 		let mut normalize = |ty, facts| {
 			case.sema
 				.normalize(

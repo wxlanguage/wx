@@ -740,13 +740,13 @@ impl<'r> ImportResolver<'r> {
 					(target, visibility, reachable)
 				}
 				// Recovered as an error, as any path's ambiguity is.
-				BindingLookup::Ambiguous(candidates) => {
+				BindingLookup::Ambiguous(mut candidates) => {
 					let ambiguity = report_ambiguous_identifier(
 						self.namespaces,
 						self.strings,
 						key.symbol,
 						source_span,
-						candidates,
+						&mut candidates,
 					);
 					return (ImportSlot::Poisoned, Some(ambiguity));
 				}
@@ -891,13 +891,13 @@ impl<'r> ImportResolver<'r> {
 					}
 					(target, reachable)
 				}
-				BindingLookup::Ambiguous(candidates) => {
+				BindingLookup::Ambiguous(mut candidates) => {
 					let diagnostic = report_ambiguous_identifier(
 						self.namespaces,
 						self.strings,
 						segment.segment.inner,
 						source_span,
-						candidates,
+						&mut candidates,
 					);
 					self.diagnostics.push(diagnostic);
 					return Err(());
@@ -1092,7 +1092,7 @@ pub(super) fn report_ambiguous_identifier(
 	strings: &StringInterner,
 	name: SymbolU32,
 	span: SourceSpan,
-	mut candidates: Box<[GlobCandidate]>,
+	candidates: &mut [GlobCandidate],
 ) -> Diagnostic<FileId> {
 	let resolved_name = strings.resolve(name).unwrap();
 	let mut diagnostic = Diagnostic::error()

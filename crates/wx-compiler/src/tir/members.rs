@@ -530,7 +530,6 @@ impl Semantics {
 	/// Resolve the trait declaration named by the first segment of a
 	/// qualified type path: an associated type or a function. Later segments
 	/// use ordinary type-member lookup.
-	#[allow(clippy::too_many_arguments)]
 	pub(super) fn resolve_trait_qualified_type_member(
 		&mut self,
 		strings: &StringInterner,
@@ -2198,7 +2197,7 @@ mod tests {
 				.enumerate()
 				.filter(|&(_, &at)| at == span)
 				.map(|(index, _)| ast::ExprId(index as u32))
-				.last()
+				.next_back()
 				.unwrap_or_else(|| {
 					panic!("no expression `{}`", &written[..dot])
 				});

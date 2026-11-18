@@ -961,7 +961,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let trait_env = sema.traits[usize::from(trait_index)].env;
 		let args = sema.generic_args.push([(target.inner, target.span)]);
 		let result = sema.check_bound_requirements(
-			&self.strings,
+			self.strings,
 			sema.assumption_envs.of_frame(scope),
 			BoundRequirements::Frame {
 				env: trait_env,
@@ -970,7 +970,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			at_target,
 			owner,
 		);
-		sema.report_unfinished(&self.strings, result, at_target)?;
+		sema.report_unfinished(self.strings, result, at_target)?;
 
 		for member_index in
 			0..sema.decls.traits[usize::from(trait_index)].members.len()
@@ -986,7 +986,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			// that has no meaning; one the impl omits with no default is
 			// reported missing above.
 			let value = match sema.assoc_value(
-				&self.strings,
+				self.strings,
 				ImplMember {
 					impl_index,
 					declaration: declaration_index,
@@ -1021,7 +1021,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					_ => at_target,
 				};
 			let result = sema.check_bound_requirements(
-				&self.strings,
+				self.strings,
 				sema.assumption_envs.of_frame(scope),
 				BoundRequirements::AssociatedType {
 					declaration: declaration_index,
@@ -1032,7 +1032,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				reference,
 				owner,
 			);
-			sema.report_unfinished(&self.strings, result, reference)?;
+			sema.report_unfinished(self.strings, result, reference)?;
 		}
 		Ok(())
 	}
@@ -1081,7 +1081,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				})
 			else {
 				sema.report_not_a_member(
-					&self.strings,
+					self.strings,
 					trait_index,
 					member,
 					name,
@@ -1105,7 +1105,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 						found,
 						target,
 					);
-					sema.report_unfinished(&self.strings, result, at_member)?;
+					sema.report_unfinished(self.strings, result, at_member)?;
 				}
 				(
 					MemberKind::Constant(expected),
@@ -1118,14 +1118,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 						found,
 						target,
 					);
-					sema.report_unfinished(&self.strings, result, at_member)?;
+					sema.report_unfinished(self.strings, result, at_member)?;
 				}
 				(
 					MemberKind::AssociatedType(_),
 					MemberKind::AssociatedType(_),
 				) => {}
 				_ => sema.report_kind_mismatch(
-					&self.strings,
+					self.strings,
 					trait_index,
 					declaration,
 					member,
@@ -1145,12 +1145,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			.map(|member| sema.decls.name(member.kind))
 			.collect();
 		if !missing.is_empty() {
-			sema.report_missing(
-				&self.strings,
-				trait_index,
-				&missing,
-				at_target,
-			);
+			sema.report_missing(self.strings, trait_index, &missing, at_target);
 		}
 		Ok(())
 	}
@@ -1210,7 +1205,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		);
 		if expected_own != own {
 			sema.report_count_mismatch(
-				&self.strings,
+				self.strings,
 				trait_index,
 				member,
 				(declaration, function),
@@ -1220,9 +1215,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 			return Ok(());
 		}
 		let contract =
-			sema.contract_env(&self.strings, declaration, function, target)?;
+			sema.contract_env(self.strings, declaration, function, target)?;
 		if !sema.check_own_bounds(
-			&self.strings,
+			self.strings,
 			trait_index,
 			(declaration, function),
 			contract,
@@ -1243,7 +1238,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let expected_count = sema.types.list(expected_params).len();
 		if expected_count != params {
 			sema.report_count_mismatch(
-				&self.strings,
+				self.strings,
 				trait_index,
 				member,
 				(declaration, function),
@@ -1315,14 +1310,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 				},
 			);
 			let expected = sema.normalize(
-				&self.strings,
+				self.strings,
 				contract,
 				expected,
 				NormalizationDepth::Deep,
 				RewriteFlags::ALL,
 			)?;
 			let found = sema.normalize(
-				&self.strings,
+				self.strings,
 				contract,
 				found,
 				NormalizationDepth::Deep,
@@ -1365,13 +1360,13 @@ impl<'ast> SemanticsBuilder<'ast> {
 				}
 			};
 			let head = sema.signature_mismatch(
-				&self.strings,
+				self.strings,
 				trait_index,
 				member,
 				function,
 			);
 			sema.report_type_mismatch(
-				&self.strings,
+				self.strings,
 				self.asts,
 				head,
 				(expected_file, written(expected_file, &expected_syntax)),
@@ -1407,14 +1402,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 			},
 		);
 		let expected = sema.normalize(
-			&self.strings,
+			self.strings,
 			sema.assumption_envs.of_frame(env),
 			expected,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
 		)?;
 		let found = sema.normalize(
-			&self.strings,
+			self.strings,
 			sema.assumption_envs.of_frame(env),
 			found,
 			NormalizationDepth::Deep,
@@ -1456,10 +1451,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 			.with_message(format!(
 				"constant `{}` has an incompatible type for trait `{}`",
 				self.strings.resolve(name).unwrap(),
-				sema.trait_name(&self.strings, trait_index),
+				sema.trait_name(self.strings, trait_index),
 			));
 		sema.report_type_mismatch(
-			&self.strings,
+			self.strings,
 			self.asts,
 			head,
 			(expected_file, WrittenType::Written(expected_ty)),
@@ -1511,7 +1506,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			format!("`{}`", self.strings.resolve(name.inner).unwrap())
 		};
 		let diagnostic = sema
-			.signature_mismatch(&self.strings, trait_index, member, function)
+			.signature_mismatch(self.strings, trait_index, member, function)
 			.with_label(
 				SourceSpan::new(
 					sema.decls.file_id(

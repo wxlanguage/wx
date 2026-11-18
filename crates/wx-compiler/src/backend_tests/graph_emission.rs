@@ -572,7 +572,7 @@ fn lower_source(source: &str) -> (StringInterner, mir::MIR) {
 	let mut sema = crate::tir::check(&unit, &mut strings);
 	let mir = crate::tir::lower(&mut sema, &strings).ok();
 	let diagnostics = sema.diagnostics();
-	crate::testing::DiagnosticView::new("tir", &diagnostics, &unit.files)
+	crate::testing::DiagnosticView::new("tir", diagnostics, &unit.files)
 		.assert_no_errors();
 	(strings, mir.expect("source lowers"))
 }

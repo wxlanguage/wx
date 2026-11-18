@@ -817,10 +817,6 @@ impl RewriteFlags {
 		Self(self.0 | other.0)
 	}
 
-	pub(super) const fn without(self, other: Self) -> Self {
-		Self(self.0 & !other.0)
-	}
-
 	pub(super) fn contains(self, other: Self) -> bool {
 		self.0 & other.0 == other.0
 	}

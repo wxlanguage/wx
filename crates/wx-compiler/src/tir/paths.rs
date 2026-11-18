@@ -431,13 +431,13 @@ impl<'r> PathResolver<'r> {
 				}
 				BindingTarget::Error
 			}
-			BindingLookup::Ambiguous(candidates) => {
+			BindingLookup::Ambiguous(mut candidates) => {
 				self.diagnostics.push(report_ambiguous_identifier(
 					&self.decls.namespaces,
 					self.strings,
 					segments[stopped_at as usize].ident.inner,
 					SourceSpan::new(file_id, span),
-					candidates,
+					&mut candidates,
 				));
 				BindingTarget::Error
 			}

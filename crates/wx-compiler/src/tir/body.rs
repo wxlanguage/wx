@@ -179,12 +179,10 @@ pub(super) struct ArmRange {
 	len: u32,
 }
 
-/// One arm of a match. Its bindings are declared in `scope`, which holds
-/// `body`.
+/// One arm of a match.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct Arm {
-	pub(super) scope: ScopeIdx,
 	pub(super) pattern: PatIdx,
 	pub(super) body: ExprIdx,
 }
@@ -297,9 +295,25 @@ pub(super) enum ExprKind {
 	Global(GlobalIdx),
 	/// A memory's handle, of its own nominal type (`Type::Memory`): the
 	/// receiver of `Memory`'s methods (`heap.grow(1)`).
-	Memory(MemoryIdx),
+	Memory(
+		#[cfg_attr(
+			not(test),
+			expect(
+				dead_code,
+				reason = "the type carries it for lowering; the test printer reads it"
+			)
+		)]
+		MemoryIdx,
+	),
 	/// A function as a value, of its own zero-sized type (`Type::Function`),
 	/// with its type arguments, flat as a call's.
+	#[cfg_attr(
+		not(test),
+		expect(
+			dead_code,
+			reason = "the type carries it for lowering; the test printer reads it"
+		)
+	)]
 	Function {
 		function: FunctionIdx,
 		type_args: GenericArgs,
@@ -1343,7 +1357,7 @@ mod tests {
 			.enumerate()
 			.filter(|&(_, &at)| at == span)
 			.map(|(index, _)| ExprId(index as u32))
-			.last()
+			.next_back()
 			.unwrap_or_else(|| panic!("no expression `{object}`"));
 		let body = case.body(function);
 		let operand = body

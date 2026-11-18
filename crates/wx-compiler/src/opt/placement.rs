@@ -1086,7 +1086,7 @@ mod tests {
 				.unwrap();
 			// MIR can introduce assignment temporaries which also have stored
 			// columns. Only the source values and counter should be demanded.
-			assert!(graph.width(header) >= width + 1);
+			assert!(graph.width(header) > width);
 			let uses = Uses::collect(&graph);
 			let plan = plan(&graph);
 			let phis: Vec<_> = uses.used_nodes().iter().copied().filter(|&node| matches!(graph.kind(node), NodeKind::Phi { join, .. } if join == header)).collect();
@@ -1200,10 +1200,8 @@ mod tests {
 			.kinds
 			.iter()
 			.enumerate()
-			.filter_map(|(index, kind)| {
-				matches!(kind, NodeKind::Result { .. })
-					.then(|| NodeId::new(index as u32))
-			})
+			.filter(|(_, kind)| matches!(kind, NodeKind::Result { .. }))
+			.map(|(index, _)| NodeId::new(index as u32))
 			.collect();
 		assert_eq!(results.len(), 2);
 		let invalid = graph.push(

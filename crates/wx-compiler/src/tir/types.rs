@@ -197,16 +197,6 @@ impl TypeList {
 		self.len == 0
 	}
 
-	/// The first `len` elements, sharing this list's storage: the arguments
-	/// of a flat list's outer frames.
-	pub(super) fn prefix(self, len: usize) -> TypeList {
-		assert!(len <= self.len(), "a prefix longer than its list");
-		TypeList {
-			start: self.start,
-			len: len as u32,
-		}
-	}
-
 	/// The elements after the first `skip`, sharing this list's storage: a
 	/// method's parameters after its receiver.
 	pub(super) fn suffix(self, skip: usize) -> TypeList {

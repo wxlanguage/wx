@@ -378,6 +378,10 @@ impl Semantics {
 /// `Struct` and the other item kinds use indices allocated in `decls.rs`
 /// and keep resolved data in index-aligned slots here.
 #[derive(Clone, Copy)]
+#[expect(
+	dead_code,
+	reason = "most locations repeat their query's own index; tests check that"
+)]
 pub enum SignatureLocation {
 	Trait(TraitIdx),
 	TraitImpl(TraitImplIdx),
@@ -1659,7 +1663,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		self.check_declarations(sema);
 		self.check_constant_bodies(sema);
 		self.check_bodies(sema);
-		sema.exports = sema.resolve_exports(&self.strings, self.asts);
+		sema.exports = sema.resolve_exports(self.strings, self.asts);
 		debug_assert!(
 			self.query_state
 				.values()
@@ -1681,7 +1685,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			for obligation in
 				&obligations[range.start as usize..range.end as usize]
 			{
-				sema.check_obligation(&self.strings, obligation)
+				sema.check_obligation(self.strings, obligation)
 					.expect("every signature and every constant body exists");
 			}
 			if let SignatureQuery::TraitImpl(impl_index) = entry.node.query() {
@@ -1736,14 +1740,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 				| AstNodeRef::TraitImplConstant { const_index, .. }
 				| AstNodeRef::InherentImplConst { const_index, .. }
 				| AstNodeRef::EnumVariant { const_index, .. } => {
-					sema.evaluate_constant(&self.strings, const_index);
+					sema.evaluate_constant(self.strings, const_index);
 					// A body built with an error has no value, but what else
 					// it recorded is still decided and reported. Any other
 					// was decided when its constant was checked.
-					sema.decide_obligations(&self.strings, const_index);
+					sema.decide_obligations(self.strings, const_index);
 				}
 				AstNodeRef::Enum { enum_index, .. } => {
-					sema.check_discriminants(&self.strings, enum_index);
+					sema.check_discriminants(self.strings, enum_index);
 				}
 				_ => {}
 			}
@@ -1804,12 +1808,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 					let (mut body, obligations) =
 						BodyBuilder::new(sema, self, scope, owner)
 							.check_body(value, ty);
-					BodyContext::new(sema, &self.strings, &mut body, scope)
+					BodyContext::new(sema, self.strings, &mut body, scope)
 						.decide(obligations);
 					sema.global_bodies[usize::from(global_index)] =
 						Some(sema.push_body(body));
 					if !sema.diagnostics[reported..].has_errors() {
-						sema.evaluate_global(&self.strings, global_index);
+						sema.evaluate_global(self.strings, global_index);
 					}
 				}
 				_ => {}
@@ -1838,7 +1842,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			sema, self, scope, owner,
 		)
 		.check_function(function_index, signature, block);
-		BodyContext::new(sema, &self.strings, &mut body, scope)
+		BodyContext::new(sema, self.strings, &mut body, scope)
 			.decide(obligations);
 		let statics = body.statics().to_vec();
 		sema.function_implementations[usize::from(function_index)] =
@@ -1852,7 +1856,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		{
 			for expr in statics {
 				let _ =
-					sema.static_value(&self.strings, function_index, &[], expr);
+					sema.static_value(self.strings, function_index, &[], expr);
 			}
 		}
 	}
@@ -1916,7 +1920,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				.map(|p| p.name())
 			{
 				sema.diagnostics.push(report_duplicate_generic_param(
-					&self.strings,
+					self.strings,
 					file_id,
 					param.name(),
 					colliding_param,
@@ -2084,7 +2088,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			let ids: Box<[BoundId]> =
 				occurrences.iter().map(|o| o.id).collect();
 			sema.collect_value_clauses(
-				&self.strings,
+				self.strings,
 				&mut equalities,
 				*subject,
 				&ids,
@@ -2198,7 +2202,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			})
 			.collect();
 		let args = sema.resolve_type_args(
-			&self.strings,
+			self.strings,
 			obligations,
 			scope,
 			self.asts,
@@ -3274,7 +3278,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					}
 				};
 				sema.resolve_global_signature(
-					&self.strings,
+					self.strings,
 					obligations,
 					file_id,
 					global_index,
@@ -3326,7 +3330,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					span: self.ast(file_id).type_span(*ty),
 				};
 				sema.resolve_global_signature(
-					&self.strings,
+					self.strings,
 					obligations,
 					file_id,
 					global_index,
@@ -3974,7 +3978,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			)),
 			None => {
 				sema.diagnostics.push(report_pointer_without_memory(
-					&self.files,
+					self.files,
 					scope.file_id,
 					span,
 				));
@@ -4101,7 +4105,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					member,
 				);
 				return sema.type_constant_length(
-					&self.strings,
+					self.strings,
 					self.ast(scope.file_id),
 					scope,
 					selected,
@@ -4120,7 +4124,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 						);
 						let selected = sema
 							.resolve_trait_bound_path(
-								&self.strings,
+								self.strings,
 								self.asts,
 								scope.file_id,
 								scope.namespace,
@@ -4128,7 +4132,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 							)
 							.and_then(|required_trait| {
 								sema.select_qualified_constant(
-									&self.strings,
+									self.strings,
 									obligations,
 									scope,
 									receiver,
@@ -4137,7 +4141,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 								)
 							});
 						return sema.type_constant_length(
-							&self.strings,
+							self.strings,
 							self.ast(scope.file_id),
 							scope,
 							selected,
@@ -4179,7 +4183,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			PathResolver::new(
 				&mut sema.diagnostics,
 				&mut sema.resolutions,
-				&self.strings,
+				self.strings,
 				&sema.decls,
 				self.asts,
 			)
@@ -4202,7 +4206,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					segments.split_last().expect("a path has a segment");
 				if prefix.is_empty() {
 					sema.report_length_not_constant(
-						&self.strings,
+						self.strings,
 						"type",
 						member.ident.inner,
 						site,
@@ -4224,7 +4228,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					member,
 				);
 				return sema.type_constant_length(
-					&self.strings,
+					self.strings,
 					self.ast(scope.file_id),
 					scope,
 					selected,
@@ -4239,7 +4243,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		if let BindingTarget::Inaccessible(_) = target {
 			sema.diagnostics.push(report_private_identifier(
 				&sema.decls.namespaces,
-				&self.strings,
+				self.strings,
 				name.inner,
 				SourceSpan::new(scope.file_id, name.span),
 				Some(key),
@@ -4250,7 +4254,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			kind
 		else {
 			sema.report_length_not_constant(
-				&self.strings,
+				self.strings,
 				kind.noun(),
 				name.inner,
 				site,
@@ -4401,7 +4405,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					);
 				}
 				sema.diagnostics.push(report_type_args_not_allowed(
-					&self.strings,
+					self.strings,
 					&sema.decls,
 					self.ast(scope.file_id),
 					scope.file_id,
@@ -4439,7 +4443,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					);
 				}
 				let diagnostic = sema.report_type_args_on_impl_self(
-					&self.strings,
+					self.strings,
 					self.ast(scope.file_id),
 					scope.file_id,
 					first,
@@ -4453,7 +4457,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			let walk = PathResolver::new(
 				&mut sema.diagnostics,
 				&mut sema.resolutions,
-				&self.strings,
+				self.strings,
 				&sema.decls,
 				self.asts,
 			)
@@ -4465,7 +4469,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			if let BindingTarget::Inaccessible(_) = walk.target {
 				sema.diagnostics.push(report_private_identifier(
 					&sema.decls.namespaces,
-					&self.strings,
+					self.strings,
 					stopped.ident.inner,
 					SourceSpan::new(scope.file_id, stopped.ident.span),
 					Some(loc),
@@ -4531,7 +4535,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					);
 				}
 				sema.diagnostics.push(report_type_args_not_allowed(
-					&self.strings,
+					self.strings,
 					&sema.decls,
 					self.ast(scope.file_id),
 					scope.file_id,
@@ -4582,7 +4586,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 							})
 							.collect();
 						let type_args = sema.resolve_type_args(
-							&self.strings,
+							self.strings,
 							obligations,
 							scope,
 							self.asts,
@@ -4647,7 +4651,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					})
 					.collect();
 				let type_args = sema.resolve_type_args(
-					&self.strings,
+					self.strings,
 					obligations,
 					scope,
 					self.asts,
@@ -4673,7 +4677,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 						);
 					}
 					sema.diagnostics.push(report_type_args_not_allowed(
-						&self.strings,
+						self.strings,
 						&sema.decls,
 						self.ast(scope.file_id),
 						scope.file_id,
@@ -4707,7 +4711,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 						);
 					}
 					sema.diagnostics.push(report_type_args_not_allowed(
-						&self.strings,
+						self.strings,
 						&sema.decls,
 						self.ast(scope.file_id),
 						scope.file_id,
@@ -4725,7 +4729,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			| DeclKind::TypeSet(_)) => {
 				sema.diagnostics.push(report_not_a_type(
 					scope.file_id,
-					&self.strings,
+					self.strings,
 					stopped.ident,
 					kind,
 				));
@@ -4767,7 +4771,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					})
 					.collect();
 				let type_args = sema.resolve_type_args(
-					&self.strings,
+					self.strings,
 					obligations,
 					scope,
 					self.asts,
@@ -4797,7 +4801,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 						);
 					}
 					sema.diagnostics.push(report_type_args_not_allowed(
-						&self.strings,
+						self.strings,
 						&sema.decls,
 						self.ast(scope.file_id),
 						scope.file_id,
@@ -4872,7 +4876,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			})
 			.collect();
 		sema.resolve_type_args(
-			&self.strings,
+			self.strings,
 			obligations,
 			scope,
 			self.asts,
@@ -4906,7 +4910,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			);
 		}
 		sema.diagnostics.push(report_type_args_not_allowed(
-			&self.strings,
+			self.strings,
 			&sema.decls,
 			self.ast(scope.file_id),
 			scope.file_id,
@@ -5008,7 +5012,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					return TypeIndex::ERROR;
 				}
 				let Some(required_trait) = sema.resolve_trait_bound_path(
-					&self.strings,
+					self.strings,
 					self.asts,
 					scope.file_id,
 					scope.namespace,
@@ -5024,7 +5028,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				// `resolve_type_member_path`.
 				let first = &segments[0];
 				let Ok(declaration) = sema.resolve_trait_qualified_type_member(
-					&self.strings,
+					self.strings,
 					obligations,
 					scope.generic_env,
 					base_ty,
@@ -5639,7 +5643,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let ids: Box<[BoundId]> = occurrences.iter().map(|o| o.id).collect();
 		let mut equalities = Vec::new();
 		sema.collect_value_clauses(
-			&self.strings,
+			self.strings,
 			&mut equalities,
 			subject,
 			&ids,
@@ -5746,7 +5750,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			}
 		};
 		let Some(trait_index) = sema.resolve_trait_bound_path(
-			&self.strings,
+			self.strings,
 			self.asts,
 			file_id,
 			namespace,
@@ -5803,7 +5807,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				MemberLookup::Ambiguous(candidates) => {
 					let diagnostic = report_ambiguous_type_member(
 						file_id,
-						&self.strings,
+						self.strings,
 						&sema.decls,
 						binding.name,
 						&candidates,
@@ -5854,7 +5858,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				};
 				sema.diagnostics.push(report_not_a_binding_member(
 					file_id,
-					&self.strings,
+					self.strings,
 					binding.name,
 					sema.decls.name(trait_index).inner,
 					noun,
@@ -5878,7 +5882,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					&& !declared.is_const_kind()
 				{
 					let diagnostic = sema.report_typed_constant_bound(
-						&self.strings,
+						self.strings,
 						SourceSpan::new(
 							file_id,
 							TextSpan::new(
@@ -5899,7 +5903,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			{
 				sema.diagnostics.push(report_duplicate_assoc_type_binding(
 					file_id,
-					&self.strings,
+					self.strings,
 					binding.name,
 				));
 				continue;
@@ -6144,11 +6148,10 @@ pub(super) mod tests {
 		let at = |context: &str, name: &str| {
 			let site =
 				Site::Type(SourceSpan::new(file_id, span_of(context, name)));
-			let resolution =
-				case.sema.resolutions.get(site).unwrap_or_else(|| {
-					panic!("`{name}` in `{context}` is not recorded")
-				});
-			resolution
+
+			case.sema.resolutions.get(site).unwrap_or_else(|| {
+				panic!("`{name}` in `{context}` is not recorded")
+			})
 		};
 		let declared = |referent: Reference| {
 			let Reference::Item {

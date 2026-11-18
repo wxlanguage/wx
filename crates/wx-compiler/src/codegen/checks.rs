@@ -26,7 +26,7 @@ fn lower(source: &str) -> (ast::StringInterner, mir::MIR) {
 	let mut sema = crate::tir::check(&unit, &mut strings);
 	let mir = crate::tir::lower(&mut sema, &strings).ok();
 	let diagnostics = sema.diagnostics();
-	DiagnosticView::new("tir", &diagnostics, &unit.files).assert_no_errors();
+	DiagnosticView::new("tir", diagnostics, &unit.files).assert_no_errors();
 	(strings, mir.expect("source lowers"))
 }
 

@@ -479,10 +479,9 @@ mod tests {
 			.regions
 			.iter()
 			.enumerate()
-			.filter_map(|(index, region)| {
-				matches!(region.kind, RegionKind::If { .. }).then(|| {
-					locations.entry(RegionId::new(index as u32)).unwrap()
-				})
+			.filter(|(_, region)| matches!(region.kind, RegionKind::If { .. }))
+			.map(|(index, _)| {
+				locations.entry(RegionId::new(index as u32)).unwrap()
 			})
 			.collect();
 		assert_eq!(decisions.len(), 2);
