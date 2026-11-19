@@ -263,6 +263,11 @@ pub enum ExportedItem {
 }
 
 impl Semantics {
+	/// The namespace in which a body's names and field accesses are checked.
+	pub fn body_scope(&self, owner: BodyOwner) -> Scope {
+		self.owner_scope(owner).namespace
+	}
+
 	/// Decides what building a constant's body left undecided.
 	pub(super) fn decide_obligations(
 		&mut self,

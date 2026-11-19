@@ -41,6 +41,73 @@ use crate::tir::solver::SolverError;
 use crate::tir::types::{GenericArgs, GenericEnvOwner, Type, TypeIndex};
 use crate::vfs::FileId;
 
+/// Validate a positional pattern list and return the element range covered by
+/// `..`. Without a rest, every element must be written and the range is empty.
+/// `rest` counts written patterns before `..`, not entries in the source list.
+/// Callers handle duplicate rests before calling this rule.
+pub fn positional_pattern_gap(
+	written: usize,
+	rest: Option<usize>,
+	count: usize,
+) -> Option<Range<usize>> {
+	let before = rest.unwrap_or(written);
+	if before > written
+		|| written > count
+		|| (rest.is_none() && written != count)
+	{
+		return None;
+	}
+	Some(before..count - (written - before))
+}
+
+/// How the written list of `Name(...)` reads against the fields of `Name`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub enum FieldListShape {
+	/// One pattern for all the fields, as a tuple of them (`P(p)`).
+	Whole,
+	/// Several patterns for a lone field whose type is a tuple (`W(a, b)`).
+	LoneTuple,
+	/// Each written pattern, or `..`, for its own field.
+	PerField,
+}
+
+impl FieldListShape {
+	/// `written` patterns, with `..` after the first `rest` of them, against
+	/// fields of which `lone_tuple_field` says whether there is exactly one,
+	/// of a tuple type.
+	pub fn of(
+		written: usize,
+		rest: Option<usize>,
+		lone_tuple_field: bool,
+	) -> Self {
+		if written == 1 && rest.is_none() {
+			Self::Whole
+		} else if lone_tuple_field {
+			Self::LoneTuple
+		} else {
+			Self::PerField
+		}
+	}
+}
+
+/// The patterns of a positional list, and how many come before its first `..`.
+fn written_positions(
+	elements: &[ast::PatternElement],
+) -> (usize, Option<usize>) {
+	let mut patterns = 0;
+	let mut rest = None;
+	for element in elements {
+		match element {
+			ast::PatternElement::Pattern(_) => patterns += 1,
+			ast::PatternElement::Rest(_) => {
+				rest.get_or_insert(patterns);
+			}
+		}
+	}
+	(patterns, rest)
+}
+
 /// The state of checking one pattern: where it is written, and the names it
 /// has bound.
 pub(super) struct PatternContext {
@@ -179,12 +246,10 @@ impl BodyBuilder<'_, '_> {
 				self.bind(name, mut_span, expected, span, context)
 			}
 			ast::Pattern::Constant { path } => {
-				let expected = self.check_refutable(context, span, expected);
-				self.check_value_path(ast.list(path), span, expected)
+				self.check_value_path(ast.list(path), span, expected, context)
 			}
 			ast::Pattern::Literal(literal) => {
-				let expected = self.check_refutable(context, span, expected);
-				self.check_literal(&literal, span, expected)
+				self.check_literal(&literal, span, expected, context)
 			}
 			ast::Pattern::Or(alternatives) => {
 				// The alternatives of a `|` bind the same names: the same
@@ -212,20 +277,20 @@ impl BodyBuilder<'_, '_> {
 			ast::Pattern::Destructure(destructure) => {
 				self.check_destructure(destructure, span, expected, context)
 			}
-			ast::Pattern::Error => self.error_pattern(span),
+			ast::Pattern::Error => self.error_pattern(span, expected),
 		}
 	}
 
-	/// A `local` always matches, so a test in one is a mistake. The rest of
-	/// the pattern is still checked, so the bindings it makes resolve; every
-	/// test is checked against `ERROR`, so it says nothing more, and only
-	/// the first one is reported.
-	fn check_refutable(
+	/// Whether this position and subject permit a value test. Failure is
+	/// separate from the subject type: callers still build an error pattern
+	/// of that type, but do not diagnose its literal/value compatibility.
+	/// A local's first test is reported once, without abandoning its siblings.
+	fn check_pattern_test(
 		&mut self,
 		context: &mut PatternContext,
 		span: TextSpan,
 		expected: TypeIndex,
-	) -> TypeIndex {
+	) -> Result<(), ()> {
 		if context.refutable {
 			return self.check_pattern_equality(expected, span);
 		}
@@ -244,7 +309,7 @@ impl BodyBuilder<'_, '_> {
 					),
 			);
 		}
-		TypeIndex::ERROR
+		Err(())
 	}
 
 	/// A constant or literal pattern compares the matched value with a known
@@ -257,9 +322,9 @@ impl BodyBuilder<'_, '_> {
 		&mut self,
 		ty: TypeIndex,
 		span: TextSpan,
-	) -> TypeIndex {
+	) -> Result<(), ()> {
 		if ty == TypeIndex::ERROR {
-			return ty;
+			return Err(());
 		}
 		let normalized = self.context().normalized(ty);
 		match *self.sema.types.resolve(normalized) {
@@ -268,9 +333,9 @@ impl BodyBuilder<'_, '_> {
 			| Type::Infer
 			| Type::ConstInt
 			| Type::ConstFloat
-			| Type::ConstChar => return ty,
+			| Type::ConstChar => return Ok(()),
 			// Unplaced data has its own diagnostic too.
-			Type::Slice { .. } | Type::Array { .. } => return ty,
+			Type::Slice { .. } | Type::Array { .. } => return Ok(()),
 			_ => {}
 		}
 		let trait_index = self
@@ -285,17 +350,17 @@ impl BodyBuilder<'_, '_> {
 			normalized,
 			trait_index,
 		) {
-			Ok(Some(_)) => ty,
+			Ok(Some(_)) => Ok(()),
 			Ok(None) => {
 				self.report_pattern_eq_violation(ty, trait_index, span);
-				TypeIndex::ERROR
+				Err(())
 			}
 			Err(SolverError::Overflow) => {
 				let site = SourceSpan::new(self.scope.file_id, span);
 				self.sema
 					.diagnostics
 					.push(self.sema.overflow_diagnostic(site));
-				TypeIndex::ERROR
+				Err(())
 			}
 			Err(SolverError::Cycle(cycle)) => {
 				let site = SourceSpan::new(self.scope.file_id, span);
@@ -305,10 +370,10 @@ impl BodyBuilder<'_, '_> {
 					site,
 				);
 				self.sema.diagnostics.push(diagnostic);
-				TypeIndex::ERROR
+				Err(())
 			}
 			// Another construct owns the error or the answer is not final.
-			Err(SolverError::Pending | SolverError::Poisoned) => ty,
+			Err(SolverError::Pending | SolverError::Poisoned) => Ok(()),
 		}
 	}
 
@@ -592,12 +657,13 @@ impl BodyBuilder<'_, '_> {
 				let Some((owner, ty, types)) =
 					self.pattern_owner(ast.list(path), span, expected)
 				else {
-					return self.check_poisoned(elements, span, context);
+					return self
+						.check_poisoned(elements, span, expected, context);
 				};
 				let Some(fields) = self
 					.check_field_list(elements, owner, &types, span, context)
 				else {
-					return self.error_pattern(span);
+					return self.error_pattern(span, expected);
 				};
 				self.push_fields_pattern(owner, fields, ty, span)
 			}
@@ -610,12 +676,12 @@ impl BodyBuilder<'_, '_> {
 							self.check_field(field, TypeIndex::ERROR, context);
 						}
 					}
-					return self.error_pattern(span);
+					return self.error_pattern(span, expected);
 				};
 				let Some(children) =
 					self.check_fields(fields, owner, &types, span, context)
 				else {
-					return self.error_pattern(span);
+					return self.error_pattern(span, expected);
 				};
 				let fields = self.fields_value(children, &types, span);
 				self.push_fields_pattern(owner, fields, ty, span)
@@ -657,7 +723,7 @@ impl BodyBuilder<'_, '_> {
 						 which, name the variant: `{name}::Variant`"
 					)),
 			);
-			return self.error_pattern(span);
+			return self.error_pattern(span, ty);
 		}
 		self.body
 			.push_pattern(PatternKind::Fields { owner, fields }, ty, span)
@@ -706,13 +772,13 @@ impl BodyBuilder<'_, '_> {
 				if expected != TypeIndex::ERROR {
 					self.report_pattern_mismatch(expected, "a tuple", span);
 				}
-				return self.check_poisoned(elements, span, context);
+				return self.check_poisoned(elements, span, expected, context);
 			}
 		};
 		let Some(children) =
 			self.check_elements(elements, &types, span, context, None)
 		else {
-			return self.error_pattern(span);
+			return self.error_pattern(span, expected);
 		};
 		let children = self.body.push_patterns(children);
 		self.body
@@ -732,17 +798,24 @@ impl BodyBuilder<'_, '_> {
 		span: TextSpan,
 		context: &mut PatternContext,
 	) -> Option<PatIdx> {
-		match (types, self.ast().list(elements)) {
-			(_, &[ast::PatternElement::Pattern(pattern)]) => {
+		let written = self.ast().list(elements);
+		let lone_tuple_field = matches!(
+			types,
+			&[field] if matches!(self.sema.types.resolve(field), Type::Tuple { .. })
+		);
+		let (patterns, rest) = written_positions(written);
+		match FieldListShape::of(patterns, rest, lone_tuple_field) {
+			FieldListShape::Whole => {
+				let [ast::PatternElement::Pattern(pattern)] = *written else {
+					unreachable!("a whole list is one pattern");
+				};
 				let ty = self.sema.types.intern_tuple(types);
 				Some(self.check_pattern(pattern, ty, context))
 			}
-			(&[field], _)
-				if let Type::Tuple { .. } = self.sema.types.resolve(field) =>
-			{
-				Some(self.check_tuple(elements, span, field, context))
+			FieldListShape::LoneTuple => {
+				Some(self.check_tuple(elements, span, types[0], context))
 			}
-			_ => {
+			FieldListShape::PerField => {
 				let children = self.check_elements(
 					elements,
 					types,
@@ -801,11 +874,11 @@ impl BodyBuilder<'_, '_> {
 			}
 		}
 		let count = types.len();
-		let fits = match rest {
-			Some(_) => written.len() <= count,
-			None => written.len() == count,
-		};
-		if !fits {
+		let Some(gap) = positional_pattern_gap(
+			written.len(),
+			rest.map(|(at, _)| at),
+			count,
+		) else {
 			self.report_element_count(
 				count,
 				written.len(),
@@ -817,15 +890,15 @@ impl BodyBuilder<'_, '_> {
 				self.check_pattern(pattern, TypeIndex::ERROR, context);
 			}
 			return None;
-		}
-		let before = rest.map_or(written.len(), |(at, _)| at);
-		let after = written.len() - before;
+		};
+		let before = gap.start;
+		let after = count - gap.end;
 		let mut children = Vec::with_capacity(count);
 		for (at, &pattern) in written[..before].iter().enumerate() {
 			children.push(self.check_pattern(pattern, types[at], context));
 		}
 		if let Some((_, rest_span)) = rest {
-			for &ty in &types[before..count - after] {
+			for &ty in &types[gap] {
 				children.push(self.body.push_pattern(
 					PatternKind::Wildcard,
 					ty,
@@ -1171,9 +1244,10 @@ impl BodyBuilder<'_, '_> {
 		literal: &ast::Literal,
 		span: TextSpan,
 		expected: TypeIndex,
+		context: &mut PatternContext,
 	) -> PatIdx {
-		if expected == TypeIndex::ERROR {
-			return self.error_pattern(span);
+		if self.check_pattern_test(context, span, expected).is_err() {
+			return self.error_pattern(span, expected);
 		}
 		match *literal {
 			ast::Literal::Int(value) => {
@@ -1186,7 +1260,7 @@ impl BodyBuilder<'_, '_> {
 				let integer = Integer::from_type(expected);
 				if expected != TypeIndex::CHAR && integer.is_none() {
 					self.report_pattern_mismatch(expected, "a character", span);
-					return self.error_pattern(span);
+					return self.error_pattern(span, expected);
 				}
 				let source =
 					&self.builder.files.get(self.scope.file_id).unwrap().source;
@@ -1215,7 +1289,7 @@ impl BodyBuilder<'_, '_> {
 								SourceSpan::new(self.scope.file_id, span),
 							);
 							self.sema.diagnostics.push(diagnostic);
-							self.error_pattern(span)
+							self.error_pattern(span, expected)
 						}
 					},
 					Err(error) => {
@@ -1240,7 +1314,7 @@ impl BodyBuilder<'_, '_> {
 									span,
 								)),
 						);
-						self.error_pattern(span)
+						self.error_pattern(span, expected)
 					}
 				}
 			}
@@ -1251,7 +1325,7 @@ impl BodyBuilder<'_, '_> {
 					"float equality is partial: `0.1 + 0.2` is not `0.3`, so \
 					 a float has no single value to compare with",
 				);
-				self.error_pattern(span)
+				self.error_pattern(span, expected)
 			}
 			ast::Literal::String => {
 				self.report_unmatchable_literal(
@@ -1259,7 +1333,7 @@ impl BodyBuilder<'_, '_> {
 					"a string",
 					"a string has no equality to compare with",
 				);
-				self.error_pattern(span)
+				self.error_pattern(span, expected)
 			}
 		}
 	}
@@ -1277,7 +1351,7 @@ impl BodyBuilder<'_, '_> {
 	) -> PatIdx {
 		let Some(integer) = Integer::from_type(expected) else {
 			self.report_pattern_mismatch(expected, "an integer", span);
-			return self.error_pattern(span);
+			return self.error_pattern(span, expected);
 		};
 		let value = if negated {
 			-i128::from(magnitude)
@@ -1292,7 +1366,7 @@ impl BodyBuilder<'_, '_> {
 				SourceSpan::new(self.scope.file_id, span),
 			);
 			self.sema.diagnostics.push(diagnostic);
-			return self.error_pattern(span);
+			return self.error_pattern(span, expected);
 		}
 		let bits = if negated {
 			magnitude.wrapping_neg()
@@ -1313,12 +1387,35 @@ impl BodyBuilder<'_, '_> {
 		segments: &[ast::PathSegment],
 		span: TextSpan,
 		expected: TypeIndex,
+		context: &mut PatternContext,
 	) -> PatIdx {
-		let found = match self.resolve_value_path(segments, span) {
+		let test = self.check_pattern_test(context, span, expected);
+		// Even a rejected test resolves its name: navigation, missing-name
+		// reports and notes about locals must survive diagnostic recovery.
+		let found = self.resolve_pattern_constant(segments, span);
+		let (Ok(()), Some((kind, ty))) = (test, found) else {
+			return self.error_pattern(span, expected);
+		};
+		if ty != TypeIndex::ERROR && ty != expected {
+			let diagnostic = self.context().mismatch_at(expected, ty, span);
+			self.sema.diagnostics.push(diagnostic);
+			return self.error_pattern(span, expected);
+		}
+		self.body.push_pattern(kind, expected, span)
+	}
+
+	/// Resolve a constant independently of whether the surrounding pattern
+	/// permits a test or the subject supports equality.
+	fn resolve_pattern_constant(
+		&mut self,
+		segments: &[ast::PathSegment],
+		span: TextSpan,
+	) -> Option<(PatternKind, TypeIndex)> {
+		match self.resolve_value_path(segments, span) {
 			Ok(ValuePath::Item(walk)) => {
 				let Some(key) = walk.target.loc() else {
 					self.note_local_not_constant(segments);
-					return self.error_pattern(span);
+					return None;
 				};
 				let kind = key.symbol_kind(&self.sema.decls);
 				if let BindingTarget::Inaccessible(_) = walk.target {
@@ -1406,21 +1503,7 @@ impl BodyBuilder<'_, '_> {
 				_ => None,
 			},
 			Err(_) => None,
-		};
-		let Some((kind, ty)) = found else {
-			return self.error_pattern(span);
-		};
-		if expected == TypeIndex::ERROR {
-			// The test is a mistake already reported; the pattern says
-			// nothing more.
-			return self.error_pattern(span);
 		}
-		if ty != TypeIndex::ERROR && ty != expected {
-			let diagnostic = self.context().mismatch_at(expected, ty, span);
-			self.sema.diagnostics.push(diagnostic);
-			return self.error_pattern(span);
-		}
-		self.body.push_pattern(kind, expected, span)
 	}
 
 	/// After a value path of one name found nothing: when a local of that
@@ -1450,6 +1533,7 @@ impl BodyBuilder<'_, '_> {
 		&mut self,
 		elements: ast::List<ast::PatternElement>,
 		span: TextSpan,
+		expected: TypeIndex,
 		context: &mut PatternContext,
 	) -> PatIdx {
 		for item in self.ast().list(elements) {
@@ -1457,12 +1541,11 @@ impl BodyBuilder<'_, '_> {
 				self.check_pattern(pattern, TypeIndex::ERROR, context);
 			}
 		}
-		self.error_pattern(span)
+		self.error_pattern(span, expected)
 	}
 
-	fn error_pattern(&mut self, span: TextSpan) -> PatIdx {
-		self.body
-			.push_pattern(PatternKind::Error, TypeIndex::ERROR, span)
+	fn error_pattern(&mut self, span: TextSpan, expected: TypeIndex) -> PatIdx {
+		self.body.push_pattern(PatternKind::Error, expected, span)
 	}
 
 	/// A float has no single value to compare with, and a string has no
@@ -1621,5 +1704,50 @@ impl Semantics {
 			}
 		}
 		found
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{FieldListShape, positional_pattern_gap};
+
+	#[test]
+	fn a_field_list_is_whole_before_it_is_a_lone_tuple() {
+		use FieldListShape::*;
+		for (written, rest, lone, shape) in [
+			(1, None, false, Whole),
+			(1, None, true, Whole),
+			(0, Some(0), true, LoneTuple),
+			(1, Some(1), false, PerField),
+			(2, None, true, LoneTuple),
+			(2, None, false, PerField),
+			(0, None, false, PerField),
+		] {
+			assert_eq!(FieldListShape::of(written, rest, lone), shape);
+		}
+	}
+
+	#[test]
+	fn positional_gap_covers_exactly_the_omitted_elements() {
+		for (written, rest, count, gap) in [
+			(0, None, 0, 0..0),
+			(3, None, 3, 3..3),
+			(0, Some(0), 3, 0..3),
+			(2, Some(0), 4, 0..2),
+			(2, Some(1), 4, 1..3),
+			(2, Some(2), 4, 2..4),
+			(3, Some(1), 3, 1..1),
+		] {
+			assert_eq!(positional_pattern_gap(written, rest, count), Some(gap));
+		}
+	}
+
+	#[test]
+	fn positional_gap_rejects_bad_counts_and_rest_positions() {
+		for (written, rest, count) in
+			[(2, None, 3), (4, None, 3), (4, Some(1), 3), (2, Some(3), 4)]
+		{
+			assert_eq!(positional_pattern_gap(written, rest, count), None);
+		}
 	}
 }

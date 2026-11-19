@@ -40,6 +40,10 @@ use crate::query;
 use crate::snapshot::Snapshot;
 use crate::state::ServerState;
 
+mod patterns;
+
+use patterns::{PatternForms, PatternSite, PatternTarget};
+
 /// The names that can be written at the cursor, in a body or a signature.
 pub(crate) fn completion(
 	state: &mut ServerState,
@@ -88,14 +92,25 @@ pub(crate) fn completion(
 		}
 		_ => None,
 	};
+	if let Site::Pattern(site) = site {
+		return patterns::complete(
+			snapshot,
+			file,
+			declaration?,
+			site,
+			offset,
+			snippets,
+			label_details,
+		);
+	}
 	let ast = snapshot.compilation.ast(file);
 	let sema = &mut snapshot.sema;
 	// A function, method or constructor written as a value is inserted as its
 	// call, unless the call is written already (`hel|per()`).
 	let source = &snapshot.compilation.files.get(file).ok()?.source;
-	let called = source[usize::from(offset)..]
-		.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_')
-		.starts_with('(');
+	let suffix =
+		after_name(source, snapshot.compilation.comments(file), offset);
+	let called = suffix.starts_with('(');
 	let insert = match site {
 		Site::Name(NameUse::Value)
 		| Site::Segment {
@@ -239,6 +254,7 @@ pub(crate) fn completion(
 		// A name written twice is reported (E2121), so the ones written are
 		// not offered again.
 		Site::PackageKey { .. } => return None,
+		Site::Pattern(_) => unreachable!("pattern provider dispatched above"),
 		Site::Argument {
 			target: ArgumentTarget::Loop { jump },
 			written,
@@ -469,6 +485,9 @@ pub(crate) enum Jump {
 
 /// What can be written at the cursor, as completion offers it.
 pub(crate) enum Site {
+	/// An ordinary match-pattern name or positional insertion, whose type
+	/// comes from checked patterns or the prospective insertion layout.
+	Pattern(PatternSite),
 	/// A bare name, used as its `NameUse` says.
 	Name(NameUse),
 	/// A path's segment after another, used as `used_as` in what the one
@@ -700,6 +719,28 @@ fn item(
 		label_details,
 		..Default::default()
 	}
+}
+
+/// The source following the identifier at the cursor, ignoring whitespace
+/// and the comments already identified by the parser.
+fn after_name<'a>(
+	source: &'a str,
+	comments: &CommentMap,
+	offset: TextOffset,
+) -> &'a str {
+	let suffix = source[usize::from(offset)..]
+		.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_');
+	let start = TextOffset::from((source.len() - suffix.len()) as u32);
+	let mut suffix = suffix.trim_start();
+	for comment in
+		comments.between(start, TextOffset::from(source.len() as u32))
+	{
+		if usize::from(comment.span.start) != source.len() - suffix.len() {
+			break;
+		}
+		suffix = source[usize::from(comment.span.end)..].trim_start();
+	}
+	suffix
 }
 
 /// A member an entry of a bound's `where { .. }` block names, at `index` in
@@ -1272,7 +1313,7 @@ impl Cursor<'_> {
 		match statement {
 			Statement::Expression(expression) => self.expression(expression),
 			Statement::LocalDefinition { pattern, ty, value } => self
-				.pattern(pattern)
+				.pattern(pattern, PatternForms::Bindings)
 				.or_else(|| self.ty(ty?))
 				.or_else(|| self.expression(value)),
 		}
@@ -1402,17 +1443,31 @@ impl Cursor<'_> {
 				.expression(condition)
 				.or_else(|| self.block(then_block))
 				.or_else(|| self.branch(else_block?)),
-			Expression::Match { scrutinee, arms } => {
-				self.expression(scrutinee).or_else(|| {
-					let arm = self.child_by(ast.list(arms), |arm| {
-						TextSpan::new(
-							ast.pattern_span(arm.pattern).start,
-							ast.branch_span(arm.body).end,
-						)
-					})?;
-					self.pattern(arm.pattern).or_else(|| self.branch(arm.body))
-				})
-			}
+			Expression::Match {
+				scrutinee,
+				arms,
+				open_brace,
+			} => self.expression(scrutinee).or_else(|| {
+				let arm = self.child_by(ast.list(arms), |arm| {
+					TextSpan::new(
+						ast.pattern_span(arm.pattern).start,
+						ast.branch_span(arm.body).end,
+					)
+				});
+				match arm {
+					Some(arm) => self
+						.pattern(arm.pattern, PatternForms::Tests)
+						.or_else(|| self.branch(arm.body)),
+					None => self
+						.inside(TextSpan::new(open_brace, span.end))
+						.then_some(Site::Pattern(PatternSite {
+							target: PatternTarget::MatchGap(expression),
+							prefix: None,
+							forms: PatternForms::Tests,
+							ancestors: Vec::new(),
+						})),
+				}
+			}),
 			Expression::Loop { header, block, .. } => header
 				.and_then(|header| {
 					let header = ast.loop_header(header);
@@ -1546,7 +1601,7 @@ impl Cursor<'_> {
 		}
 	}
 
-	fn pattern(&self, pattern: PatId) -> Option<Site> {
+	fn pattern(&self, pattern: PatId, forms: PatternForms) -> Option<Site> {
 		let ast = self.ast;
 		if !self.at(ast.pattern_span(pattern)) {
 			return None;
@@ -1554,19 +1609,39 @@ impl Cursor<'_> {
 		match ast.pattern(pattern) {
 			// `const MAX`: a constant, named in the value tier.
 			Pattern::Constant { path } => {
-				self.path(ast.list(path), NameUse::Constant)
+				let path = ast.list(path);
+				// `const` is explicit syntax: only a constant can follow it.
+				// Without it, a qualified path may still become a constructor.
+				let used_as = if ast.pattern_span(pattern).start
+					< path.first()?.ident.span.start
+				{
+					NameUse::Constant
+				} else {
+					NameUse::Pattern
+				};
+				self.path(path, used_as)
+					.map(|site| self.pattern_site(pattern, forms, site))
 			}
 			Pattern::Or(alternatives) => self.pattern(
 				*self.child_by(ast.list(alternatives), |&alternative| {
 					ast.pattern_span(alternative)
 				})?,
+				forms,
 			),
 			Pattern::Destructure(Destructure::Tuple { elements }) => {
-				self.pattern_elements(ast.list(elements))
+				self.pattern_elements(pattern, ast.list(elements), forms)
 			}
 			Pattern::Destructure(Destructure::Struct { path, elements }) => {
-				self.path(ast.list(path), NameUse::Value)
-					.or_else(|| self.pattern_elements(ast.list(elements)))
+				self.path(ast.list(path), NameUse::Pattern)
+					.map(|site| self.pattern_site(pattern, forms, site))
+					.or_else(|| {
+						self.pattern_elements(
+							pattern,
+							ast.list(elements),
+							forms,
+						)
+						.map(|site| Self::inside_pattern(site, pattern))
+					})
 			}
 			Pattern::Destructure(Destructure::NamedStruct {
 				path,
@@ -1574,21 +1649,65 @@ impl Cursor<'_> {
 				open_brace,
 			}) => {
 				let path = ast.list(path);
-				// The braces end right before the `)` that closes the pattern.
-				let braces = TextSpan::new(
-					open_brace,
-					ast.pattern_span(pattern).end - 1,
-				);
-				self.path(path, NameUse::Value).or_else(|| {
-					self.pattern_fields(path, ast.list(fields), braces)
-				})
+				let braces =
+					TextSpan::new(open_brace, ast.pattern_span(pattern).end);
+				self.path(path, NameUse::Pattern)
+					.map(|site| self.pattern_site(pattern, forms, site))
+					.or_else(|| {
+						self.pattern_fields(
+							path,
+							ast.list(fields),
+							braces,
+							forms,
+						)
+						.map(|site| Self::inside_pattern(site, pattern))
+					})
 			}
-			// A binding declares its name; nothing is looked up.
+			Pattern::Binding { mutable: false, .. }
+				if matches!(forms, PatternForms::Tests) =>
+			{
+				Some(self.pattern_site(
+					pattern,
+					forms,
+					Site::Name(NameUse::Pattern),
+				))
+			}
+			// An explicitly mutable binding, or a local's own binding name,
+			// declares its name; nothing is looked up.
 			Pattern::Binding { .. }
 			| Pattern::Wildcard
 			| Pattern::Literal(_)
 			| Pattern::Error => None,
 		}
+	}
+
+	fn pattern_site(
+		&self,
+		pattern: PatId,
+		forms: PatternForms,
+		site: Site,
+	) -> Site {
+		let prefix = match site {
+			Site::Name(NameUse::Pattern) => None,
+			Site::Segment {
+				prefix,
+				used_as: NameUse::Pattern,
+			} => Some(prefix),
+			_ => return site,
+		};
+		Site::Pattern(PatternSite {
+			target: PatternTarget::Written(pattern),
+			prefix,
+			forms,
+			ancestors: Vec::new(),
+		})
+	}
+
+	fn inside_pattern(mut site: Site, parent: PatId) -> Site {
+		if let Site::Pattern(site) = &mut site {
+			site.ancestors.push(parent);
+		}
+		site
 	}
 
 	/// A struct pattern's fields, in their braces: the name of the one at the
@@ -1599,6 +1718,7 @@ impl Cursor<'_> {
 		path: &[PathSegment],
 		fields: &[PatternFieldItem],
 		braces: TextSpan,
+		forms: PatternForms,
 	) -> Option<Site> {
 		if !self.inside(braces) {
 			return None;
@@ -1617,7 +1737,7 @@ impl Cursor<'_> {
 		if let Some(at) = at {
 			match fields[at] {
 				PatternFieldItem::Field(field) if !self.at(field.name.span) => {
-					return self.pattern(field.pattern?);
+					return self.pattern(field.pattern?, forms);
 				}
 				PatternFieldItem::Field(_) => {}
 				PatternFieldItem::Rest(_) => return None,
@@ -1636,15 +1756,42 @@ impl Cursor<'_> {
 		})
 	}
 
-	fn pattern_elements(&self, elements: &[PatternElement]) -> Option<Site> {
+	fn pattern_elements(
+		&self,
+		parent: PatId,
+		elements: &[PatternElement],
+		forms: PatternForms,
+	) -> Option<Site> {
 		let ast = self.ast;
 		let element = self.child_by(elements, |element| match *element {
 			PatternElement::Pattern(pattern) => ast.pattern_span(pattern),
 			PatternElement::Rest(at) => rest_span(at),
-		})?;
-		match *element {
-			PatternElement::Pattern(pattern) => self.pattern(pattern),
-			PatternElement::Rest(_) => None,
+		});
+		match element {
+			Some(PatternElement::Pattern(pattern)) => {
+				self.pattern(*pattern, forms)
+			}
+			Some(PatternElement::Rest(_)) => None,
+			None => {
+				if !self.inside(ast.pattern_span(parent)) {
+					return None;
+				}
+				let at = elements.partition_point(|element| {
+					let span = match *element {
+						PatternElement::Pattern(pattern) => {
+							ast.pattern_span(pattern)
+						}
+						PatternElement::Rest(at) => rest_span(at),
+					};
+					span.end < self.offset
+				});
+				Some(Site::Pattern(PatternSite {
+					target: PatternTarget::Insert { parent, at },
+					prefix: None,
+					forms,
+					ancestors: Vec::new(),
+				}))
+			}
 		}
 	}
 

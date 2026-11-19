@@ -906,7 +906,9 @@ impl<'a> Printer<'a> {
 					.into_iter()
 					.chain(else_block.map(|branch| self.branch(branch))),
 			),
-			Expression::Match { scrutinee, arms } => Sexp::head(
+			Expression::Match {
+				scrutinee, arms, ..
+			} => Sexp::head(
 				"match",
 				[self.expr(scrutinee)].into_iter().chain(
 					self.ast.list(arms).iter().map(|arm| {

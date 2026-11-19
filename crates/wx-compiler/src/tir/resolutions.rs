@@ -575,7 +575,7 @@ impl Semantics {
 		// prefix included.
 		let hidden = |tier: Tier, name: SymbolU32| match (used_as, tier) {
 			(NameUse::Value, Tier::Value) => is_local(name),
-			(NameUse::Value | NameUse::Type, Tier::Type) => {
+			(NameUse::Value | NameUse::Type | NameUse::Pattern, Tier::Type) => {
 				self.generic_envs.resolve(env, name).is_some()
 			}
 			_ => false,
@@ -2299,6 +2299,32 @@ mod tests {
 				1,
 				"`{namespace}` in {names:?}"
 			);
+		}
+	}
+
+	#[test]
+	fn a_pattern_position_lists_pattern_paths_without_locals_or_functions() {
+		let analysis = Analysis::new(indoc! {"
+			struct Point(x: u32);
+			enum Signal(value: u32) { Off = 0, On }
+			const LIMIT: u32 = 3;
+			func helper() {}
+			mod shapes {
+				pub struct Visible(pub x: u32);
+				pub struct Hidden(x: u32);
+				pub func make() {}
+			}
+			use shapes::*;
+			func f(Point: u32) {
+				// here
+			}
+		"});
+		let names = analysis.names("here", NameUse::Pattern);
+		for name in ["Point", "Signal", "LIMIT", "Visible", "shapes"] {
+			assert_eq!(listed(&names, name), 1, "`{name}` in {names:?}");
+		}
+		for name in ["Point (local)", "helper", "make", "Hidden", "f"] {
+			assert_eq!(listed(&names, name), 0, "`{name}` in {names:?}");
 		}
 	}
 

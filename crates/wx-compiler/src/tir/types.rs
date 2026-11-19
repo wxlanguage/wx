@@ -187,7 +187,7 @@ pub struct TypeList {
 }
 
 impl TypeList {
-	pub(super) const EMPTY: TypeList = TypeList { start: 0, len: 0 };
+	pub const EMPTY: TypeList = TypeList { start: 0, len: 0 };
 
 	pub fn len(self) -> usize {
 		self.len as usize
@@ -1032,7 +1032,7 @@ impl TypeInterner {
 	/// Whether an expression of type `ty` waits for its context: an untyped
 	/// literal is given a type, and unplaced data a memory, a tuple's
 	/// included.
-	pub(super) fn needs_context(&self, ty: TypeIndex) -> bool {
+	pub fn needs_context(&self, ty: TypeIndex) -> bool {
 		self.has_const_kind(ty) || self.has_unplaced(ty)
 	}
 

@@ -128,3 +128,21 @@ export {
     main as "_start",
     heap as "memory",
 }
+
+struct Point(x: i32, y: i32);
+
+impl Point {
+    func new() -> Self {
+        Self{ x: 0, y: 0 }
+    }
+
+    const ORIGIN: Self = Self{ x: 0, y: 0 };
+}
+
+func test() {
+    local p = Point::new();
+    match (True) {
+        Bool::False => {},
+        Bool::True => {},
+    }
+}

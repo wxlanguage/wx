@@ -1259,7 +1259,9 @@ impl Semantics {
 		used_as: NameUse,
 	) -> Vec<(SymbolU32, Definition)> {
 		let tier = match used_as {
-			NameUse::Value | NameUse::Constant => Tier::Value,
+			NameUse::Value | NameUse::Constant | NameUse::Pattern => {
+				Tier::Value
+			}
 			NameUse::Type => Tier::Type,
 			_ => return Vec::new(),
 		};
@@ -1520,7 +1522,7 @@ impl Semantics {
 
 	/// Whether `field` of `owner`, a struct or an enum, is visible from
 	/// `accessor`, by its own `pub`.
-	pub(super) fn field_accessible(
+	pub fn field_accessible(
 		&self,
 		owner: FieldOwner,
 		field: FieldIdx,

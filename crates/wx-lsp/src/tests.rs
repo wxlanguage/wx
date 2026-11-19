@@ -2794,11 +2794,451 @@ fn completion_in_a_struct_pattern_offers_its_fields() {
 }
 
 #[test]
+fn completion_in_a_struct_pattern_needs_no_space_before_the_closing_brace() {
+	for (pattern, expected) in [
+		("Point{$0}", &["x", "y", "z"][..]),
+		("Point{ $0 }", &["x", "y", "z"][..]),
+		("Point{ $0}", &["x", "y", "z"][..]),
+		("Point{x,$0}", &["y", "z"][..]),
+		("Point{x,y$0}", &["y", "z"][..]),
+	] {
+		for source in [
+			format!("func f(p: Point) {{ local {pattern} = p; }}"),
+			format!("func f(p: Point) {{ match (p) {{ {pattern} => (), }} }}"),
+		] {
+			let labels = completions(&format!("{PATTERN_ITEMS}{source}"))
+				.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
+			assert_eq!(labels, expected, "{source:?}");
+		}
+	}
+}
+
+#[test]
+fn completion_of_a_match_pattern_prefix_offers_only_the_expected_constructor() {
+	for pattern in ["$0", "Poi$0", "Point$0", "Poi$0nt"] {
+		for suffix in ["", " => ()"] {
+			let source = format!(
+				"{PATTERN_ITEMS}func f(p: Point) {{ match (p) {{ {pattern}{suffix} }} }}"
+			);
+			let labels = completions(&source)
+				.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
+			assert_offers(
+				&labels,
+				&["Point", "_"],
+				&["Pair", "Signal", "LIMIT", "p", "helper", "f", "transmute"],
+			);
+		}
+	}
+}
+
+#[test]
+fn completion_of_a_qualified_pattern_includes_constructors_but_not_functions() {
+	let declarations = "mod shapes {
+		pub struct Point(pub x: u32);
+		pub struct Hidden(x: u32);
+		pub enum Signal(value: u32) { Off = 0, On }
+		pub const LIMIT: u32 = 4;
+		pub func make() -> Point { Point(1) }
+	}";
+	for pattern in ["shapes::$0", "shapes::Poi$0"] {
+		let source = format!(
+			"{declarations}func f(p: shapes::Point) {{ match (p) {{ {pattern} }} }}"
+		);
+		let labels = completions(&source).unwrap();
+		assert_offers(
+			&labels,
+			&["Point"],
+			&["Signal", "LIMIT", "Hidden", "make", "p"],
+		);
+	}
+	let source = format!(
+		"{declarations}func f(p: shapes::Signal) {{ match (p) {{ shapes::Signal::$0 }} }}"
+	);
+	assert_eq!(completions(&source).unwrap(), ["Off", "On"]);
+}
+
+#[test]
+fn completion_of_a_pattern_inserts_destructuring_not_a_binding_or_call() {
+	for (pattern, inserted) in [
+		("Poi$0", "Point{ ${1:..} }"),
+		("Poi$0nt", "Point{ ${1:..} }"),
+		("Poi$0nt{}", "Point"),
+		("Poi$0nt()", "Point"),
+		("Poi$0nt // fields\n{}", "Point"),
+		("Poi$0nt // elements\n()", "Point"),
+	] {
+		let source = format!(
+			"{PATTERN_ITEMS}func f(p: Point) {{ match (p) {{ {pattern} }} }}"
+		);
+		let items = completion_items(&source, true).unwrap();
+		let point = items
+			.iter()
+			.find(|item| item.filter_text.as_deref() == Some("Point"))
+			.unwrap();
+		assert_eq!(point.label, "Point");
+		assert_eq!(point.insert_text.as_deref(), Some(inserted), "{source}");
+		assert_eq!(
+			point.insert_text_format,
+			inserted.contains('$').then_some(
+				tower_lsp_server::ls_types::InsertTextFormat::SNIPPET
+			),
+			"{source}"
+		);
+	}
+	let source =
+		format!("{PATTERN_ITEMS}func f(p: Point) {{ match (p) {{ Poi$0 }} }}");
+	let items = completion_items(&source, false).unwrap();
+	let point = items
+		.iter()
+		.find(|item| item.filter_text.as_deref() == Some("Point"))
+		.unwrap();
+	assert_eq!(point.insert_text.as_deref(), Some("Point{ .. }"));
+	assert!(!items.iter().any(|item| item.label == "LIMIT"));
+}
+
+#[test]
+fn pattern_completion_handles_arm_gaps_nested_patterns_and_end_of_file() {
+	for body in [
+		"match (p) { $0 }",
+		"match (p) { Point{..} => (), $0 }",
+		"match (p) { Point{..} => (), Poi$0 }",
+		"match (p) { Point{..} | Poi$0 => (), }",
+		"match (p) { Poi$0",
+	] {
+		let source = format!("{PATTERN_ITEMS}func f(p: Point) {{ {body} }}");
+		let labels = completions(&source)
+			.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
+		assert_offers(&labels, &["Point"], &["p", "helper"]);
+	}
+	let source =
+		format!("{PATTERN_ITEMS}func f(p: Point) {{ match (p) {{ Poi$0");
+	assert_offers(&completions(&source).unwrap(), &["Point"], &["p", "helper"]);
+	for body in [
+		"match (p) { Point{ x: Poi$0, .. } => (), }",
+		"match (p) { (Poi$0, _) => (), }",
+	] {
+		let source = format!("{PATTERN_ITEMS}func f(p: Point) {{ {body} }}");
+		assert_eq!(completions(&source).unwrap(), ["_"]);
+	}
+}
+
+#[test]
+fn pattern_constant_completion_labels_show_only_the_entity_name() {
+	let source = "func f(b: Bool) { match (b) { $0 } }";
+	for snippets in [false, true] {
+		let items = completion_items(source, snippets).unwrap();
+		for name in ["False", "True"] {
+			let item = items
+				.iter()
+				.find(|item| item.label == name)
+				.unwrap_or_else(|| panic!("missing completion label `{name}`"));
+			assert_eq!(item.filter_text.as_deref(), Some(name));
+			assert_eq!(item.insert_text, Some(format!("Bool::{name}")));
+		}
+		assert!(!items.iter().any(|item| item.label.starts_with("const ")));
+	}
+}
+
+#[test]
+fn pattern_variants_follow_nested_generic_and_positional_expectations() {
+	for (declarations, subject, pattern) in [
+		(
+			"struct Holder<T>(value: T);",
+			"Holder<Bool>",
+			"Holder{ value: Tr$0 }",
+		),
+		(
+			"struct Holder<T>(value: T);",
+			"Holder<Bool>",
+			"Holder::<Bool>{ value: ((Tr$0)) }",
+		),
+		("struct Pair(a: u32, b: Bool);", "Pair", "Pair(_, Tr$0)"),
+		(
+			"struct Wrapper(value: (u32, Bool));",
+			"Wrapper",
+			"Wrapper(_, Tr$0)",
+		),
+		(
+			"struct Three(a: u8, b: u32, c: Bool);",
+			"Three",
+			"Three(.., Tr$0)",
+		),
+		("", "(u32, Bool)", "(_, Tr$0)"),
+		("", "Bool", "Bool::False | Tr$0"),
+	] {
+		let source = format!(
+			"{declarations}const LIMIT: u32 = 4;
+			 func f(value: {subject}) {{ match (value) {{ {pattern} => () }} }}"
+		);
+		assert_eq!(
+			completions(&source).unwrap(),
+			["_", "False", "True"],
+			"{source}"
+		);
+		let items = completion_items(&source, false).unwrap();
+		assert_eq!(
+			items
+				.iter()
+				.find(|item| item.label == "True")
+				.unwrap()
+				.insert_text
+				.as_deref(),
+			Some("Bool::True")
+		);
+	}
+}
+
+#[test]
+fn vacant_pattern_slots_use_prospective_positional_types() {
+	for (declarations, subject, pattern, expected) in [
+		(
+			"struct Pair(a: u32, b: Bool);",
+			"Pair",
+			"Pair($0)",
+			vec!["_"],
+		),
+		(
+			"struct Pair(a: u32, b: Bool);",
+			"Pair",
+			"Pair(first, $0)",
+			vec!["_", "False", "True"],
+		),
+		(
+			"struct Wrapper(value: (u32, Bool));",
+			"Wrapper",
+			"Wrapper(first, $0)",
+			vec!["_", "False", "True"],
+		),
+		(
+			"struct Three(a: u8, b: u32, c: Bool);",
+			"Three",
+			"Three(.., $0)",
+			vec!["_", "False", "True"],
+		),
+	] {
+		let source = format!(
+			"{declarations}func f(value: {subject}) {{ match (value) {{ {pattern} => () }} }}"
+		);
+		assert_eq!(completions(&source).unwrap(), expected, "{source}");
+	}
+}
+
+#[test]
+fn enum_representation_context_survives_nested_cursor_descent() {
+	// The invalid repr still has a known Bool field type during recovery.
+	// That knowledge must not make value tests legal inside its destructure.
+	for pattern in ["Flag(((Tr$0)))", "Flag{ value: ((Tr$0)) }", "Flag($0)"] {
+		let source = format!(
+			"enum Flag(pub value: Bool) {{ Off = 0 }}
+			 func f(value: Flag) {{ match (value) {{ {pattern} => () }} }}"
+		);
+		assert_eq!(completions(&source).unwrap(), ["_"], "{source}");
+	}
+}
+
+#[test]
+fn ordinary_patterns_exclude_constants_and_incompatible_qualifiers() {
+	for (subject, pattern) in [
+		("Bool", "Point::$0"),
+		("Point", "Bool::$0"),
+		("Point", "Point::LIM$0"),
+	] {
+		let source = format!(
+			"struct Point(x: u32);
+			 impl Point {{ pub const LIMIT: u32 = 1; }}
+			 func f(value: {subject}) {{ match (value) {{ {pattern} => () }} }}"
+		);
+		assert_eq!(completions(&source), None, "{source}");
+	}
+	for (subject, pattern) in [
+		("u32", "Tr$0"),
+		("Point", "Unknown{ x: Tr$0 }"),
+		("Point", "Other{ x: Tr$0 }"),
+		("Holder<Bool>", "Holder::<u32>{ value: Tr$0 }"),
+	] {
+		let source = format!(
+			"struct Point(x: u32); struct Other(x: Bool); struct Holder<T>(value: T);
+			 const LIMIT: u32 = 1;
+			 func f(value: {subject}) {{ match (value) {{ {pattern} => () }} }}"
+		);
+		assert_eq!(completions(&source).unwrap(), ["_"], "{source}");
+	}
+}
+
+#[test]
+fn enum_completion_respects_namespaces_and_declaration_order() {
+	let declarations = "mod signals {
+		pub enum Signal(value: u8) { Zed = 0, Alpha = 1 }
+	}";
+	for (pattern, inserted) in [
+		("signals::$0", "Signal::Alpha"),
+		("signals::Signal::$0", "Alpha"),
+	] {
+		let source = format!(
+			"{declarations}func f(value: signals::Signal) {{ match (value) {{ {pattern} => () }} }}"
+		);
+		assert_eq!(completions(&source).unwrap(), ["Zed", "Alpha"]);
+		let items = completion_items(&source, false).unwrap();
+		assert_eq!(items[1].insert_text.as_deref(), Some(inserted));
+	}
+}
+
+#[test]
+fn accepting_enum_pattern_completions_checks_without_a_const_marker() {
+	for (pattern, replaced) in [("Tr$0", "Tr$0"), ("Bool::Tr$0", "Tr$0")] {
+		let source = format!(
+			"func f(value: Bool) -> u32 {{
+				match (value) {{ {pattern} => 1, _ => 0 }}
+			 }}"
+		);
+		for snippets in [false, true] {
+			let items = completion_items(&source, snippets).unwrap();
+			let variant =
+				items.iter().find(|item| item.label == "True").unwrap();
+			let completed =
+				source.replace(replaced, variant.insert_text.as_ref().unwrap());
+			let (state, dir) =
+				analyzed(&PathBuf::from("/test/main.wx"), &completed);
+			let snapshot = &state.cached[&dir];
+			assert!(
+				snapshot.compilation.collect_diagnostics().is_empty(),
+				"{completed}"
+			);
+			assert!(
+				snapshot.sema.diagnostics().is_empty(),
+				"{completed}: {:?}",
+				snapshot.sema.diagnostics()
+			);
+		}
+	}
+}
+
+#[test]
+fn pattern_completion_preserves_qualified_and_marked_constant_spelling() {
+	for (pattern, subject, expected) in [
+		("const LIM$0", "Point", "LIMIT"),
+		("Signal::O$0", "Signal", "Off"),
+		("const Point::LIM$0", "Point", "LIMIT"),
+	] {
+		let source = format!(
+			"{PATTERN_ITEMS}impl Point {{ pub const LIMIT: u32 = 1; }}\
+			func f(p: {subject}) {{ match (p) {{ {pattern} }} }}"
+		);
+		let items = completion_items(&source, true).unwrap();
+		let item = items.iter().find(|item| item.label == expected).unwrap();
+		assert_eq!(
+			item.insert_text.as_deref().unwrap_or(&item.label),
+			expected
+		);
+	}
+}
+
+#[test]
+fn accepting_a_pattern_constructor_completion_produces_a_valid_pattern() {
+	let source = "struct Point(x: u32, y: u32);\nfunc f(p: Point) { match (p) { Poi$0 => (), } }";
+	for snippets in [false, true] {
+		let items = completion_items(source, snippets).unwrap();
+		let point = items
+			.iter()
+			.find(|item| item.filter_text.as_deref() == Some("Point"))
+			.unwrap();
+		let inserted =
+			point.insert_text.as_ref().unwrap().replace("${1:..}", "..");
+		let completed = source.replace("Poi$0", &inserted);
+		let (state, dir) =
+			analyzed(&PathBuf::from("/test/main.wx"), &completed);
+		let snapshot = &state.cached[&dir];
+		assert!(
+			snapshot.compilation.collect_diagnostics().is_empty(),
+			"{completed}"
+		);
+		assert!(
+			snapshot.sema.diagnostics().is_empty(),
+			"{completed}: {:?}",
+			snapshot.sema.diagnostics()
+		);
+	}
+}
+
+#[test]
+fn completion_of_a_match_pattern_does_not_complete_binding_declarations() {
+	for source in [
+		"func f(p: Point) { local Poi$0 = p; }",
+		"func f(p: Point) { match (p) { mut Poi$0 => (), } }",
+	] {
+		assert_eq!(completions(&format!("{PATTERN_ITEMS}{source}")), None);
+	}
+}
+
+#[test]
+fn completion_in_an_unfinished_match_arm_keeps_its_pattern() {
+	for pattern in ["Point{$0}", "Point{x,$0}", "Poi$0nt{}", "Signal::$0"] {
+		for suffix in ["", ",", " =>", " =>,"] {
+			let subject = if pattern == "Signal::$0" {
+				"Signal"
+			} else {
+				"Point"
+			};
+			let source = format!(
+				"{PATTERN_ITEMS}func f(p: {subject}) {{ match (p) {{ {pattern}{suffix} }} }}"
+			);
+			let labels = completions(&source)
+				.unwrap_or_else(|| panic!("nothing offered in {source:?}"));
+			match pattern {
+				"Point{$0}" => assert_eq!(labels, ["x", "y", "z"], "{source}"),
+				"Point{x,$0}" => assert_eq!(labels, ["y", "z"], "{source}"),
+				"Poi$0nt{}" => assert_offers(&labels, &["Point"], &[]),
+				"Signal::$0" => assert_eq!(labels, ["Off", "On"], "{source}"),
+				_ => unreachable!(),
+			}
+		}
+	}
+}
+
+#[test]
+fn an_unfinished_match_arm_keeps_completion_at_end_of_file() {
+	for suffix in ["", " =>"] {
+		let source = format!(
+			"{PATTERN_ITEMS}func f(p: Point) {{ match (p) {{ Point{{$0}}{suffix}"
+		);
+		assert_eq!(completions(&source).unwrap(), ["x", "y", "z"], "{source}");
+	}
+}
+
+#[test]
+fn an_unfinished_match_arm_keeps_definition_and_hover() {
+	let root = PathBuf::from("/test/main.wx");
+	for suffix in ["", " =>"] {
+		let source = format!(
+			"struct Point(x: i32, y: i32);\nfunc f(p: Point) {{ match (p) {{ Point{{ x, .. }}{suffix} }} }}"
+		);
+		let (state, _) = analyzed(&root, &source);
+		let uri = Uri::from_file_path(&root).unwrap();
+		for (name, declaration) in [("Point{", "Point("), ("x, ..", "x: i32")] {
+			let location = scalar(requests::goto_definition(
+				&state,
+				&definition_params(&uri, position_of(&source, name, 0)),
+			));
+			assert_eq!(location.uri, uri);
+			assert_eq!(
+				location.range.start,
+				position_of(&source, declaration, 0)
+			);
+		}
+		let hover = hover_text(&state, &uri, &source, "Point{", 0)
+			.expect("the retained pattern resolves its constructor");
+		assert!(hover.contains("Point"), "{hover}");
+	}
+}
+
+#[test]
 fn completion_in_a_struct_pattern_offers_nothing_the_checker_would_refuse() {
 	for source in [
 		// After `..`, and outside the braces.
 		"func f(p: Point) {\n    local Point{ x, ..$0 } = p;\n}\n",
 		"func f(p: Point) {\n    local Point{ x }$0 = p;\n}\n",
+		"func f(p: Point) {\n    local Point{}$0 = p;\n}\n",
+		"func f(p: Point) {\n    match (p) { Point{}$0 => (), }\n}\n",
 	] {
 		assert_eq!(
 			completions(&format!("{PATTERN_ITEMS}{source}")),
@@ -4537,6 +4977,26 @@ fn semantic_tokens_survive_recovered_blocks_and_labels() {
 		assert!(
 			!tokens.iter().any(|token| token.starts_with('{')),
 			"{tokens:?}"
+		);
+	}
+}
+
+#[test]
+fn a_local_destructuring_path_offers_constructors_and_no_tests() {
+	for (body, constructor) in [
+		("func f(p: Point) { local Poi$0(..) = p; }", "Point"),
+		("func f(s: Signal) { local Sig$0(..) = s; }", "Signal"),
+	] {
+		let source = format!("{PATTERN_ITEMS}{body}");
+		let items = completion_items(&source, false).unwrap();
+		for item in &items {
+			let text = item.insert_text.as_deref().unwrap_or(&item.label);
+			assert!(!text.starts_with("const "), "{text:?}");
+		}
+		assert_offers(
+			&completions(&source).unwrap(),
+			&[constructor],
+			&["LIMIT", "On", "Off"],
 		);
 	}
 }

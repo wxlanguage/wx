@@ -2588,9 +2588,9 @@ impl<'a> Builder<'a> {
 				);
 				self.arena.concat(items)
 			}
-			ast::Expression::Match { scrutinee, arms } => {
-				self.build_match_expression(span, scrutinee, ast.list(arms))
-			}
+			ast::Expression::Match {
+				scrutinee, arms, ..
+			} => self.build_match_expression(span, scrutinee, ast.list(arms)),
 			ast::Expression::Break { label, value } => {
 				let mut items: Vec<NodeId> = vec![self.text(Text::Break)];
 				if let Some(label) = label {

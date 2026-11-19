@@ -261,22 +261,6 @@ fn report_chained_assignments(
 		)
 }
 
-/// A `const` before a path that is a constant already: it changes nothing,
-/// and the path is what the pattern means.
-fn report_redundant_const(
-	file_id: FileId,
-	span: TextSpan,
-) -> Diagnostic<FileId> {
-	Diagnostic::warning()
-		.with_code(DiagnosticCode::RedundantConstMarker.code())
-		.with_message("redundant `const`")
-		.with_label(
-			Label::primary(file_id, span)
-				.with_message("this path is a constant already"),
-		)
-		.with_note("drop the `const`")
-}
-
 /// `const` where nothing else could be written: before a literal or `_`
 /// argument, or an array's length.
 fn report_redundant_const_marker(
@@ -3131,6 +3115,7 @@ impl<'ctx> Parser<'ctx> {
 			Expression::Match {
 				scrutinee,
 				arms: arms.inner,
+				open_brace: open.start,
 			},
 			span,
 		))
@@ -3139,28 +3124,51 @@ impl<'ctx> Parser<'ctx> {
 	/// `pattern => { .. }` or `pattern => expr`.
 	fn parse_match_arm(parser: &mut Parser) -> Result<Spanned<MatchArm>, ()> {
 		let pattern = Parser::parse_pattern(parser)?;
-		parser.next_expect(Token::FatArrow)?;
+		let pattern_span = parser.ast.patterns.spans[usize::from(pattern)];
+		let arrow = parser.lexer.next_if(Token::FatArrow);
+		let token = parser.lexer.peek();
+		if arrow.is_none() {
+			parser.diagnostics.push(report_unexpected_token(
+				parser.file_id,
+				token,
+				Token::FatArrow,
+			));
+		}
 		// A braced body is the arm's own block; a bare expression must be
 		// separated by a comma like a statement.
-		let (body, end) = if parser.lexer.peek().inner == Token::OpenBrace {
+		let (body, end) = if token.inner == Token::OpenBrace {
 			let block = parser.parse_block()?;
 			(
 				Branch::Block(block),
 				parser.ast.blocks.spans[usize::from(block)].end,
 			)
-		} else {
+		} else if arrow.is_some() && Self::starts_expression(token.inner) {
 			let expr = parser.parse_expression(BindingPower::Default)?;
 			(
 				Branch::Expression(expr),
 				parser.ast.exprs.spans[usize::from(expr)].end,
 			)
+		} else {
+			// Keep the pattern when the arm is still being written. Do not
+			// consume a comma, enclosing delimiter, or the next arm's pattern.
+			// An error body spans the gap where a body belongs, as a local's
+			// missing initializer does, preserving semantic checking and LSP
+			// queries for the parts that are present.
+			if arrow.is_some() {
+				parser
+					.diagnostics
+					.push(report_expected_expression(parser.file_id, token));
+			}
+			let start = arrow.map_or(pattern_span.end, |arrow| arrow.span.end);
+			let expr = parser.ast.push_expr(
+				Expression::Error,
+				TextSpan::new(start, token.span.start),
+			);
+			(Branch::Expression(expr), token.span.start)
 		};
 		Ok(Spanned {
 			inner: MatchArm { pattern, body },
-			span: TextSpan::new(
-				parser.ast.patterns.spans[usize::from(pattern)].start,
-				end,
-			),
+			span: TextSpan::new(pattern_span.start, end),
 		})
 	}
 
@@ -3482,18 +3490,8 @@ impl<'ctx> Parser<'ctx> {
 		const_span: TextSpan,
 	) -> Result<PatId, ()> {
 		let path = Parser::parse_path(parser)?;
-		// A path of one segment is a name, which is ambiguous: the marker
-		// is what says it is a constant. A longer path is a constant
-		// already, and the marker says nothing.
-		let ambiguous = matches!(
-			&*path,
-			[segment] if segment.type_args.is_empty()
-		);
-		if !ambiguous {
-			parser
-				.diagnostics
-				.push(report_redundant_const(parser.file_id, const_span));
-		}
+		// The marker is required for an unqualified name and optional for a
+		// qualified path. Both denote the same constant pattern.
 		let span = TextSpan::new(
 			const_span.start,
 			path.last().unwrap().ident.span.end,

@@ -30,7 +30,7 @@ use super::numbers::DecimalFloat;
 use super::obligations::TypeObligation;
 use super::signatures::Semantics;
 use super::types::{GenericArgs, TypeIndex};
-use crate::ast::{AST, BinaryOp, ExprId, Expression, Spanned, UnaryOp};
+use crate::ast::{self, AST, BinaryOp, ExprId, Expression, Spanned, UnaryOp};
 use crate::diagnostics::{TextOffset, TextSpan};
 use crate::index::index_newtype;
 use crate::symbols::Keyword;
@@ -229,8 +229,9 @@ pub(super) enum PatternKind {
 	/// them is one local.
 	Or(PatternRange),
 
-	/// Already reported; whatever reads it stays silent, and exhaustiveness
-	/// counts it as `_`.
+	/// Already reported. Its type can retain the known subject type; the
+	/// kind, not TypeIndex::ERROR, marks failure. Exhaustiveness skips a match
+	/// containing one rather than treating it as a valid wildcard.
 	Error,
 }
 
@@ -963,6 +964,46 @@ impl Body {
 		self.operand_with_span(ast.expr_span(expr))
 	}
 
+	/// The type assigned to a written pattern in this body, including known
+	/// subject types retained on failed patterns. This does not imply validity.
+	pub fn pattern_type_of(
+		&self,
+		ast: &AST,
+		pattern: ast::PatId,
+	) -> Option<TypeIndex> {
+		Some(self.pattern_ty(self.pattern_of(ast, pattern)?))
+	}
+
+	/// Exact-span lookup, like `operand_of`. Transparent single-element tuples
+	/// have no checked node. Synthetic field tuples and omitted-field wildcards
+	/// can share a destructure's span; the enclosing written node is built last.
+	fn pattern_of(&self, ast: &AST, mut pattern: ast::PatId) -> Option<PatIdx> {
+		while let ast::Pattern::Destructure(ast::Destructure::Tuple {
+			elements,
+		}) = ast.pattern(pattern)
+		{
+			let [ast::PatternElement::Pattern(child)] = *ast.list(elements)
+			else {
+				break;
+			};
+			pattern = child;
+		}
+		let span = ast.pattern_span(pattern);
+		self.pat_spans
+			.iter()
+			.rposition(|&found| found == span)
+			.map(|at| PatIdx::new(at as u32))
+	}
+
+	/// The checked subject of a match expression, independently of its
+	/// result type and whether it has any arms.
+	pub fn match_scrutinee(&self, expr: ExprIdx) -> Option<ExprIdx> {
+		match self.kind(expr) {
+			ExprKind::Match { scrutinee, .. } => Some(scrutinee),
+			_ => None,
+		}
+	}
+
 	/// The loop the `continue` written as `expr` of `ast` restarts, as it
 	/// was checked. `None` for one with no target, which was checked as an
 	/// error.
@@ -1186,9 +1227,11 @@ mod tests {
 	use indoc::indoc;
 
 	use super::*;
+	use crate::diagnostics::{DiagnosticCode, SourceSpan};
 	use crate::symbols::{Keyword, StringInterner};
+	use crate::testing::DiagnosticView;
 	use crate::tir::decls::{FunctionIdx, Scope};
-	use crate::tir::resolutions::Reference;
+	use crate::tir::resolutions::{Reference, Site};
 	use crate::tir::signatures::Semantics;
 	use crate::tir::signatures::tests::source_graph;
 	use crate::vfs::{self, FileId};
@@ -1796,5 +1839,343 @@ mod tests {
 	#[test]
 	fn a_pattern_node_stays_small() {
 		assert!(std::mem::size_of::<PatternKind>() <= 16);
+	}
+
+	fn written_pattern(case: &Case<'_>, written: &str) -> ast::PatId {
+		let start = case.source.rfind(written).unwrap() as u32;
+		let span = TextSpan::from(start..start + written.len() as u32);
+		let ast = case.graph.ast(case.file);
+		fn find(
+			ast: &AST,
+			pattern: ast::PatId,
+			span: TextSpan,
+		) -> Option<ast::PatId> {
+			if ast.pattern_span(pattern) == span {
+				return Some(pattern);
+			}
+			match ast.pattern(pattern) {
+				ast::Pattern::Or(children) => ast
+					.list(children)
+					.iter()
+					.find_map(|&child| find(ast, child, span)),
+				ast::Pattern::Destructure(
+					ast::Destructure::Tuple { elements }
+					| ast::Destructure::Struct { elements, .. },
+				) => {
+					ast.list(elements).iter().find_map(|element| match *element
+					{
+						ast::PatternElement::Pattern(child) => {
+							find(ast, child, span)
+						}
+						_ => None,
+					})
+				}
+				ast::Pattern::Destructure(ast::Destructure::NamedStruct {
+					fields,
+					..
+				}) => ast.list(fields).iter().find_map(|item| match item {
+					ast::PatternFieldItem::Field(field) => {
+						field.pattern.and_then(|child| find(ast, child, span))
+					}
+					_ => None,
+				}),
+				_ => None,
+			}
+		}
+		ast.exprs
+			.kinds
+			.iter()
+			.find_map(|expression| match *expression {
+				Expression::Match { arms, .. } => ast
+					.list(arms)
+					.iter()
+					.find_map(|arm| find(ast, arm.pattern, span)),
+				_ => None,
+			})
+			.unwrap_or_else(|| panic!("no pattern `{written}`"))
+	}
+
+	#[test]
+	fn pattern_lookup_unwraps_tuples_but_preserves_alternatives() {
+		let case = Case::new(
+			"func f(value: Bool) { match (value) { ((_,)) | const False => {} } }",
+		);
+		let ast = case.graph.ast(case.file);
+		let body = case.body("f");
+		let wrapped = body
+			.pattern_of(ast, written_pattern(&case, "((_,))"))
+			.unwrap();
+		assert_eq!(
+			Some(wrapped),
+			body.pattern_of(ast, written_pattern(&case, "_"))
+		);
+		assert!(matches!(body.pattern(wrapped), PatternKind::Wildcard));
+		assert_eq!(body.pattern_ty(wrapped), TypeIndex::BOOL);
+		let alternatives = body
+			.pattern_of(ast, written_pattern(&case, "((_,)) | const False"))
+			.unwrap();
+		assert!(matches!(body.pattern(alternatives), PatternKind::Or(_)));
+	}
+
+	#[test]
+	fn pattern_lookup_prefers_written_destructures_over_synthetic_nodes() {
+		for pattern in [
+			"Pair(a, b)",
+			"Pair{ first: a, second: b }",
+			"Pair{..}",
+			"Pair(..)",
+		] {
+			let source = format!(
+				"struct Pair(first: u32, second: Bool);
+				 func f(value: Pair) {{ match (value) {{ {pattern} => {{}} }} }}"
+			);
+			let case = Case::new(&source);
+			let ast = case.graph.ast(case.file);
+			let body = case.body("f");
+			let written = written_pattern(&case, pattern);
+			let span = ast.pattern_span(written);
+			assert!(
+				body.pat_spans
+					.iter()
+					.filter(|&&found| found == span)
+					.count() >= 2
+			);
+			let checked = body.pattern_of(ast, written).unwrap();
+			assert!(matches!(
+				body.pattern(checked),
+				PatternKind::Fields { .. }
+			));
+			assert_eq!(
+				case.sema
+					.type_formatter(&case.strings)
+					.display_type(body.pattern_type_of(ast, written).unwrap()),
+				"Pair"
+			);
+		}
+	}
+
+	#[test]
+	fn pattern_lookup_retains_error_types_and_never_uses_another_body() {
+		let case = Case::new(
+			"func f(value: u8) { match (value) { (999) => {}, _ => {} } }
+			 func g(value: Bool) { match (value) { target => {} } }",
+		);
+		let ast = case.graph.ast(case.file);
+		let body = case.body("f");
+		let written = written_pattern(&case, "(999)");
+		let checked = body.pattern_of(ast, written).unwrap();
+		assert!(matches!(body.pattern(checked), PatternKind::Error));
+		assert_eq!(body.pattern_type_of(ast, written), Some(TypeIndex::U8));
+		assert_eq!(case.body("g").pattern_type_of(ast, written), None);
+		assert_eq!(
+			body.pattern_type_of(ast, written_pattern(&case, "target")),
+			None
+		);
+	}
+
+	/// Recovery nodes are found through the same exact source spans as
+	/// other checked data. A synthetic field tuple can share the owner's
+	/// span, so inspect every error at that span here.
+	fn error_pattern_types(case: &Case<'_>, written: &str) -> Vec<String> {
+		let start = case.source.rfind(written).unwrap();
+		let span = TextSpan::from(start as u32..(start + written.len()) as u32);
+		let body = case.body("f");
+		body.pat_spans
+			.iter()
+			.enumerate()
+			.filter(|&(at, &found)| {
+				found == span
+					&& matches!(body.pat_kinds[at], PatternKind::Error)
+			})
+			.map(|(at, _)| {
+				case.sema
+					.type_formatter(&case.strings)
+					.display_type(body.pat_types[at])
+			})
+			.collect()
+	}
+
+	#[test]
+	fn erroneous_literal_patterns_keep_the_subject_type() {
+		let case = Case::new(
+			"func f(value: u8) { match (value) { 999 => {}, _ => {} } }",
+		);
+		DiagnosticView::new(
+			"typecheck",
+			case.sema.diagnostics(),
+			&case.graph.files,
+		)
+		.assert_codes(&[DiagnosticCode::IntegerLiteralOutOfRange]);
+		assert_eq!(error_pattern_types(&case, "999"), ["u8"]);
+		let mut sema = case.sema;
+		assert!(crate::tir::lower(&mut sema, &case.strings).is_err());
+	}
+
+	#[test]
+	fn rejected_local_tests_keep_the_original_subject_type() {
+		let case =
+			Case::new("func f(value: Bool) { local const True = value; }");
+		DiagnosticView::new(
+			"typecheck",
+			case.sema.diagnostics(),
+			&case.graph.files,
+		)
+		.assert_codes(&[DiagnosticCode::RefutablePatternInLocal]);
+		assert_eq!(error_pattern_types(&case, "const True"), ["Bool"]);
+	}
+
+	#[test]
+	fn rejected_equality_keeps_the_original_subject_type() {
+		let case = Case::new(
+			"const BAD: f32 = 1.0;
+			 func f(value: f32) { match (value) { const BAD => {}, _ => {} } }",
+		);
+		DiagnosticView::new(
+			"typecheck",
+			case.sema.diagnostics(),
+			&case.graph.files,
+		)
+		.assert_codes(&[DiagnosticCode::TraitBoundViolation]);
+		assert_eq!(error_pattern_types(&case, "const BAD"), ["f32"]);
+	}
+
+	#[test]
+	fn rejected_local_literals_keep_types_without_cascades_or_losing_bindings()
+	{
+		let case = Case::new(
+			"func f(value: (Bool, u8, u32)) -> u32 {
+			    local ('x', 999, kept) = value;
+			    kept
+			 }",
+		);
+		DiagnosticView::new(
+			"typecheck",
+			case.sema.diagnostics(),
+			&case.graph.files,
+		)
+		.assert_codes(&[DiagnosticCode::RefutablePatternInLocal]);
+		assert_eq!(error_pattern_types(&case, "'x'"), ["Bool"]);
+		assert_eq!(error_pattern_types(&case, "999"), ["u8"]);
+		let body = case.body("f");
+		let kept = body
+			.locals
+			.iter()
+			.find(|local| {
+				case.strings.resolve(local.name.inner) == Some("kept")
+			})
+			.unwrap();
+		assert_eq!(kept.ty, TypeIndex::U32);
+	}
+
+	#[test]
+	fn rejected_local_constants_still_resolve_without_compatibility_cascades() {
+		let case = Case::new(
+			"const N: u32 = 1;
+			 func f(value: Bool) { local const N = value; }",
+		);
+		DiagnosticView::new(
+			"typecheck",
+			case.sema.diagnostics(),
+			&case.graph.files,
+		)
+		.assert_codes(&[DiagnosticCode::RefutablePatternInLocal]);
+		assert_eq!(error_pattern_types(&case, "const N"), ["Bool"]);
+		let start = case.source.rfind("N =").unwrap() as u32;
+		let site = Site::Value(SourceSpan::new(
+			case.file,
+			TextSpan::from(start..start + 1),
+		));
+		let Some(Reference::Item { item, .. }) =
+			case.sema.resolutions.by_site.get(&site)
+		else {
+			panic!("a rejected constant test must still resolve its name")
+		};
+		assert!(matches!(
+			case.sema.declaration_kind(*item),
+			crate::tir::DeclKind::Const(_)
+		));
+		assert_eq!(
+			case.strings.resolve(case.sema.decls.item(*item).name.inner),
+			Some("N")
+		);
+	}
+
+	#[test]
+	fn rejected_local_constants_still_report_unresolved_names() {
+		let case =
+			Case::new("func f(value: Bool) { local const MISSING = value; }");
+		DiagnosticView::new(
+			"typecheck",
+			case.sema.diagnostics(),
+			&case.graph.files,
+		)
+		.assert_codes(&[
+			DiagnosticCode::RefutablePatternInLocal,
+			DiagnosticCode::UndeclaredIdentifier,
+		]);
+		assert_eq!(error_pattern_types(&case, "const MISSING"), ["Bool"]);
+	}
+
+	#[test]
+	fn incompatible_destructuring_keeps_its_subject_but_not_guessed_child_types()
+	 {
+		let case = Case::new(
+			"func f(value: Bool) { match (value) { (left, right) => {}, _ => {} } }",
+		);
+		DiagnosticView::new(
+			"typecheck",
+			case.sema.diagnostics(),
+			&case.graph.files,
+		)
+		.assert_codes(&[DiagnosticCode::TypeMistmatch]);
+		assert_eq!(error_pattern_types(&case, "(left, right)"), ["Bool"]);
+		let body = case.body("f");
+		for local in &body.locals[1..] {
+			assert_eq!(local.ty, TypeIndex::ERROR);
+		}
+	}
+
+	#[test]
+	fn synthetic_field_tuple_errors_keep_the_field_type() {
+		let case = Case::new(
+			"struct W(value: (u8, Bool));
+			 func f(value: W) { match (value) { W(a, b, c) => {} } }",
+		);
+		DiagnosticView::new(
+			"typecheck",
+			case.sema.diagnostics(),
+			&case.graph.files,
+		)
+		.assert_codes(&[DiagnosticCode::ArgumentCountMismatch]);
+		assert_eq!(error_pattern_types(&case, "W(a, b, c)"), ["(u8, Bool)"]);
+	}
+
+	#[test]
+	fn erroneous_enum_repr_patterns_keep_the_enum_type() {
+		let case = Case::new(
+			"enum Flag(value: u8) { A = 0 }
+			 func f(value: Flag) { match (value) { Flag(0) => {} } }",
+		);
+		DiagnosticView::new(
+			"typecheck",
+			case.sema.diagnostics(),
+			&case.graph.files,
+		)
+		.assert_codes(&[DiagnosticCode::TestInEnumRepr]);
+		assert_eq!(error_pattern_types(&case, "Flag(0)"), ["Flag"]);
+	}
+
+	#[test]
+	fn unknown_subjects_do_not_acquire_a_type_from_an_invalid_pattern() {
+		let case = Case::new(
+			"func f() { match (missing) { const BAD => {}, _ => {} } }",
+		);
+		DiagnosticView::new(
+			"typecheck",
+			case.sema.diagnostics(),
+			&case.graph.files,
+		)
+		.assert_error_saying("cannot find");
+		assert_eq!(error_pattern_types(&case, "const BAD"), ["{unknown}"]);
 	}
 }

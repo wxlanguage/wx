@@ -51,8 +51,10 @@ pub use self::resolutions::{
 };
 pub use self::signatures::Semantics;
 use self::signatures::SemanticsBuilder;
+pub use self::typecheck::{FieldListShape, positional_pattern_gap};
 pub use self::types::{
 	GenericArgs, GenericEnvIdx, GenericEnvOwner, Primitive, Type, TypeIndex,
+	TypeList,
 };
 
 /// Checks declarations and bodies into a live [`Semantics`], which holds

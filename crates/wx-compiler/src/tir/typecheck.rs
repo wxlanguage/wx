@@ -32,6 +32,8 @@ mod members;
 mod patterns;
 mod places;
 
+pub use patterns::{FieldListShape, positional_pattern_gap};
+
 use calls::{CallTarget, Callee, GivenArgument};
 use members::{MemberPath, RootedPath};
 
@@ -780,9 +782,9 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			ast::Expression::Ascription { value, ty } => {
 				self.build_ascription(value, ty)
 			}
-			ast::Expression::Match { scrutinee, arms } => {
-				self.build_match(scrutinee, ast.list(arms), expected, span)
-			}
+			ast::Expression::Match {
+				scrutinee, arms, ..
+			} => self.build_match(scrutinee, ast.list(arms), expected, span),
 			ast::Expression::String => self.build_string(span),
 			kind @ (ast::Expression::QualifiedPath { .. }
 			| ast::Expression::Grouped { .. }) => {

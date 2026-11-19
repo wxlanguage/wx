@@ -170,6 +170,9 @@ pub enum NameUse {
 	/// A constant argument, for example an array's length: a constant or
 	/// an enum's variant.
 	Constant,
+	/// A pattern path: a struct/enum to destructure, or a constant/variant
+	/// to compare with. Bare constants need the `const` pattern marker.
+	Pattern,
 	/// A type, for example a parameter's annotation or `type Item = X`.
 	Type,
 	/// A bound (`T: X`, `trait Y: X`) or `<T as X>`: a trait or typeset.
@@ -188,7 +191,9 @@ impl NameUse {
 	/// Whether the name is looked up in `tier`.
 	fn looked_up_in(self, tier: Tier) -> bool {
 		match self {
-			NameUse::Value | NameUse::Constant => tier == Tier::Value,
+			NameUse::Value | NameUse::Constant | NameUse::Pattern => {
+				tier == Tier::Value
+			}
 			NameUse::Import => true,
 			NameUse::Type
 			| NameUse::Bound
@@ -205,6 +210,13 @@ impl NameUse {
 			(NameUse::Constant, _) => {
 				matches!(kind, DeclKind::Const(_) | DeclKind::EnumVariant(_))
 			}
+			(NameUse::Pattern, _) => matches!(
+				kind,
+				DeclKind::Struct(_)
+					| DeclKind::Enum(_)
+					| DeclKind::Const(_)
+					| DeclKind::EnumVariant(_)
+			),
 			(_, None) => false,
 			(NameUse::Type, Some(role)) => role == TypeRole::Type,
 			(NameUse::Bound, Some(role)) => {
@@ -228,7 +240,9 @@ impl NameUse {
 					| MemberKind::Method(_)
 					| MemberKind::Constant(_)
 			),
-			NameUse::Constant => matches!(kind, MemberKind::Constant(_)),
+			NameUse::Constant | NameUse::Pattern => {
+				matches!(kind, MemberKind::Constant(_))
+			}
 			NameUse::Type => matches!(kind, MemberKind::AssociatedType(_)),
 			NameUse::Bound
 			| NameUse::Trait
@@ -242,9 +256,10 @@ impl NameUse {
 	/// as a type (`shapes::area`).
 	pub(super) fn listed_tiers(self) -> &'static [Tier] {
 		match self {
-			NameUse::Value | NameUse::Constant | NameUse::Import => {
-				&[Tier::Value, Tier::Type]
-			}
+			NameUse::Value
+			| NameUse::Constant
+			| NameUse::Pattern
+			| NameUse::Import => &[Tier::Value, Tier::Type],
 			NameUse::Type
 			| NameUse::Bound
 			| NameUse::Trait
@@ -258,16 +273,22 @@ impl NameUse {
 	/// is reached through a type with members too (`Kind::A`,
 	/// `Point::SIZE`).
 	pub(super) fn admits(self, tier: Tier, kind: DeclKind) -> bool {
+		let prefix = match self {
+			NameUse::Constant => matches!(
+				kind,
+				DeclKind::Struct(_)
+					| DeclKind::Enum(_)
+					| DeclKind::TypeAlias(_)
+			),
+			// Constructors are listed from the value tier, where constructor
+			// accessibility is recorded. Listing their type bindings too
+			// would duplicate them or offer an inaccessible constructor.
+			NameUse::Pattern => matches!(kind, DeclKind::TypeAlias(_)),
+			_ => false,
+		};
 		(self.looked_up_in(tier) && self.takes(kind))
 			|| kind.type_role() == Some(TypeRole::Namespace)
-			|| (self == NameUse::Constant
-				&& tier == Tier::Type
-				&& matches!(
-					kind,
-					DeclKind::Struct(_)
-						| DeclKind::Enum(_)
-						| DeclKind::TypeAlias(_)
-				))
+			|| (tier == Tier::Type && prefix)
 	}
 }
 

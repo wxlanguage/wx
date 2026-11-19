@@ -269,6 +269,8 @@ pub enum Expression {
 	Match {
 		scrutinee: ExprId,
 		arms: List<MatchArm>,
+		/// Start of the arm list, including when no arm is written yet.
+		open_brace: TextOffset,
 	},
 	/// `continue (:{label})? {expr}?`: a branch to the loop it restarts.
 	/// The operand is its next state, or a [`Expression::NamedList`] giving

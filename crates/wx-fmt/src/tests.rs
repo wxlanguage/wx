@@ -1052,16 +1052,19 @@ fn test_format_local_patterns() {
 #[test]
 fn test_format_pattern_constants() {
 	// A constant named by one segment is written `const name`; a qualified
-	// path is a constant on its own.
+	// path is a constant on its own, so its optional marker is omitted.
 	let case = TestCase::new(indoc! {"
         func f(x: i32) {
             match (x) {
                 const MAX => {},
-                Ordering::Less => {},
+                const Ordering::Less => {},
+                const Point::LIMIT => {},
+                const limits::Point::LIMIT => {},
                 _ => {},
             }
         }
     "});
+	assert!(case.diagnostics.is_empty(), "{:#?}", case.diagnostics);
 	let output = format(
 		&case.ast,
 		&case.comments,
@@ -1079,11 +1082,14 @@ fn test_format_pattern_constants() {
                 match (x) {
                     const MAX => {},
                     Ordering::Less => {},
+                    Point::LIMIT => {},
+                    limits::Point::LIMIT => {},
                     _ => {},
                 }
             }
         "}
 	);
+	assert_eq!(checked_format(&output, 80, 4), output);
 }
 
 #[test]
@@ -2760,10 +2766,12 @@ impl Roles<'_> {
 				E::Match {
 					scrutinee: a,
 					arms: aa,
+					..
 				},
 				E::Match {
 					scrutinee: b,
 					arms: ba,
+					..
 				},
 			) => {
 				self.expr(a, b);

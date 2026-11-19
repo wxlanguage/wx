@@ -1198,14 +1198,6 @@ fn test_match_enum_variant_patterns() {
 
 #[test]
 fn test_match_missing_arrow_recovers_with_diagnostic() {
-	// The missing `->` itself is reported as E1002. `SeparatedGroup`'s
-	// recovery matches the arm list's closing brace by token *kind*, not
-	// nesting depth, so it mistakes `{ 1 }`'s own `}` for the match's
-	// closing brace here — a pre-existing characteristic of recovery
-	// shared by every brace-delimited construct in this parser, not
-	// specific to `match` — which cascades: the `,` left behind is not an
-	// expression (E1002), and re-syncing at the enclosing item boundary
-	// reports E1009.
 	let case = TestCase::new(indoc! {"
         func f(x: i32) -> i32 {
             match (x) {
@@ -1214,11 +1206,79 @@ fn test_match_missing_arrow_recovers_with_diagnostic() {
             }
         }
     "});
-	case.diagnostics().assert_codes(&[
-		DiagnosticCode::UnexpectedToken,
-		DiagnosticCode::UnexpectedToken,
-		DiagnosticCode::InvalidItem,
-	]);
+	case.diagnostics()
+		.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+	assert_eq!(case.arm_patterns(0), ["0", "_"]);
+	let Expression::Match { arms, .. } =
+		case.statement_expression(&case.function_block(0), 0)
+	else {
+		panic!("expected a match");
+	};
+	assert!(
+		case.ast
+			.list(arms)
+			.iter()
+			.all(|arm| matches!(arm.body, Branch::Block(_)))
+	);
+}
+
+#[test]
+fn unfinished_match_arms_keep_patterns_and_enclosing_delimiters() {
+	for unfinished in ["Point{}", "Point{},", "Point{} =>", "Point{} =>,"] {
+		let source = format!(
+			"func f(p: Point) {{ match (p) {{ {unfinished} }}; after(); }}\nfunc following() {{}}"
+		);
+		let case = TestCase::new(&source);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+		assert_eq!(case.ast.list(case.ast.root).len(), 2, "{source}");
+		assert_eq!(case.arm_patterns(0), ["(Point (named))"], "{source}");
+		let statements = case.function_block(0);
+		let Expression::Match { arms, .. } =
+			case.statement_expression(&statements, 0)
+		else {
+			panic!("expected a match in {source}");
+		};
+		let [arm] = case.ast.list(arms) else {
+			panic!("expected the unfinished arm in {source}");
+		};
+		let Branch::Expression(body) = arm.body else {
+			panic!("expected an error expression in {source}");
+		};
+		assert!(matches!(case.ast.expr(body), Expression::Error), "{source}");
+		assert_eq!(
+			case.shape(case.entry_expr(&statements, 1)),
+			"(call after)",
+			"{source}"
+		);
+	}
+}
+
+#[test]
+fn an_unfinished_match_arm_preserves_the_following_arm() {
+	for unfinished in ["Point{},", "Point{} =>,"] {
+		let case = TestCase::new(&format!(
+			"func f(p: Point) {{ match (p) {{ {unfinished} _ => (), }} }}"
+		));
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UnexpectedToken]);
+		assert_eq!(case.arm_patterns(0), ["(Point (named))", "_"]);
+	}
+}
+
+#[test]
+fn an_unfinished_match_arm_survives_at_end_of_file() {
+	for unfinished in ["Point{}", "Point{} =>"] {
+		let case = TestCase::new(&format!(
+			"func f(p: Point) {{ match (p) {{ {unfinished}"
+		));
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::UnexpectedToken,
+			DiagnosticCode::UnclosedDelimiter,
+			DiagnosticCode::UnclosedDelimiter,
+		]);
+		assert_eq!(case.arm_patterns(0), ["(Point (named))"]);
+	}
 }
 
 #[test]
@@ -2324,24 +2384,26 @@ fn test_pattern_const_marks_a_name_as_a_constant() {
 }
 
 #[test]
-fn test_pattern_redundant_const_is_dropped_and_warned() {
-	// A `const` before a path that is a constant already changes nothing:
-	// the parser warns and drops it.
+fn test_pattern_const_is_optional_on_qualified_paths_without_a_warning() {
 	let case = TestCase::new(indoc! {"
         func f(x: i32) {
             match (x) {
                 const Ordering::Less => {},
+                const Point::LIMIT => {},
+                const limits::Point::LIMIT => {},
                 const MAX => {},
             }
         }
     "});
-	case.diagnostics()
-		.assert_codes(&[DiagnosticCode::RedundantConstMarker]);
-	case.diagnostics()
-		.assert_warning(DiagnosticCode::RedundantConstMarker);
+	case.diagnostics().assert_none();
 	assert_eq!(
 		case.arm_patterns(0),
-		["(const Ordering::Less)", "(const MAX)"]
+		[
+			"(const Ordering::Less)",
+			"(const Point::LIMIT)",
+			"(const limits::Point::LIMIT)",
+			"(const MAX)"
+		]
 	);
 }
 
