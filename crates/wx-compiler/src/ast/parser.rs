@@ -712,17 +712,6 @@ impl<'ctx> Parser<'ctx> {
 		}
 		let root = parser.ast.push_nodes(items);
 
-		if parser.lexer.has_crlf {
-			parser.diagnostics.push(Diagnostic::warning()
-				.with_code(DiagnosticCode::CrlfLineEndings.code())
-				.with_message("file contains carriage returns (`\\r\\n`)")
-				.with_label(
-					Label::primary(file_id, TextSpan::empty_at(TextOffset::ZERO)).with_message(
-						"carriage returns can shift text spans; consider using LF (`\\n`) line endings instead",
-				))
-			);
-		}
-
 		let Parser {
 			lexer,
 			ast,
@@ -730,11 +719,10 @@ impl<'ctx> Parser<'ctx> {
 			..
 		} = parser;
 		// Appended, in whatever position they land: nothing downstream reads
-		// diagnostics positionally, each one carries its own span, and the
-		// CRLF warning above is already out of source order. `extend` over an
-		// exact-size iterator reserves once and moves each `Diagnostic` — not
-		// a cheap thing to shuffle, holding an owned message and two `Vec`s —
-		// exactly once.
+		// diagnostics positionally, and each one carries its own span.
+		// `extend` over an exact-size iterator reserves once and moves each
+		// `Diagnostic` — not a cheap thing to shuffle, holding an owned
+		// message and two `Vec`s — exactly once.
 		diagnostics.extend(
 			lexer
 				.unknown_spans

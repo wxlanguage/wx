@@ -67,9 +67,6 @@ pub enum Token {
 	MinusRightArrow,
 	FatArrow,
 	// Special
-	Comment,
-	DocComment,
-	Unknown,
 	Eof,
 }
 
@@ -130,9 +127,6 @@ impl std::fmt::Display for Token {
 			Hash => "#",
 			MinusRightArrow => "->",
 			FatArrow => "=>",
-			Comment => "comment",
-			DocComment => "doc comment",
-			Unknown => "unknown token",
 			Eof => "end of file",
 		};
 		write!(f, "{}", text)
@@ -159,11 +153,8 @@ pub(super) struct Lexer<'src> {
 	pub(super) source: &'src str,
 	pub(super) peeked: Option<Spanned<Token>>,
 	pub(super) comments: Vec<Comment>,
-	pub(super) has_crlf: bool,
 	pub(super) unknown_spans: Vec<TextSpan>,
 }
-
-const EOF: char = '\0';
 
 impl<'src> Lexer<'src> {
 	pub(super) fn new(input: &'src str) -> Lexer<'src> {
@@ -172,7 +163,6 @@ impl<'src> Lexer<'src> {
 			source: input,
 			peeked: None,
 			comments: Vec::new(),
-			has_crlf: false,
 			unknown_spans: Vec::new(),
 		}
 	}
@@ -219,128 +209,109 @@ impl<'src> Lexer<'src> {
 			return token;
 		}
 
-		let mut unknown_span: Option<TextSpan> = None;
-		loop {
-			let token = self.advance();
-			match token.inner {
-				Token::Comment => {
-					self.comments.push(Comment {
-						span: token.span,
-						kind: CommentKind::Line,
-					});
-					continue;
-				}
-				Token::DocComment => {
-					self.comments.push(Comment {
-						span: token.span,
-						kind: CommentKind::Doc,
-					});
-					continue;
-				}
-				Token::Unknown => {
-					unknown_span = match unknown_span {
-						Some(span) => {
-							Some(TextSpan::new(span.start, token.span.end))
-						}
-						None => Some(token.span),
-					};
-					continue;
-				}
-				_ => {
-					// A run of unknown characters is recorded and skipped,
-					// exactly like a comment. The parser has no handler for
-					// `Token::Unknown`, so surfacing one only ever added a
-					// second, misleading diagnostic on top of this one —
-					// pointing at whatever token happened to follow.
-					//
-					// Recorded here, where the run ends, so it is counted once
-					// however often the surrounding tokens are peeked: `next`
-					// returns a peeked token before reaching this point.
-					if let Some(span) = unknown_span {
-						self.unknown_spans.push(span);
-					}
-					return token;
-				}
-			}
-		}
+		self.advance()
 	}
 
 	pub(super) fn advance(&mut self) -> Spanned<Token> {
-		// Whitespace never becomes a token — skip it here instead of
-		// round-tripping it through the dispatch below only for `next` to
-		// discard the result and loop. Scan on a local cursor (see
-		// `eat_while`) so the skip costs one `self.chars` store, not one
-		// per whitespace char.
-		let mut cursor = self.chars.clone();
-		loop {
-			let mut probe = cursor.clone();
-			match probe.next() {
-				Some(' ' | '\t' | '\n') => cursor = probe,
-				Some('\r') => {
-					self.has_crlf = true;
-					cursor = probe;
+		// A run of unknown characters, with any whitespace inside it, is
+		// skipped and recorded as one span. The parser never sees it, so
+		// it cannot add a second, misleading diagnostic at whatever follows.
+		let mut unknown: Option<TextSpan> = None;
+		let token = loop {
+			// Whitespace never becomes a token — skip it here instead of
+			// round-tripping it through the dispatch below. Scan on a local
+			// cursor (see `eat_while`) so the skip costs one `self.chars`
+			// store, not one per whitespace char.
+			let mut cursor = self.chars.clone();
+			loop {
+				let mut probe = cursor.clone();
+				match probe.next() {
+					Some(' ' | '\t' | '\n' | '\r') => cursor = probe,
+					_ => break,
 				}
-				_ => break,
 			}
-		}
-		self.chars = cursor;
+			self.chars = cursor;
 
-		let start = self.offset();
-		let token = match self.chars.next().unwrap_or(EOF) {
-			// Patterns are ordered by frequency of occurrence in typical source code
-			// Most Frequent
-			'A'..='Z' | 'a'..='z' | '_' => self.consume_word(start),
-			'0'..='9' => self.consume_number(),
+			let start = self.offset();
+			let Some(ch) = self.chars.next() else {
+				break Spanned {
+					inner: Token::Eof,
+					span: TextSpan::empty_at(start),
+				};
+			};
+			let token = match ch {
+				// Patterns are ordered by frequency of occurrence in typical source code
+				// Most Frequent
+				'A'..='Z' | 'a'..='z' | '_' => self.consume_word(start),
+				'0'..='9' => self.consume_number(),
 
-			// Common Punctuation & Operators
-			'(' => Token::OpenParen,
-			')' => Token::CloseParen,
-			';' => Token::SemiColon,
-			',' => Token::Comma,
-			'=' => self.consume_equals(),
-			'{' => Token::OpenBrace,
-			'}' => Token::CloseBrace,
-			'#' => Token::Hash,
-			'[' => Token::OpenBracket,
-			']' => Token::CloseBracket,
-			'.' => self.consume_and_check('.', Token::DotDot, Token::Dot),
-			':' => self.consume_and_check(':', Token::ColonColon, Token::Colon),
-			'/' => self.consume_slash(),
+				// Common Punctuation & Operators
+				'(' => Token::OpenParen,
+				')' => Token::CloseParen,
+				';' => Token::SemiColon,
+				',' => Token::Comma,
+				'=' => self.consume_equals(),
+				'{' => Token::OpenBrace,
+				'}' => Token::CloseBrace,
+				'#' => Token::Hash,
+				'[' => Token::OpenBracket,
+				']' => Token::CloseBracket,
+				'.' => self.consume_and_check('.', Token::DotDot, Token::Dot),
+				':' => {
+					self.consume_and_check(':', Token::ColonColon, Token::Colon)
+				}
+				'/' => match self.consume_slash(start) {
+					Some(token) => token,
+					None => continue,
+				},
 
-			// Moderately Frequent
-			'+' => self.consume_and_check('=', Token::PlusEq, Token::Plus),
-			'-' => self.consume_dash(),
-			'*' => self.consume_and_check('=', Token::StarEq, Token::Star),
-			'<' => self.consume_open_angle(),
-			'>' => self.consume_close_angle(),
-			'!' => self.consume_and_check('=', Token::BangEq, Token::Bang),
-			'&' => self.consume_amper(),
-			'|' => self.consume_vbar(),
-			'"' => self.consume_string(),
+				// Moderately Frequent
+				'+' => self.consume_and_check('=', Token::PlusEq, Token::Plus),
+				'-' => self.consume_dash(),
+				'*' => self.consume_and_check('=', Token::StarEq, Token::Star),
+				'<' => self.consume_open_angle(),
+				'>' => self.consume_close_angle(),
+				'!' => self.consume_and_check('=', Token::BangEq, Token::Bang),
+				'&' => self.consume_amper(),
+				'|' => self.consume_vbar(),
+				'"' => self.consume_string(),
 
-			// Less Frequent
-			'\'' => self.consume_char(),
-			'%' => {
-				self.consume_and_check('=', Token::PercentEq, Token::Percent)
-			}
-			'^' => self.consume_and_check('=', Token::CaretEq, Token::Caret),
-			'\0' => Token::Eof,
-			_ => Token::Unknown,
+				// Less Frequent
+				'\'' => self.consume_char(),
+				'%' => self.consume_and_check(
+					'=',
+					Token::PercentEq,
+					Token::Percent,
+				),
+				'^' => {
+					self.consume_and_check('=', Token::CaretEq, Token::Caret)
+				}
+				_ => {
+					let run_start = unknown.map_or(start, |run| run.start);
+					unknown = Some(TextSpan::new(run_start, self.offset()));
+					continue;
+				}
+			};
+			break Spanned {
+				inner: token,
+				span: TextSpan::new(start, self.offset()),
+			};
 		};
-		let span = TextSpan::new(start, self.offset());
-
-		Spanned { inner: token, span }
+		if let Some(span) = unknown {
+			self.unknown_spans.push(span);
+		}
+		token
 	}
 
 	/// `=`, `==`, or `=>`.
 	#[inline]
 	pub(super) fn consume_equals(&mut self) -> Token {
-		match self.chars.clone().next().unwrap_or(EOF) {
-			'=' => {
+		match self.chars.clone().next() {
+			Some('=') => {
 				_ = self.chars.next();
 				Token::EqEq
 			}
-			'>' => {
+			Some('>') => {
 				_ = self.chars.next();
 				Token::FatArrow
 			}
@@ -355,8 +326,8 @@ impl<'src> Lexer<'src> {
 		token: Token,
 		fallback: Token,
 	) -> Token {
-		match self.chars.clone().next().unwrap_or(EOF) {
-			ch if ch == expect => {
+		match self.chars.clone().next() {
+			Some(ch) if ch == expect => {
 				_ = self.chars.next();
 				token
 			}
@@ -366,12 +337,12 @@ impl<'src> Lexer<'src> {
 
 	#[inline]
 	pub(super) fn consume_amper(&mut self) -> Token {
-		match self.chars.clone().next().unwrap_or(EOF) {
-			'&' => {
+		match self.chars.clone().next() {
+			Some('&') => {
 				_ = self.chars.next();
 				Token::DoubleAmper
 			}
-			'=' => {
+			Some('=') => {
 				_ = self.chars.next();
 				Token::AmperEq
 			}
@@ -381,12 +352,12 @@ impl<'src> Lexer<'src> {
 
 	#[inline]
 	pub(super) fn consume_vbar(&mut self) -> Token {
-		match self.chars.clone().next().unwrap_or(EOF) {
-			'|' => {
+		match self.chars.clone().next() {
+			Some('|') => {
 				_ = self.chars.next();
 				Token::DoubleVbar
 			}
-			'=' => {
+			Some('=') => {
 				_ = self.chars.next();
 				Token::VbarEq
 			}
@@ -396,12 +367,12 @@ impl<'src> Lexer<'src> {
 
 	#[inline]
 	pub(super) fn consume_dash(&mut self) -> Token {
-		match self.chars.clone().next().unwrap_or(EOF) {
-			'=' => {
+		match self.chars.clone().next() {
+			Some('=') => {
 				_ = self.chars.next();
 				Token::MinusEq
 			}
-			'>' => {
+			Some('>') => {
 				_ = self.chars.next();
 				Token::MinusRightArrow
 			}
@@ -411,15 +382,15 @@ impl<'src> Lexer<'src> {
 
 	#[inline]
 	pub(super) fn consume_open_angle(&mut self) -> Token {
-		match self.chars.clone().next().unwrap_or(EOF) {
-			'=' => {
+		match self.chars.clone().next() {
+			Some('=') => {
 				_ = self.chars.next();
 				Token::LeftArrowEq
 			}
-			'<' => {
+			Some('<') => {
 				_ = self.chars.next();
-				match self.chars.clone().next().unwrap_or(EOF) {
-					'=' => {
+				match self.chars.clone().next() {
+					Some('=') => {
 						_ = self.chars.next();
 						Token::DoubleLeftArrowEq
 					}
@@ -432,15 +403,15 @@ impl<'src> Lexer<'src> {
 
 	#[inline]
 	pub(super) fn consume_close_angle(&mut self) -> Token {
-		match self.chars.clone().next().unwrap_or(EOF) {
-			'=' => {
+		match self.chars.clone().next() {
+			Some('=') => {
 				_ = self.chars.next();
 				Token::RightArrowEq
 			}
-			'>' => {
+			Some('>') => {
 				_ = self.chars.next();
-				match self.chars.clone().next().unwrap_or(EOF) {
-					'=' => {
+				match self.chars.clone().next() {
+					Some('=') => {
 						_ = self.chars.next();
 						Token::DoubleRightArrowEq
 					}
@@ -571,45 +542,50 @@ impl<'src> Lexer<'src> {
 
 	pub(super) fn consume_string(&mut self) -> Token {
 		loop {
-			match self.chars.next().unwrap_or(EOF) {
-				'\\' => {
+			match self.chars.next() {
+				Some('\\') => {
 					_ = self.chars.next();
 				}
-				'"' | EOF => return Token::String,
-				_ => (),
+				Some('"') | None => return Token::String,
+				Some(_) => (),
 			}
 		}
 	}
 
 	pub(super) fn consume_char(&mut self) -> Token {
 		loop {
-			match self.chars.next().unwrap_or(EOF) {
-				'\\' => {
+			match self.chars.next() {
+				Some('\\') => {
 					_ = self.chars.next();
 				}
-				'\'' | EOF => return Token::Char,
-				_ => (),
+				Some('\'') | None => return Token::Char,
+				Some(_) => (),
 			}
 		}
 	}
 
-	pub(super) fn consume_slash(&mut self) -> Token {
-		match self.chars.clone().next().unwrap_or(EOF) {
-			'/' => {
+	/// `/` or `/=`, or `None` for a comment, which is recorded instead.
+	pub(super) fn consume_slash(&mut self, start: TextOffset) -> Option<Token> {
+		match self.chars.clone().next() {
+			Some('/') => {
 				_ = self.chars.next(); // consume second /
-				let is_doc = self.chars.clone().next().unwrap_or(EOF) == '/';
-				self.eat_while(|ch| !matches!(ch, '\n' | EOF));
-				if is_doc {
-					Token::DocComment
-				} else {
-					Token::Comment
-				}
+				let kind = match self.chars.clone().next() {
+					Some('/') => CommentKind::Doc,
+					_ => CommentKind::Line,
+				};
+				// `lines` ends the comment before a `\r\n` line break too.
+				let rest = self.chars.as_str();
+				let comment = rest.lines().next().unwrap_or("");
+				self.chars = rest[comment.len()..].chars();
+				let span = TextSpan::new(start, self.offset());
+				self.comments.push(Comment { span, kind });
+				None
 			}
-			'=' => {
+			Some('=') => {
 				_ = self.chars.next();
-				Token::SlashEq
+				Some(Token::SlashEq)
 			}
-			_ => Token::Slash,
+			_ => Some(Token::Slash),
 		}
 	}
 }

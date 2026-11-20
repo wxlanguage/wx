@@ -48,6 +48,17 @@ pub struct FormatManifest {
 	pub max_line_width: Option<u32>,
 	#[serde(default)]
 	pub indent_width: Option<u8>,
+	#[serde(default)]
+	pub line_ending: Option<LineEnding>,
+}
+
+/// The line break the formatter prints.
+#[derive(serde::Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LineEnding {
+	#[default]
+	Lf,
+	Crlf,
 }
 
 impl PackageManifest {

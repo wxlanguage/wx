@@ -2,6 +2,7 @@ use string_interner::symbol::SymbolU32;
 use wx_compiler::ast;
 use wx_compiler::diagnostics::{TextOffset, TextSpan};
 use wx_compiler::tir::unescape_string_literal;
+use wx_compiler::vfs::LineEnding;
 
 #[cfg(test)]
 mod tests;
@@ -3251,6 +3252,7 @@ impl<'a> Builder<'a> {
 pub struct RendererConfig {
 	pub max_line_width: u32,
 	pub indent_width: u8,
+	pub line_ending: LineEnding,
 }
 
 impl Default for RendererConfig {
@@ -3258,6 +3260,7 @@ impl Default for RendererConfig {
 		Self {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		}
 	}
 }
@@ -3278,6 +3281,7 @@ impl RendererConfig {
 				.max_line_width
 				.unwrap_or(default.max_line_width),
 			indent_width: format.indent_width.unwrap_or(default.indent_width),
+			line_ending: format.line_ending.unwrap_or(default.line_ending),
 		}
 	}
 }
@@ -3351,7 +3355,10 @@ impl<'a> Renderer<'a> {
 		if self.buffer.is_empty() {
 			return;
 		}
-		self.buffer.push('\n');
+		match self.config.line_ending {
+			LineEnding::Lf => self.buffer.push('\n'),
+			LineEnding::Crlf => self.buffer.push_str("\r\n"),
+		}
 	}
 
 	/// Ends the current line and opens the next one at the current indent.

@@ -42,7 +42,7 @@ impl StringLiteralError {
 		let (code, message, label) = match self.kind {
 			StringLiteralErrorKind::UnknownEscape(ch) => (
 				DiagnosticCode::UnknownCharacterEscape,
-				format!("unknown character escape: `{ch}`"),
+				format!("unknown character escape: `{}`", ch.escape_debug()),
 				"unknown character escape",
 			),
 			StringLiteralErrorKind::Unterminated => (
@@ -108,13 +108,17 @@ pub fn unescape_string_literal(
 						});
 					}
 				};
-				let output = decoded.get_or_insert_with(|| {
-					let mut value =
-						String::with_capacity(source.len().saturating_sub(2));
-					value.push_str(&source[1..offset]);
-					value
+				decoded
+					.get_or_insert_with(|| {
+						String::with_capacity(source.len()) + &source[1..offset]
+					})
+					.push(value);
+			}
+			// A line break is `\n` whatever the file's line endings are.
+			'\r' if source[offset + 1..].starts_with('\n') => {
+				decoded.get_or_insert_with(|| {
+					String::with_capacity(source.len()) + &source[1..offset]
 				});
-				output.push(value);
 			}
 			ch => {
 				if let Some(output) = &mut decoded {
@@ -144,6 +148,18 @@ mod tests {
 			unescape_string_literal(r#""plain""#).unwrap(),
 			Cow::Borrowed("plain")
 		));
+	}
+
+	#[test]
+	fn raw_crlf_line_breaks_decode_as_lf() {
+		for (source, expected) in [
+			("\"a\r\nb\"", "a\nb"),
+			("\"a\rb\"", "a\rb"),
+			("\"a\\r\\nb\"", "a\r\nb"),
+		] {
+			assert_eq!(unescape_string_literal(source).unwrap(), expected);
+		}
+		assert_eq!(parse_char_literal("'\r\n'"), Ok('\n'));
 	}
 
 	#[test]
@@ -206,6 +222,7 @@ pub fn parse_char_literal(s: &str) -> Result<char, CharLiteralError> {
 			}
 			Some(c) => c,
 		},
+		Some('\r') if chars.as_str() == "\n" => chars.next().unwrap(),
 		Some(c) => c,
 	};
 

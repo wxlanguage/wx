@@ -55,6 +55,7 @@ fn test_format_simple_function() {
 		RendererConfig {
 			max_line_width: 40,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -91,6 +92,7 @@ fn test_format_crate_contract_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(output, source);
@@ -118,6 +120,7 @@ fn test_format_use_trees() {
 		RendererConfig {
 			max_line_width: 40,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(output, source);
@@ -149,6 +152,7 @@ fn test_format_uses_and_reexports_in_import_blocks() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
+				line_ending: LineEnding::Lf,
 			},
 		);
 		assert_eq!(output, expected);
@@ -179,6 +183,7 @@ fn test_format_import_block() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -221,6 +226,7 @@ fn test_format_keeps_an_import_field_name_only_when_it_is_not_the_entrys_own() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -251,6 +257,7 @@ fn test_format_single_import_function_stays_inline() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -284,6 +291,7 @@ fn test_format_module_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -322,6 +330,7 @@ fn test_format_impl_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -362,6 +371,7 @@ fn test_format_trait_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -452,6 +462,7 @@ fn test_format_where_clause_assoc_type_bound() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
+				line_ending: LineEnding::Lf,
 			},
 		)
 	};
@@ -502,6 +513,7 @@ fn test_format_qualified_path() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	// The header is 90 columns flat, so its parameters break.
@@ -537,6 +549,7 @@ fn test_format_const_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -566,6 +579,7 @@ fn test_format_enum_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -599,6 +613,7 @@ fn an_enum_repr_is_formatted_as_a_struct_field() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -636,6 +651,7 @@ fn a_constant_parameter_and_arguments_keep_only_the_meaningful_const() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -662,6 +678,7 @@ fn an_array_length_is_formatted_without_a_marker() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -691,6 +708,7 @@ fn a_bracketed_constant_path_is_formatted_as_written() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(output, source);
@@ -714,6 +732,7 @@ fn a_literal_kind_is_formatted_as_a_path() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(output, source);
@@ -734,6 +753,7 @@ fn test_format_struct_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -761,6 +781,7 @@ fn test_format_parameter_and_field_slots() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -787,6 +808,7 @@ fn test_format_typeset_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -811,6 +833,7 @@ fn test_format_typeset_with_bound_clause() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -853,6 +876,7 @@ fn test_format_preserves_attributes_on_trait_enum_const_and_global() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -894,6 +918,7 @@ fn test_format_generic_struct_stays_inline() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -925,6 +950,7 @@ fn test_format_generic_function() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -957,6 +983,7 @@ fn test_format_struct_init() {
 		RendererConfig {
 			max_line_width: 40,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -991,6 +1018,7 @@ fn test_format_struct_init_block_value() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -1029,6 +1057,7 @@ fn test_format_local_patterns() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -1073,6 +1102,7 @@ fn test_format_pattern_constants() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -1111,6 +1141,7 @@ fn test_format_impl_trait_items() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -1144,6 +1175,7 @@ fn test_format_block_like_statement_semicolon() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -1171,6 +1203,7 @@ fn test_format_block_like_statement_semicolon() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -1196,6 +1229,7 @@ fn test_format_call_args_wrap() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
+				line_ending: LineEnding::Lf,
 			},
 		)
 	};
@@ -1259,6 +1293,7 @@ fn test_format_local_definition_wraps() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
+				line_ending: LineEnding::Lf,
 			},
 		)
 	};
@@ -1341,6 +1376,7 @@ fn test_format_inline_blocks() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
+				line_ending: LineEnding::Lf,
 			},
 		)
 	};
@@ -1413,6 +1449,7 @@ fn test_format_keeps_pub_on_memory_and_global() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
+				line_ending: LineEnding::Lf,
 			},
 		)
 	};
@@ -1443,6 +1480,7 @@ fn test_format_memory_config() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
+				line_ending: LineEnding::Lf,
 			},
 		)
 	};
@@ -1483,6 +1521,7 @@ fn test_format_binary_chain_breaks_at_line_limit() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
+				line_ending: LineEnding::Lf,
 			},
 		)
 	};
@@ -1870,6 +1909,7 @@ fn test_format_long_type_params_wrap() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -1899,6 +1939,7 @@ fn test_format_address_of() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -1929,6 +1970,7 @@ fn test_format_impl_trait_multi_segment() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -1961,6 +2003,7 @@ fn test_format_impl_trait_generic_type_params() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -2002,6 +2045,7 @@ fn test_format_deep_indent_past_max_width_does_not_panic() {
 		RendererConfig {
 			max_line_width: 10,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert!(!output.is_empty());
@@ -2549,6 +2593,7 @@ fn export_aliases_preserve_their_quoted_source_spelling() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
+				line_ending: LineEnding::Lf,
 			},
 		)
 	};
@@ -2573,6 +2618,7 @@ fn raw_ast_strings_preserve_original_spelling_when_formatted() {
 			RendererConfig {
 				max_line_width: 80,
 				indent_width: 4,
+				line_ending: LineEnding::Lf,
 			},
 		)
 	};
@@ -2610,6 +2656,7 @@ fn checked_format(source: &str, width: u32, indent: u8) -> String {
 	let config = RendererConfig {
 		max_line_width: width,
 		indent_width: indent,
+		line_ending: LineEnding::Lf,
 	};
 	let output =
 		format(&case.ast, &case.comments, &case.interner, source, config);
@@ -3716,6 +3763,7 @@ fn test_format_one_element_tuple_as_its_element() {
 		RendererConfig {
 			max_line_width: 80,
 			indent_width: 4,
+			line_ending: LineEnding::Lf,
 		},
 	);
 	assert_eq!(
@@ -4071,5 +4119,44 @@ fn a_group_fits_only_with_what_follows_it_on_its_line() {
 	assert_eq!(
 		checked_format(exact, exact.len() as u32 - 2, 4),
 		"struct Pair(\n    first: u32,\n    second: u32,\n);\n",
+	);
+}
+
+#[test]
+fn test_format_crlf_line_ending() {
+	let format_source = |source: &str, line_ending| {
+		let case = TestCase::new(source);
+		format(
+			&case.ast,
+			&case.comments,
+			&case.interner,
+			&case.files.get(case.file_id).unwrap().source,
+			RendererConfig {
+				line_ending,
+				..RendererConfig::default()
+			},
+		)
+	};
+	let lf = indoc! {"
+        /// doc
+        func f() {
+            // c
+            local s: heap::&[u8] = \"a
+        b\"; // trailing
+        }
+    "};
+	let crlf = lf.replace('\n', "\r\n");
+	assert_eq!(
+		format_source(&crlf, LineEnding::Crlf),
+		format_source(lf, LineEnding::Lf).replace('\n', "\r\n")
+	);
+
+	let manifest = vfs::PackageManifest::parse(
+		r#"{ "entry": "main.wx", "format": { "line_ending": "crlf" } }"#,
+	)
+	.unwrap();
+	assert!(
+		RendererConfig::from_manifest(manifest.format).line_ending
+			== LineEnding::Crlf
 	);
 }

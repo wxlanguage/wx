@@ -54,10 +54,9 @@ test('entry compilation runs core operators, generics, modules, and inlining', (
 
 test('warnings survive successful compilation', () => {
     const result = compile('main.wx', {
-        'main.wx': '#[unknown]\r\nfunc answer() -> i32 { 42 } export { answer }',
+        'main.wx': '#[unknown]\nfunc answer() -> i32 { 42 } export { answer }',
     });
     assert.equal(run(result, 'answer', 0), 42);
-    assert.ok(result.diagnostics.some(d => d.code === 'W1001'));
     assert.ok(result.diagnostics.some(d => d.code === 'W2011'));
 });
 

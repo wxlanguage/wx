@@ -2205,6 +2205,23 @@ fn test_scientific_notation_literal_at_end_of_input_is_float() {
 	}
 }
 
+#[test]
+fn test_line_comments_end_before_crlf() {
+	for (src, kind, end) in [
+		("// c\r\nx", CommentKind::Line, 4),
+		("/// d\r\nx", CommentKind::Doc, 5),
+		("// a\rb\nx", CommentKind::Line, 6),
+	] {
+		let mut lexer = Lexer::new(src);
+		assert!(lexer.next().inner == Token::Identifier, "{src:?}");
+		let [comment] = lexer.comments[..] else {
+			panic!("{src:?} should record one comment");
+		};
+		assert!(comment.kind == kind, "{src:?}");
+		assert_eq!(u32::from(comment.span.end), end, "{src:?}");
+	}
+}
+
 // ── Patterns ─────────────────────────────────────────────────────────────────
 
 #[test]
@@ -4505,6 +4522,21 @@ fn test_unknown_characters_are_skipped_rather_than_derailing_the_parse() {
 		let case = TestCase::new(source);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnknownToken]);
+	}
+}
+
+#[test]
+fn test_nul_is_an_unknown_character_not_end_of_input() {
+	// Everything after the NUL still parses, so `g` is seen.
+	let case = TestCase::new("func f() { \0 } func g(");
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::UnclosedDelimiter,
+		DiagnosticCode::UnknownToken,
+	]);
+
+	for source in ["// a\0b\nfunc f() {}", "func f() { local s = \"a\0b\"; }"] {
+		let case = TestCase::new(source);
+		case.diagnostics().assert_codes(&[]);
 	}
 }
 

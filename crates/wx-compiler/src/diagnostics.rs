@@ -115,7 +115,6 @@ define_diagnostic_codes! {
 		BlockLikeOperand => "E1028",
 		ChainedAssignment => "E1029",
 		RestInEnumBody => "E1030",
-		CrlfLineEndings => "W1001",
 		VisibilityNotPermitted => "W1002",
 		RedundantConstMarker => "W1003",
 

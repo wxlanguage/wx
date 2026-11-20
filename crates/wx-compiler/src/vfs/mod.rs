@@ -12,7 +12,8 @@ use crate::symbols::StringInterner;
 
 mod manifest;
 pub use manifest::{
-	DependencySource, FormatManifest, PackageManifest, PackageManifestKind,
+	DependencySource, FormatManifest, LineEnding, PackageManifest,
+	PackageManifestKind,
 };
 
 mod resolve;
