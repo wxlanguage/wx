@@ -17,7 +17,7 @@ use crate::convert::{
 };
 use crate::diagnostics::{add_compiler_diagnostic, diagnostic_publish_paths};
 use crate::documents::OpenDocument;
-use crate::projects::{ManifestState, ProjectState, discover_package_root};
+use crate::projects::{Manifest, ProjectState, discover_package_root};
 use crate::requests;
 use crate::snapshot::Snapshot;
 use crate::state::{
@@ -446,6 +446,59 @@ fn full_diagnostic_renders_and_handles_a_bad_index() {
 	let untracked = Uri::from_str("file:///not/a/tracked/file.wx").unwrap();
 	let untracked = requests::render_full_diagnostic(&state, &untracked, 0);
 	assert!(untracked.contains("Unable to find original wx diagnostic"));
+}
+
+#[test]
+fn lints_are_published_at_the_level_the_manifest_sets() {
+	let root = PathBuf::from("/workspace/app/main.wx");
+	let manifest_path = PathBuf::from("/workspace/app/wx.json");
+	let mut state = ServerState::default();
+	state.open_documents.insert(
+		root.clone(),
+		open_document("func f() {\n    local unused: i32 = 1;\n}\n"),
+	);
+	let dir = open_synthetic_manifest(&mut state, &root);
+	let published = |state: &mut ServerState, manifest: &str| {
+		state
+			.open_documents
+			.insert(manifest_path.clone(), open_document(manifest));
+		refresh_project_manifest(state, &manifest_path);
+		let analysis = analyze_root(state, &dir, &mut trace());
+		analysis
+			.diagnostics_by_file
+			.get(&root)
+			.cloned()
+			.unwrap_or_default()
+	};
+
+	let warned = published(&mut state, r#"{ "entry": "main.wx" }"#);
+	assert_eq!(warned.len(), 1);
+	assert_eq!(warned[0].severity, Some(DiagnosticSeverity::WARNING));
+	assert_eq!(
+		warned[0].code,
+		Some(tower_lsp_server::ls_types::NumberOrString::String(
+			wx_lint::Lint::UnusedVariable.code().to_string()
+		))
+	);
+	assert_eq!(
+		warned[0].tags,
+		Some(vec![tower_lsp_server::ls_types::DiagnosticTag::UNNECESSARY])
+	);
+
+	let denied = published(
+		&mut state,
+		r#"{ "entry": "main.wx", "lint": { "unused_variable": "error" } }"#,
+	);
+	assert!(denied.len() == 1 && is_error(&denied[0]));
+
+	let off = r#"{ "entry": "main.wx", "lint": { "unused_variable": "off" } }"#;
+	assert!(published(&mut state, off).is_empty());
+
+	// An invalid `lint` section disables linting, not the project.
+	let invalid = r#"{ "entry": "main.wx", "lint": { "unused": "off" } }"#;
+	assert!(published(&mut state, invalid).is_empty());
+	let sections = &state.projects[&dir].manifest;
+	assert!(sections.package.is_some() && sections.lint.is_none());
 }
 
 #[test]
@@ -1594,12 +1647,21 @@ async fn formatting_reuses_project_manifests() {
 	assert!(updated[0].new_text.contains("\n   local"));
 	assert!(!updated[0].new_text.contains("\n      local"));
 
+	// An invalid `format` section disables formatting, not the project.
+	let wide = r#"{"entry":"main.wx","format":{"indent_width":"wide"},"dependencies":{"dep":{"type":"local","path":"dep"}}}"#;
+	handle_command(change(wide.into(), 3), &mut state, client).await;
+	let sections = &state.projects[&root].manifest;
+	assert!(sections.package.is_some() && sections.format.is_none());
+	assert!(format(&mut state, client).await.is_none());
+
 	// A failed parse replaces the last valid value.
 	handle_command(change("{".into(), 3), &mut state, client).await;
-	assert!(matches!(
-		state.projects[&root].manifest,
-		ManifestState::Invalid
-	));
+	let sections = &state.projects[&root].manifest;
+	assert!(
+		sections.package.is_none()
+			&& sections.format.is_none()
+			&& sections.lint.is_none()
+	);
 	assert!(format(&mut state, client).await.is_none());
 	state.open_documents.get_mut(&manifest_path).unwrap().text = manifest(4);
 	assert!(
@@ -1672,7 +1734,7 @@ fn an_unconvertible_manifest_path_does_not_delete_the_project() {
 	state.projects.insert(
 		root.clone(),
 		ProjectState {
-			manifest: ManifestState::Invalid,
+			manifest: Manifest::default(),
 			published_files: HashSet::from([root.join("main.wx")]),
 		},
 	);

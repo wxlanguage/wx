@@ -34,7 +34,7 @@ A `local` inside the loop body does not work: the body runs again on every
 iteration, and the `local` with it.
 
 A second, smaller oddity: `loop { break 0 }` compiles and `block { break 0 }`
-does not (E2012), since an unlabelled `break` only leaves a loop
+does not (E2011), since an unlabelled `break` only leaves a loop
 (`jump_target` in `tir/typecheck/blocks.rs`). "Decision: what a jump targets"
 settles it.
 
@@ -102,12 +102,12 @@ same with a hidden counter. `break` and `continue` mean the same in all of them.
   target.
 - **A label names a target past a nearer one**: a `block`'s, to leave it from
   inside a loop; a loop's, to leave or restart it from inside a `block` or an
-  inner loop. A `continue` naming a `block` stays E2012.
+  inner loop. A `continue` naming a `block` stays E2011.
 
 **Only a written `block { .. }` is a target.** The braces a construct owns are
 not: an `if`'s and an `else`'s, a match arm's `{ .. }`, and a function's body.
 In Wasm an `if` is a forward target too;
-WX keeps it out, as it already refuses a label on an `if` (E1025), so
+WX keeps it out, as it already refuses a label on an `if` (E1016), so
 `loop { if c { break } }` leaves the loop. A `block` is something written to be
 left (or to scope locals), never a side effect of another construct.
 
@@ -167,7 +167,7 @@ loop :label (a: A = x, b = y, mut c: C = z) { body }
   `loop { .. }`, and wx-fmt prints it so. The label is optional.
 - **Each initial value is checked as a `local`'s value is.** It is held to the
   parameter's written type, and a parameter without one takes the value's
-  type, which must be known (E2002 for an untyped literal, as `local i = 0;`).
+  type, which must be known (E2003 for an untyped literal, as `local i = 0;`).
 - **The initial values are evaluated once, before the first iteration**, left
   to right, outside the loop: they see neither the parameters nor the loop's
   label (`loop (i: u32 = i + 1)` reads an outer `i`).
@@ -207,8 +207,8 @@ parameter. `continue` gives it as a call's arguments, in one of two forms:
   Each name is a parameter of the loop.
 
 The named form follows the rules of a call by name, with the same
-diagnostics: every name is required (E2122 for a missing one), an unknown name
-is E2120, a repeated one E2121, and the two forms do not mix in one list
+diagnostics: every name is required (E2093 for a missing one), an unknown name
+is E2091, a repeated one E2092, and the two forms do not mix in one list
 (E1018). Leaving a name out does not keep its value: forgetting to advance a
 counter is an error, not a silent infinite loop. A call by name and a named
 state share their matching (`match_names` in `tir/typecheck/calls.rs`).
@@ -229,7 +229,7 @@ parenthesized list. A call and a `continue` hold their argument list as one
 expression node, a `Tuple` or a `NamedList` (`AST::argument_list`). The
 checker gives a named list's names a meaning only there; anywhere else,
 including a loop body's result and one in parentheses inside the arguments
-(`continue(({ .. }))`), it is E2144, with its values still checked. A branch
+(`continue(({ .. }))`), it is E2112, with its values still checked. A branch
 gives the state by name with `continue`:
 
 ```wx
@@ -245,7 +245,7 @@ match arr[mid].cmp(target) {
 The parser reads an optional label, then a parameter list if the next token
 is not `{`, then the block. Each parameter is read with the parameter list's
 own slot parser (`parse_binding_and_type`, the same recovery), then `=` and
-its initial value; a missing one is reported (E1010) and kept as an error
+its initial value; a missing one is reported (E1009) and kept as an error
 node. `continue` takes an optional argument list after its optional label,
 parenthesized as a call's: a value written without parentheses is E1031, and
 read as the one argument.
@@ -262,7 +262,7 @@ parameters are declared, all together, as the loop scope's locals, with their
 completed types. The first state is the initial values as one value (a tuple
 of them, or the lone one), `ExprKind::Loop`'s `entry`. The state's type is
 stored with the loop's scope while its body is checked, for the body's result
-and each `continue`. A repeated parameter name is E2097, as in a function, and
+and each `continue`. A repeated parameter name is E2070, as in a function, and
 the name finds the first.
 
 ### Wasm
@@ -392,11 +392,11 @@ loop :rows (row: u32 = 0) {
    either.
 2. **The initial values are outside the loop's targets.** An unlabelled
    `break` in one leaves an enclosing `block` or loop, not this one;
-   `break :label` naming this loop is an undeclared label (E2011).
+   `break :label` naming this loop is an undeclared label (E2010).
 3. **A diverging initial value** (`loop (x = return)`) makes the loop
    unreachable: its type is `!`.
 4. **A body that forgets the next state is a type error.** A body ending in a
-   statement (`i += 1;`) is `()`, which is not the state's type (E2001, at the
+   statement (`i += 1;`) is `()`, which is not the state's type (E2002, at the
    body's end). A body whose every path breaks, returns or continues is `!`,
    and fits.
 5. **A bare `continue` in a loop with parameters is a mismatch**, as

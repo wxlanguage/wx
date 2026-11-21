@@ -684,7 +684,7 @@ impl Semantics {
 		Ok(false)
 	}
 
-	/// E2004: `what` ("literal `300`") is outside the range of the integer
+	/// E2005: `what` ("literal `300`") is outside the range of the integer
 	/// type `ty`.
 	pub(super) fn report_out_of_range(
 		&self,
@@ -702,7 +702,7 @@ impl Semantics {
 			.with_label(at.primary_label())
 	}
 
-	/// E2047: `what` is not representable as `member`, one of the members of
+	/// E2033: `what` is not representable as `member`, one of the members of
 	/// `typeset` an abstract target may be.
 	pub(super) fn report_typeset_member(
 		&self,
@@ -734,7 +734,7 @@ impl Semantics {
 			)
 	}
 
-	/// E2134: a bound states what `constant` is representable as, but the
+	/// E2102: a bound states what `constant` is representable as, but the
 	/// constant has a type, `declared`.
 	pub(super) fn report_typed_constant_bound(
 		&self,

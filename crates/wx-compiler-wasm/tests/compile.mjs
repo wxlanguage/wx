@@ -57,7 +57,7 @@ test('warnings survive successful compilation', () => {
         'main.wx': '#[unknown]\nfunc answer() -> i32 { 42 } export { answer }',
     });
     assert.equal(run(result, 'answer', 0), 42);
-    assert.ok(result.diagnostics.some(d => d.code === 'W2011'));
+    assert.ok(result.diagnostics.some(d => d.code === 'W2115'));
 });
 
 test('parse, module-loading, and type errors return diagnostics and null bytes', () => {

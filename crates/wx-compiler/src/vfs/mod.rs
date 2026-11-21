@@ -7,14 +7,11 @@ use codespan_reporting::files;
 use string_interner::symbol::SymbolU32;
 
 use crate::ast;
-use crate::diagnostics::{DiagnosticCode, SourceSpan, TextOffset};
+use crate::diagnostics::{DiagnosticCode, Diagnostics, SourceSpan, TextOffset};
 use crate::symbols::StringInterner;
 
 mod manifest;
-pub use manifest::{
-	DependencySource, FormatManifest, LineEnding, PackageManifest,
-	PackageManifestKind,
-};
+pub use manifest::{DependencySource, PackageManifest, PackageManifestKind};
 
 mod resolve;
 pub use resolve::{open_manifest, open_manifest_with_manifests};
@@ -388,6 +385,17 @@ impl CompilationUnit {
 			.iter()
 			.flat_map(|package| package.diagnostics.iter().cloned())
 			.collect()
+	}
+
+	/// Whether parsing or loading any package reported an error or a bug.
+	pub fn has_errors(&self) -> bool {
+		self.packages
+			.iter()
+			.any(|package| package.diagnostics.has_errors())
+			|| self
+				.parse_diagnostics
+				.iter()
+				.any(|diagnostics| diagnostics.has_errors())
 	}
 
 	pub fn collect_diagnostics(&self) -> Vec<Diagnostic<FileId>> {

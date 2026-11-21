@@ -75,7 +75,7 @@ impl<T: Eq> Eq for Pair<T> {}
 - **Every field must be `Eq` under the impl's bounds.** The bounds are written,
   never implied from the fields: without `T: Eq` above, `a: T` is an error
   ("`T` is not known to be `Eq`: require `T: Eq`"), as `func test<T>(x:
-  Foo<T>)` is E2129 asking for `T: StackValue`. A field of a type that is never
+  Foo<T>)` is E2098 asking for `T: StackValue`. A field of a type that is never
   `Eq` (`f32`, a pointer) is an error naming that field.
 - **The condition belongs to the impl, not to the type.** `Pair<f32>` is a valid
   type; it is just not `Eq`. Writing the bound on the struct
@@ -146,7 +146,7 @@ name.contents_eq(other)                  // equal contents of a slice
 
   The name is a placeholder. Both slices are in one memory, since comparing
   lengths in two memories compares an `M::Size` with an `N::Size`.
-- `==` on a pointer is the ordinary E2063 ("the trait bound `heap::&[u8]:
+- `==` on a pointer is the ordinary E2046 ("the trait bound `heap::&[u8]:
   PartialEq` is not satisfied"), with a help naming `address(..)` for identity
   and `.*`/`.contents_eq(..)` for contents. Users cannot write `PartialEq` for a
   pointer: an impl's target is a nominal type.
@@ -187,7 +187,7 @@ does in Rust. Ordering by a key is a comparator argument (`sort_by`), not an
 
 ### Enum reprs
 
-E2055 requires an enum's repr to be in core's integer typeset
+E2040 requires an enum's repr to be in core's integer typeset
 (`report_enum_repr_not_integer`, `tir/signatures.rs`). What a closed enum needs
 of its repr is `Eq`: its variants' values must be distinct, a `match` compares
 the scrutinee with each, and the checker compares them as constants. A float
@@ -259,7 +259,7 @@ nearly always be canonical.
    pattern; `Ctor::Opaque` only without a value.
 5. **Lowering**: the compiler's `eq` compares scalar by scalar; a constant
    pattern compares values; an enum `match` is unchanged.
-6. **Diagnostics**: E2063's help for `==` on a pointer.
+6. **Diagnostics**: E2046's help for `==` on a pointer.
 7. **`Slice::contents_eq`** in core.
 8. **`examples/hello_wasi`**: when `notes/open-enums.md`'s Change 2 turns its
    `Errno` into a struct, it gets `impl Eq for Errno {}` (written `PartialEq`
@@ -276,7 +276,7 @@ Write each where the code under test is (`CLAUDE.md`, "Testing patterns").
   type without `==`; without the bound, the field error.
 - Errors: a member in an `Eq` impl, a field of a type never `Eq`, a written
   `PartialEq` beside an `Eq` impl, a constant pattern of a type with only a
-  written `PartialEq`, `==` on a pointer (E2063 and its help).
+  written `PartialEq`, `==` on a pointer (E2046 and its help).
 - `f32` keeps `==`, has no `Eq`, and its constants are not patterns.
 - Lowering, under wasmtime: `==` on an `Eq` struct, a `match` on struct
   constants, `contents_eq` on two byte slices.

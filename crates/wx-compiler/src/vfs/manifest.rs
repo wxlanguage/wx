@@ -12,7 +12,9 @@ use super::{AbsolutePath, RelativePath};
 ///
 /// Unknown keys are ignored rather than rejected: `wx.json` is expected to
 /// grow further top-level keys (`meta`), and a manifest written for a newer
-/// wx should still load on an older one rather than failing outright.
+/// wx should still load on an older one rather than failing outright. A
+/// tool's own section (`format`) is not read here: the tool parses its own
+/// view of the same text.
 #[derive(serde::Deserialize)]
 pub struct PackageManifest {
 	#[serde(default, rename = "type")]
@@ -26,39 +28,6 @@ pub struct PackageManifest {
 	/// Arbitrary string keys selected by `package "key" as alias;`.
 	#[serde(default)]
 	pub dependencies: HashMap<String, DependencySource>,
-	#[serde(default)]
-	pub format: FormatManifest,
-}
-
-/// The optional `"format"` section: `wx.json`'s copy of `wx-fmt`'s
-/// `RendererConfig`, one field looser. Lives here rather than as
-/// `wx_fmt::RendererConfig` itself — `wx-fmt` depends on `wx-compiler`, not
-/// the reverse, so this crate has no way to name that type. `wx-fmt` reads
-/// this struct directly and overlays whatever's `Some` onto
-/// `RendererConfig::default()`; there's deliberately no second, duplicate
-/// set of these fields anywhere.
-///
-/// Every field optional and defaulted, at both the struct level (a manifest
-/// with no `"format"` key at all) and per-field (one that sets only e.g.
-/// `max_line_width`) — a manifest should be able to override a single
-/// setting without restating the other.
-#[derive(serde::Deserialize, Default, Clone, Copy)]
-pub struct FormatManifest {
-	#[serde(default)]
-	pub max_line_width: Option<u32>,
-	#[serde(default)]
-	pub indent_width: Option<u8>,
-	#[serde(default)]
-	pub line_ending: Option<LineEnding>,
-}
-
-/// The line break the formatter prints.
-#[derive(serde::Deserialize, Default, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum LineEnding {
-	#[default]
-	Lf,
-	Crlf,
 }
 
 impl PackageManifest {
@@ -143,46 +112,14 @@ mod tests {
 		assert!(manifest.dependencies.is_empty());
 	}
 
+	/// A tool's section is the tool's to read: an invalid one does not
+	/// stop the package from loading.
 	#[test]
-	fn manifest_defaults_format_section_when_absent() {
-		let manifest = PackageManifest::parse(r#"{ "entry": "main.wx" }"#)
-			.expect("valid ordinary manifest should parse");
-
-		assert_eq!(manifest.format.max_line_width, None);
-		assert_eq!(manifest.format.indent_width, None);
-	}
-
-	#[test]
-	fn manifest_parses_full_format_section() {
-		let manifest = PackageManifest::parse(
-			r#"{
-				"entry": "main.wx",
-				"format": {
-					"max_line_width": 100,
-					"indent_width": 2
-				}
-			}"#,
+	fn manifest_ignores_a_tool_section() {
+		PackageManifest::parse(
+			r#"{ "entry": "main.wx", "format": { "indent_width": "wide" } }"#,
 		)
-		.expect("valid format section should parse");
-
-		assert_eq!(manifest.format.max_line_width, Some(100));
-		assert_eq!(manifest.format.indent_width, Some(2));
-	}
-
-	/// A manifest should be able to override a single setting without
-	/// restating the other.
-	#[test]
-	fn manifest_format_section_fields_are_individually_optional() {
-		let manifest = PackageManifest::parse(
-			r#"{
-				"entry": "main.wx",
-				"format": { "max_line_width": 100 }
-			}"#,
-		)
-		.expect("a partial format section should parse");
-
-		assert_eq!(manifest.format.max_line_width, Some(100));
-		assert_eq!(manifest.format.indent_width, None);
+		.expect("a tool section is not read here");
 	}
 
 	#[test]

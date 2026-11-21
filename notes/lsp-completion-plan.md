@@ -142,7 +142,7 @@ finds, from the scope tree alone.
   statement, the same offsets through a reverse map.
 - Inside a literal's elements (a `Static` scope) `locals_at` stops at the
   boundary: an outer local is out of reach there. The checker's lookup
-  still finds it (and reports E2140, `build_path`), so it hides an item of
+  still finds it (and reports E2108, `build_path`), so it hides an item of
   its name, and the language keeps that rule (`notes/static-data.md`: the
   name must not silently mean an item). Completion follows the checker's
   order one candidate at a time: an item candidate is dropped when
@@ -235,9 +235,9 @@ the AST entries; `Semantics` owning everything is the design).
 ### 6. Receivers without a type yet
 
 A receiver whose type `needs_context` (`(5).`, `'a'.`, `"hi".`, `[1, 2].`)
-offers nothing, as the checker requires an annotation there (E2002). A
+offers nothing, as the checker requires an annotation there (E2003). A
 receiver with holes (`Layout<_>`) offers inherent members only, which is all
-`select_inherent_with_holes` would select. Later: a code action on E2002
+`select_inherent_with_holes` would select. Later: a code action on E2003
 that inserts the ascription.
 
 ## Steps
@@ -334,8 +334,8 @@ that inserts the ascription.
    the supertraits each trait writes itself), and an inherited one names its
    trait as a method does, `Repr (as StackValue)`.
    The parser keeps `{ Si }` and `{ Size = }` with an error type spanning
-   the gap, and `{ const }` with the error symbol as its name (one E1002
-   each); the checker adds only E2078 for a name the trait lacks.
+   the gap, and `{ const }` with the error symbol as its name (one E1001
+   each); the checker adds only E2056 for a name the trait lacks.
 4. Done: `Body::operand_of(ast, expr)` (and `operand_ty`) returns
    `tir::Operand`, the type `build_operand` already built with, moved into
    `body.rs`. It looks through a tuple of one and an ascription, which add no
@@ -427,7 +427,7 @@ that inserts the ascription.
      destructure's own path (`Po|(..)`) still lists every value.
 6. Later: ranking by the expected type (the checker has `Expected` but does
    not keep it), `completionItem/resolve` through `hover::signature`, the
-   E2002 code action.
+   E2003 code action.
 
 Validation (2026-11-12): 1546 compiler tests pass (2 ignored), 80 formatter
 tests and 63 LSP tests pass. `wx check` passes for 28/29 examples; `arena`

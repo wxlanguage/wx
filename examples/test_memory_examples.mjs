@@ -376,7 +376,7 @@ try {
     assert.equal(rejected.status, 1, rejected.stdout + rejected.stderr);
     const diagnostics = rejected.stderr.split("\n").filter(line => line.startsWith("{")).map(line => JSON.parse(line));
     assert.equal(diagnostics.length, 1, rejected.stderr);
-    assert.equal(diagnostics[0].code, "E2001");
+    assert.equal(diagnostics[0].code, "E2002");
     assert.match(diagnostics[0].labels.map(label => label.message).join("\n"), /expected .*io::&\[u8\].*found .*policy::&\[u8\]/);
     console.log("PASS wrong_memory: policy-memory slice rejected by host io parameter");
 } finally {

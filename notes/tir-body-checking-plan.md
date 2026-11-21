@@ -354,7 +354,7 @@ is the rule it replaced.
 | `i32`, `_: i32` | unnamed, binds nothing | unnamed: built and destructured by position only |
 | `x: i32` | an immutable local `x` | a field `x` |
 | `mut x: i32` | a mutable local `x` | a mutable field `x` (designed, not checked yet) |
-| `self: Self` | the receiver, first in a trait or impl function | reported: a field cannot be named `self` (E1008) |
+| `self: Self` | the receiver, first in a trait or impl function | reported: a field cannot be named `self` (E1007) |
 | `x` | the type `x`: "cannot find type `x`" | the same |
 | `_` | the type `_`: rejected, signatures do not infer | the same |
 | `self`, `mut x`, `mut i32` | E1023 "expected a type annotation" | the same |
@@ -382,11 +382,11 @@ types `func(A, B) -> R` stay unnamed; a declaration names its parameters.
   and is given `TypeExpression::Error`, which resolves to `ERROR` silently,
   so the parameter and those after it survive.
 - Where a `self` may stand is not the parser's question: `defs` reports one
-  that is not first in a trait or impl function (E2098, as before) and a
+  that is not first in a trait or impl function (E2071, as before) and a
   field named `self`; a free function's `self` is reported once and its type
   not resolved.
 - `defs`: `FunctionDef::params` holds `Option<Spanned<SymbolU32>>` per
-  parameter; the duplicate-name check (E2097) skips unnamed ones.
+  parameter; the duplicate-name check (E2070) skips unnamed ones.
 - `signatures`: every parameter's type is resolved as written, the receiver's
   too; E2099 (`MissingParameterType`) and the receiver's implied `Self` are
   gone.
@@ -448,18 +448,18 @@ known statically can be named.
   names one, and an impl's unnamed parameter must not make a concrete call
   positional only).
 - A function with an unnamed parameter (past the receiver) is called by
-  position only; naming it is an error (E2123), with the same code and
+  position only; naming it is an error (E2094), with the same code and
   wording as `X({ .. })` for `struct X(i32, b: i32)`.
 - Decided: `self` is a name like any other, so a method called through its
   type names its receiver, `T::m({ self: x, rhs })`; method syntax gives it,
-  and naming `self` there is an unknown name (E2120), as is any name the
+  and naming `self` there is an unknown name (E2091), as is any name the
   receiver already took.
 - Checking: arguments in written order;
   each name finds its parameter (the first of that name); each value is built
   with the parameter's type as known so far and learned from; an unknown name,
-  a name given twice and missing parameters are reported (new codes E2120
-  `UnknownParameterName`, E2121 `DuplicateNamedArgument`, E2122
-  `MissingArguments`, and E2123 `PositionalOnlyCall` for a target with an
+  a name given twice and missing parameters are reported (new codes E2091
+  `UnknownParameterName`, E2092 `DuplicateNamedArgument`, E2093
+  `MissingArguments`, and E2094 `PositionalOnlyCall` for a target with an
   unnamed parameter), and dropped arguments are built with nothing expected.
   Then the same final `expect` and bound checks as a positional call.
 - A struct construction is a call of its constructor and is checked by the
@@ -470,10 +470,10 @@ known statically can be named.
   diagnostics and bound ownership ask which declaration it is
   (`CallTargetKind`); `StructDef` keeps its field names and `pub`s as two
   index-aligned lists, as `FunctionDef` keeps its parameter names. The
-  diagnostics are shared too: E2016 and E2120–E2123, naming the target
+  diagnostics are shared too: E2015 and E2091–E2094, naming the target
   ("function `f`", "struct constructor `Point`") with a label at its
-  declaration. E2086 is gone; struct patterns keep E2025–E2027 and E2088
-  until they are looked at on their own, and field access keeps E2025.
+  declaration. E2086 is gone; struct patterns keep E2021–E2023 and E2088
+  until they are looked at on their own, and field access keeps E2021.
 - Body (since replaced: a call holds one `args` value, see "Calls"):
   `Call` and `AbstractCall` gain `order: ArgOrder`, as
   `StructConstructor` has. `args` stay in written order, which is the
@@ -488,7 +488,7 @@ known statically can be named.
   `ArgOrder` grew `ExprKind` from 24 to 32 bytes; moving a call's fields
   into a side record would bring it back.
 - Not yet: a call through a value (a local of `func(A) -> R` type, or a
-  value whose type implements `Call`) is not checked in either form (E2114).
+  value whose type implements `Call`) is not checked in either form (E2085).
   It will be positional only, since `Call::Args` is a tuple; a named call
   there will report "a call through a value takes its arguments by position".
 - Not yet: a named argument records no `Referent` (nor does a field name in
@@ -554,7 +554,7 @@ the first field, Rust and OCaml (for an n-ary constructor) reject it.
 **Refutability is syntactic.** wx enums carry no data, so destructuring a tuple
 or a struct always matches, and a pattern can fail only where it holds a
 literal or a constant. A `local` statement therefore takes a pattern that
-holds neither: a test in one is E2115, at the test itself. A match arm takes
+holds neither: a test in one is E2086, at the test itself. A match arm takes
 any pattern.
 
 **Values are constants.** A value leaf is a literal, an enum variant, a
@@ -567,7 +567,7 @@ structurally, field by field, never through `PartialEq`. An abstract constant
 
 A float has no single value to compare with, and a string has no equality at
 all, so neither can be matched: the parser reads them and the checker refuses
-them (E2117).
+them (E2088).
 
 **Checking flows down.** A pattern is checked against the type it is given:
 the scrutinee's, or a `local`'s value (or annotation). A struct pattern names
@@ -596,33 +596,33 @@ no `ArgOrder` or rest flag survives. `Int` is the value's bits in the pattern's
 type (`-1: i8` is `0xFF`), one spelling per value. `ExprKind::LocalDeclaration
 { pattern, value }` and `ExprKind::Match { scrutinee, arms }` with `Body::arms`
 (`Arm { scope, pattern, body }`): each arm declares its bindings in a scope of
-its own around its body. A test in a `local` is E2115, at the first test; every
+its own around its body. A test in a `local` is E2086, at the first test; every
 test in the pattern then becomes `Error`, so the pattern takes the value apart
 and binds without testing (its bindings are still declared), and only the
-first test is reported. A name bound twice in the same pattern is E2116.
+first test is reported. A name bound twice in the same pattern is E2087.
 
 The alternatives of a `|` bind the same names, as in rustc. The same name in
 two alternatives is *one* local, which both alternatives bind: the arm's body
 reads that one local. A name one alternative binds and another does not is
-E2118 (one report per name, a label on each alternative that lacks it); the
+E2089 (one report per name, a label on each alternative that lacks it); the
 same name bound differently in two alternatives — one `mut`, one not — is
-E2119; and the same name of a different type in two alternatives is E2001,
+E2090; and the same name of a different type in two alternatives is E2002,
 with the type it was first introduced with. Each `|` is checked on its own,
 and an alternative's names are those bound anywhere inside it, so a nested `|`
 counts towards the enclosing one.
 
-A name bound twice in one alternative is E2116, and is still the local the
+A name bound twice in one alternative is E2087, and is still the local the
 alternatives share: the two bindings are one variable, so they are of one
-type (E2001 says so when they are not). A name bound in two *products* — two
+type (E2002 says so when they are not). A name bound in two *products* — two
 sibling `|`s in one pattern, or a `|` and the pattern around it — is two
-variables, and E2116 says so.
+variables, and E2087 says so.
 
 The two kinds of place a name can be bound are a **product** (one value taken
 apart: a tuple, a struct, one alternative) and the **alternatives** of a `|`
 (one value matched several ways). A name in a product names a different value
 each time it is bound; a name in the alternatives names the same value, seen
 two ways. That is the whole difference, and it is what decides whether a
-second binding of a name is a mistake (E2116) or the same variable again
+second binding of a name is a mistake (E2087) or the same variable again
 (shared). rustc splits it the same way (`PatBoundCtx::{Product, Or}` in
 `rustc_resolve/src/late.rs`).
 
@@ -631,8 +631,8 @@ second binding of a name is a mistake (E2116) or the same variable again
 asked of a `Shapes`), run by `BodyContext` once a match's arms are built
 (`typecheck/exhaustiveness.rs`: lowering, `Shapes`, witnesses, reports). The question is whether a row `q`
 is useful after rows `P`: does some value match `q` and no row of `P`. Arm *i*
-is unreachable (W2010) when it is not useful after arms *0..i*; the match is
-non-exhaustive (E2066) when `_` is still useful after every arm, with up to
+is unreachable (W2114) when it is not useful after arms *0..i*; the match is
+non-exhaustive (E2049) when `_` is still useful after every arm, with up to
 three witnesses (the values no arm matches) in the report.
 
 - Constructors: a tuple or struct is the single constructor of its type, with
@@ -684,8 +684,8 @@ restricted way:
   the reader needs to know. A constant whose value is not known is opaque, and
   an enum whose variants have no value is unlisted; both need `_`.
 - **`eval` folds no `match`.** `ExprKind::Match` (like `IfElse`) is not a
-  constant expression, so a constant whose initializer is a `match` is E2057.
-- **`|` alternatives bind the same names** (E2118, E2119, E2001); the same
+  constant expression, so a constant whose initializer is a `match` is E2042.
+- **`|` alternatives bind the same names** (E2089, E2090, E2002); the same
   name in two alternatives is one local.
 - **No range patterns.** An integer or `char` match is exhaustive only with
   `_` or every value listed; the witness is the smallest value no arm lists.
@@ -694,7 +694,7 @@ restricted way:
   constant, or one `eval` cannot reduce to one number. An enum one of whose
   variants has no value is unlisted (needs `_`).
 - **A redundant alternative is not reported** (`case 1 | 1`); only whole arms
-  are (W2010).
+  are (W2114).
 - **Non-exhaustive reports** name at most three witnesses ("and more"), one
   per missing variant; an integer gets one witness; `_` when no arm names a
   constructor of that column.
@@ -709,9 +709,9 @@ restricted way:
 - **Untyped scrutinee or value:** `match 1 { .. }` and `local (a, b) = (1, 2)`
   need a type (annotation required).
 - **Literals:** floats and strings are not pattern literals.
-- **A test in a `local`** (E2115) turns each test into `Error`; the pattern
+- **A test in a `local`** (E2086) turns each test into `Error`; the pattern
   still takes the value apart, and its bindings are still declared.
-- **Parse recovery:** a `local` marker in a pattern is E1015, and the pattern
+- **Parse recovery:** a `local` marker in a pattern is E1012, and the pattern
   is read as broken.
 - **`!` scrutinee:** zero arms are exhaustive, and any arm there is reported
   unreachable.
@@ -795,7 +795,7 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   `Self(..)` and `Self({ .. })` construct it with the target's arguments
   (`impl<Mem> Layout<Mem>` builds `Layout<Mem>`), checked where every field is
   visible like any construction. Bare `Self` is a struct used as a value
-  (E2110). In a trait's default body, outside an impl, or for a target that is
+  (E2081). In a trait's default body, outside an impl, or for a target that is
   not a struct, `Self` names nothing to construct (E2009).
 - **Method calls** `x.m(..)` (done): the same `Callee`, the checked receiver
   its first argument, learned from like any argument. Only a member taking
@@ -822,7 +822,7 @@ After step 1 most stdlib bodies type-check: they are intrinsic calls, `if`,
   Slice range syntax has been removed; future range syntax will construct a
   proper range type. There is no ambient memory: a pointer type always names its
   memory (`heap::*T`, `Mem::*T`; an untagged one is `PointerWithoutMemory`,
-  E2038), and the compiler never picks one from how many are declared. A
+  E2029), and the compiler never picks one from how many are declared. A
   literal that becomes static data takes its type, and so its memory, from its
   context; without one it needs an annotation. A static-data story for MIR is
   still open.

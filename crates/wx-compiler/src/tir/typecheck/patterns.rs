@@ -1166,7 +1166,7 @@ impl BodyBuilder<'_, '_> {
 	}
 
 	/// `pattern_owner` for an enum: its repr is read, so every field of it
-	/// must be visible here (E2076, as for a field access).
+	/// must be visible here (E2054, as for a field access).
 	fn pattern_enum(
 		&mut self,
 		enum_index: EnumIdx,

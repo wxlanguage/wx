@@ -12,6 +12,8 @@ repository = "https://github.com/wxlanguage/wx/tree/main/crates/wx-fmt"
 workspace = true
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 string-interner = { workspace = true }
 wx-compiler = { path = "../wx-compiler" }
 

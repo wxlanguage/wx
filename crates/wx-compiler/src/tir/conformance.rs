@@ -291,7 +291,7 @@ impl Semantics {
 		)
 	}
 
-	/// The head of every function signature mismatch: E2080, naming the
+	/// The head of every function signature mismatch: E2058, naming the
 	/// function and its trait.
 	fn signature_mismatch(
 		&self,

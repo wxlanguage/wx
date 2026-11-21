@@ -354,7 +354,7 @@ Checkpoint 4 handoff:
   discovery and applicability remain distinct from absence and diagnosed failure.
   An unfinished competitor cannot be silently dropped from a unique selection.
   Two already established declarations still produce the ambiguity diagnostic.
-- Type-path construction reports E2104 with a qualification hint when unqualified
+- Type-path construction reports E2075 with a qualification hint when unqualified
   selection is pending. `<Receiver as Trait>::Member` continues to construct the
   existing projection and defer membership/normalization in the owning signature
   query's existing arena. No changes to obligation payloads or interner variants

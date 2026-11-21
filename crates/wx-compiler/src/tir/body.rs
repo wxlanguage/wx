@@ -534,7 +534,7 @@ pub(super) enum ScopeKind {
 	/// A string or array literal's elements, or a repeat's value:
 	/// constant expressions, so the locals of the scopes around it are out
 	/// of reach. A name still finds them, so a local shadows an item here as
-	/// anywhere, and using one is an error (E2140).
+	/// anywhere, and using one is an error (E2108).
 	Static,
 }
 
@@ -841,7 +841,7 @@ impl Body {
 	/// one its lookup finds there (`BodyBuilder::lookup_local`), innermost
 	/// scope first. Inside a `Static` scope (a literal's elements) the
 	/// locals of the scopes around it are out of reach, since using one is
-	/// an error (E2140), so they are left out. Empty when `offset` is not
+	/// an error (E2108), so they are left out. Empty when `offset` is not
 	/// in the body.
 	pub fn locals_at(&self, offset: TextOffset) -> Vec<LocalIdx> {
 		let mut found: Vec<LocalIdx> = Vec::new();
@@ -864,7 +864,7 @@ impl Body {
 
 	/// The local `name`, written at `offset`, refers to, as the checker's
 	/// lookup finds it: the nearest one declared, past static data too,
-	/// where using it is an error (E2140) but it still means that local and
+	/// where using it is an error (E2108) but it still means that local and
 	/// hides an item of its name.
 	pub fn local_named_at(
 		&self,
@@ -1750,7 +1750,7 @@ mod tests {
 	}
 
 	/// Inside a literal an outer local cannot be used, but a name there
-	/// still refers to it (E2140), so it hides an item of its name.
+	/// still refers to it (E2108), so it hides an item of its name.
 	#[test]
 	fn a_local_behind_static_data_still_takes_its_name() {
 		let source = indoc! {"

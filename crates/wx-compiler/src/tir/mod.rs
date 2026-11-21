@@ -34,7 +34,7 @@ pub use self::body::{
 };
 use self::decls::Declarations;
 pub use self::decls::{
-	AssocTypeIdx, ConstIdx, DeclKind, EnumIdx, FieldIdx, FieldOwner,
+	AssocTypeIdx, ConstIdx, DeclKind, Declared, EnumIdx, FieldIdx, FieldOwner,
 	FunctionIdx, GlobalIdx, InherentImplIdx, ItemLoc, MemberKind, MemberOwner,
 	MemoryIdx, NameUse, StructIdx, Tier, TraitIdx, TraitImplIdx, TypeAliasIdx,
 	TypeRole, TypesetIdx, UseItemIndex,

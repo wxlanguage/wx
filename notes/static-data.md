@@ -57,10 +57,10 @@ Two layers, each the single owner of its question:
    scope of their own, `ScopeKind::Static`. The scope stays connected: a
    name still finds a local around it, so a local shadows an item as
    anywhere, and `lookup_local` says it lies past the static scope, which
-   `build_path` reports (E2140 `LocalInStaticData`, "a local variable cannot
+   `build_path` reports (E2108 `LocalInStaticData`, "a local variable cannot
    be used in static data"). Disconnecting the scope was rejected: the name
    would silently fall through to an item of the same name. A repeat's count
-   is a length, held to a literal or a constant by `repeat_length` (E2044).
+   is a length, held to a literal or a constant by `repeat_length` (E2032).
    `return`, `break` and `continue` get no rule of their own: the evaluator
    reports them as not constant.
 2. **Forms.** The evaluator decides what is a constant expression, as it
@@ -230,6 +230,6 @@ Each slice ends with execution tests (inlining off and on) and a CLI run.
   `nested_arrays_are_static_data_written_inline`,
   `nested_loads_through_pointers_match_their_explicit_form`.
 - A slice as a struct's last field (an unsized tail): reported by lowering
-  (E2114), waits for `Sized`.
+  (E2085), waits for `Sized`.
 - Static data holding a struct with an array (`Header(2, "abcd")` placed):
   a construction is checked as a `StackValue`; deferred.

@@ -393,7 +393,7 @@ impl BodyBuilder<'_, '_> {
 		}
 	}
 
-	/// E2125 for an object of type `ty` at `span`; `pointee` is what a
+	/// E2096 for an object of type `ty` at `span`; `pointee` is what a
 	/// pointer object points at, to say when it is one pointer too many.
 	fn report_cannot_index(
 		&mut self,

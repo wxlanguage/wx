@@ -11,13 +11,13 @@ kept: only the unit inside the statement grows.
 Type arguments are inferred inside one call today. `build_function_call`
 holds them in a local `Vec<TypeIndex>`, `INFER` where unknown, learns from the
 expected result and then from the arguments, and `settle_uninferred` turns
-what is left into `ERROR` with E2002 before the call returns. Information
+what is left into `ERROR` with E2003 before the call returns. Information
 flows down (the expected type) and up from a call's own arguments, never back
 into a call that has returned.
 
 ```wx
 bump.set(RawPtr::from_addr(new_end).as_ptr());            // works (one level)
-bump.set(RawPtr::from_addr(new_end).add(1).as_ptr());     // E2002 on `from_addr`
+bump.set(RawPtr::from_addr(new_end).add(1).as_ptr());     // E2003 on `from_addr`
 ```
 
 The first works only by a special case (`receiver_expectation`, `ReceiverOf`):
@@ -47,7 +47,7 @@ A call no longer settles. An argument it cannot learn becomes an **inference
 variable**, a type that is unknown now and may be decided later in the same
 statement. Everything that later meets a type with a variable in it
 **unifies**, binding the variable. At the end of the statement every variable
-must be bound: what is left is E2002, reported where the variable was made,
+must be bound: what is left is E2003, reported where the variable was made,
 with the same message as today ("cannot infer type for type parameter
 `Mem`"). Then the statement's nodes are rewritten with the bound types
 (*writeback*), so nothing after the `;` ever sees a variable.
@@ -62,7 +62,7 @@ back, decide the queue in order) and never runs anything twice.
 
 The price is one rule a user can see: **a projection over a variable teaches
 nothing.** In `RawPtr::from_addr(make())` with `make<U>() -> U`, `?U` meets
-`<?0 as Memory>::Size`, which is not a structural match, so `?U` is E2002
+`<?0 as Memory>::Size`, which is not a structural match, so `?U` is E2003
 even if `?0` is bound later in the statement; `make::<u32>()` is the
 spelling. This is the same direction as "no implied bounds through
 equalities": `<?0 as Memory>::Size == u32` never binds `?0` either. Stated
@@ -89,7 +89,7 @@ variables.
   is a specific unknown that two places can share; `INFER` never is.
 - An `InferenceTable` on `BodyContext`: a union-find over `VarIdx`, each root
   holding `Unbound` or `Bound(TypeIndex)`, plus each variable's origin (the
-  span and the parameter name that E2002 needs) and its level (below).
+  span and the parameter name that E2003 needs) and its level (below).
 - `resolve(ty)` replaces each bound variable by its value, deeply, and is
   what every site that reads a type's structure calls first (rustc's
   `resolve_vars_if_possible` / `shallow_resolve`).
@@ -126,7 +126,7 @@ value, a `local`'s initializer. A local's type must be free of variables when
 the `local` statement ends, so
 
 ```wx
-local w = W::empty();   // E2002 here, as today
+local w = W::empty();   // E2003 here, as today
 w.push(5: u8);          // does not teach `w`'s type: no inference from later uses
 ```
 
@@ -148,7 +148,7 @@ let-generalization (Rémy's levels):
 - each variable is made at the current statement depth, its level;
 - unifying two variables gives the root the lower level, and binding a
   variable to a type lowers the levels of the variables inside it;
-- at a `;` at depth `d`, the unbound variables at level `d` are E2002; those
+- at a `;` at depth `d`, the unbound variables at level `d` are E2003; those
   at a lower level belong to an enclosing statement and stay open.
 
 The variables made by the inner statement that were never connected to the
@@ -159,7 +159,7 @@ outer one are settled at the inner `;`, as they would be today.
 Every place the checker reads a type and acts on it now has three choices:
 resolve and continue (no variable left in the part it reads), **wait** (queue
 it until the variables are bound), or **require** the type to be known enough
-right now (rustc's `structurally_resolve_type`, E0282) and report E2002 if it
+right now (rustc's `structurally_resolve_type`, E0282) and report E2003 if it
 is not.
 
 | site | today | with variables |
@@ -168,13 +168,13 @@ is not.
 | untyped literal against a type with variables | `coerce` on the spot | **waits** (a pending coercion); decided once the target is known |
 | bounds of a use (`check_use_bounds`) | recorded, decided at the body's end (`decide`) | unchanged: already deferred. Writeback rewrites their `GenericArgs` in place, so they never see a variable |
 | `require_stack_value` | on the spot | **waits** when the type has variables |
-| method call | selects on the receiver's type | selects on the receiver's **head**: an inherent impl by shape (`select_inherent_with_holes`, which already exists); a trait member by its head too (below). A receiver whose head is itself a variable (`id(x).m()` with `id`'s `T` unknown) is **required**: E2002 now |
+| method call | selects on the receiver's type | selects on the receiver's **head**: an inherent impl by shape (`select_inherent_with_holes`, which already exists); a trait member by its head too (below). A receiver whose head is itself a variable (`id(x).m()` with `id`'s `T` unknown) is **required**: E2003 now |
 | field access, `.*`, `.&`, indexing | reads the type | the head must be known (**required**); the parts may be variables (`make().field` is `W<?0>`'s field instantiated with `?0`) |
-| operators | primitive or trait method by operand type | the head must be known (**required**); `?0 + 1` is E2002 |
+| operators | primitive or trait method by operand type | the head must be known (**required**); `?0 + 1` is E2003 |
 | `match` scrutinee, patterns, exhaustiveness | reads the type | **required** at the `match`; usefulness is already decided at the end (`ExprObligation::Match`) |
 | call of a value (`v(a)`) | `Call` by type | **required**: the callee's type must be known to pick `CallRef` or `Call::call` |
 
-A **required** site that fails reports E2002 for the variable it met, the
+A **required** site that fails reports E2003 for the variable it met, the
 same diagnostic it would get at the `;`, only earlier. The table is the real
 cost of the change: every site in `typecheck/` that matches on
 `self.cx.types.resolve(ty)` must say which of the three it is.
@@ -210,7 +210,7 @@ So the solver is not changed: it already has the answer this needs.
 
 At the end of a statement, in this order, each step once:
 
-1. **Report.** Each unbound variable at this level: E2002 at its origin, once
+1. **Report.** Each unbound variable at this level: E2003 at its origin, once
    per variable (union-find root), then bound to `ERROR`, which silences
    whatever was waiting on it. That keeps today's poisoning: one missing
    annotation is one diagnostic.
@@ -305,7 +305,7 @@ again in `select_member`), and the model selects once.
   | binding (`TypeIndex`, a reserved value for unbound) | 4 |
   | level | 4 |
   | origin: span | 8 |
-  | origin: the parameter's frame and slot (E2002 names it) | 8 |
+  | origin: the parameter's frame and slot (E2003 names it) | 8 |
 
   A variable is made only for a type argument a call could not learn,
   typically none to four in a statement.
@@ -329,7 +329,7 @@ again in `select_member`), and the model selects once.
   as if it were a final type silently does the wrong thing. A debug assertion
   in the solver's entry points that the input has no unresolved variable
   catches the ones that reach it.
-- **Diagnostic order.** E2002 and waited mismatches are reported at the `;`,
+- **Diagnostic order.** E2003 and waited mismatches are reported at the `;`,
   after diagnostics from later in the statement. Sort a statement's
   diagnostics by span before pushing, or accept the order.
 - **A second representation of "unknown".** Literal pseudo-types
@@ -355,7 +355,7 @@ Each step leaves the suite passing:
 3. Move the settle point to the statement, with levels. `receiver_expectation`
    becomes dead; remove it. `pair(W::empty(), W::new(5: u8))` and the
    two-level chain start to check.
-4. Classify the "required" sites, each with a test that the E2002 comes from
+4. Classify the "required" sites, each with a test that the E2003 comes from
    the site and not from the `;`.
 5. Trait members by head on a receiver with variables.
 6. A written `_` in types.
@@ -364,16 +364,16 @@ Each step leaves the suite passing:
 
 - a chain of method calls learning from the expected type at its end;
 - two arguments sharing a variable through the callee (`pair`);
-- `local w = W::empty();` stays E2002; a later use teaches nothing;
+- `local w = W::empty();` stays E2003; a later use teaches nothing;
 - an inner statement in a `block` does not report an outer variable, and
   does report its own;
-- `id(x).m()` with `T` unknown: E2002 at the method call, not a "no member";
+- `id(x).m()` with `T` unknown: E2003 at the method call, not a "no member";
 - a projection equality over a variable waits (`from_addr(n)` with
   `n: u32`), and fails at the `;` when the bound memory's `Size` is not `u32`;
 - a projection over a variable teaches nothing: `from_addr(make())` with
-  `make<U>() -> U` is E2002 on `U`, even though `Mem` is bound later;
+  `make<U>() -> U` is E2003 on `U`, even though `Mem` is bound later;
 - a literal argument against a variable's projection (`add(1)`) gets its type
   at the `;` and is checked for representability then;
-- one E2002 per variable, however many sites waited on it;
+- one E2003 per variable, however many sites waited on it;
 - no type with `HAS_INFER` in a finished body (debug assertion over every
   test).

@@ -23,7 +23,7 @@ parser at the requested width. No custom binary conversion or intermediate
 floating precision is involved, so generic instances do not share a value
 rounded at another width. `const_float` caches this exact
 decimal record through references and negation. Untyped binary float
-arithmetic reports E2114 for now; typed primitive operations are evaluated
+arithmetic reports E2085 for now; typed primitive operations are evaluated
 at their operand widths, and calls remain non-constant expressions.
 
 Constants live in the type space (as in GHC's DataKinds), not in a separate
@@ -337,7 +337,7 @@ A flag on `BodyContext`; `BodyOwner::Const` already says which bodies it is.
 - `const A: heap::&[u8; A] = [9; _];`: phase 3 normalizes `Const{A}`, which
   pushes `Evaluation(A)`; evaluation reads the type's length, `Const{A}` is
   `InProgress`, so it is a cycle.
-- The constant owns it: `evaluate_constant` reports it in phase 4 (E2109).
+- The constant owns it: `evaluate_constant` reports it in phase 4 (E2080).
 - The obligation that met it (a phase-3 `CheckWellFormed`) stays silent:
   a cycle a constant owns is reported where the constant is defined.
 - Evaluation normalizes body types through the solver, in place.
@@ -405,9 +405,9 @@ Where the code differs from the plan above:
   (`constant_scalars` normalizes it), so a type naming its own constant is a
   loop on the stack instead of unbounded recursion.
 - `const C: u32 = block { local a: heap::&[u8; C] = [0; _]; 1 }` is now only
-  E2057: the block is not evaluated, so no loop is ever closed. It becomes
-  E2109 once blocks with locals are evaluated.
-- A loop is reported by the constant (E2109) alone; the obligation that met it
+  E2042: the block is not evaluated, so no loop is ever closed. It becomes
+  E2080 once blocks with locals are evaluated.
+- A loop is reported by the constant (E2080) alone; the obligation that met it
   sees `Poisoned` (`normalize_const` maps a cycle to it) and is silent.
 
 Still open from the map: section 7's `layout.rs` handling of a `Const`

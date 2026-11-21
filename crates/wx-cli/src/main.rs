@@ -7,6 +7,7 @@ use codespan_reporting::term;
 use codespan_reporting::term::DisplayStyle;
 use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
 use wx_compiler::diagnostics::Diagnostics as _;
+use wx_compiler::vfs::FileSource as _;
 use wx_compiler::*;
 
 mod format;
@@ -261,6 +262,26 @@ fn load_compilation(
 	}
 }
 
+/// The `lint` section of the project's `wx.json`.
+fn load_lint_config(path: &str) -> wx_lint::LintConfig {
+	let manifest_path =
+		resolve_cli_path(path).join(&vfs::RelativePath::new("wx.json"));
+	let Ok(manifest) = vfs::NativeFileSource.read_to_string(&manifest_path)
+	else {
+		eprintln!("error: could not read '{manifest_path}'");
+		std::process::exit(1);
+	};
+	match wx_lint::LintConfig::from_manifest(&manifest) {
+		Ok(config) => config,
+		Err(error) => {
+			eprintln!(
+				"error: invalid `lint` section in '{manifest_path}': {error}"
+			);
+			std::process::exit(1);
+		}
+	}
+}
+
 /// Emits every diagnostic in `diagnostics` to stderr in the given format.
 /// Does not inspect severity — call `abort_if_errors` separately, after all
 /// diagnostics across every stage have been emitted.
@@ -317,10 +338,19 @@ fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
 	emit_diagnostics(&compilation, &diagnostics, format.clone());
 	abort_if_errors(diagnostics.error_count());
 
+	let lint_config = load_lint_config(project_path);
 	let mut sema = tir::check(&compilation, &mut strings);
+	let lints = wx_lint::lint(
+		&compilation,
+		&sema,
+		&strings,
+		compilation.root_package,
+		lint_config,
+	);
 	let lowered = tir::lower(&mut sema, &strings);
 	emit_diagnostics(&compilation, sema.diagnostics(), format.clone());
-	abort_if_errors(sema.diagnostics().error_count());
+	emit_diagnostics(&compilation, &lints, format.clone());
+	abort_if_errors(sema.diagnostics().error_count() + lints.error_count());
 	let mut mir =
 		lowered.expect("lowering without an error diagnostic produces MIR");
 
@@ -372,9 +402,18 @@ fn cmd_check(project_path: &str, format: MessageFormat) {
 	emit_diagnostics(&compilation, &diagnostics, format.clone());
 	abort_if_errors(diagnostics.error_count());
 
+	let lint_config = load_lint_config(project_path);
 	let sema = tir::check(&compilation, &mut strings);
+	let lints = wx_lint::lint(
+		&compilation,
+		&sema,
+		&strings,
+		compilation.root_package,
+		lint_config,
+	);
 	emit_diagnostics(&compilation, sema.diagnostics(), format.clone());
-	abort_if_errors(sema.diagnostics().error_count());
+	emit_diagnostics(&compilation, &lints, format.clone());
+	abort_if_errors(sema.diagnostics().error_count() + lints.error_count());
 
 	println!("No errors found.");
 }

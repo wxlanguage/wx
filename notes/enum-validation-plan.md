@@ -189,7 +189,7 @@ Now layered on top of the new architecture:
    `variant.const_value`. New diagnostic code (next free slot after `E1053`).
 3. **Range-check explicit int literals** — bounds-check the folded `Int` value against
    the repr type's range (reuse `IntegerRange::for_integer_type`, already used for
-   typesets at builder.rs:4831-4838). Reuse `IntegerLiteralOutOfRange` (E1004).
+   typesets at builder.rs:4831-4838). Reuse `IntegerLiteralOutOfRange` (E1003).
 4. **Auto-increment overflow** — same bounds check applied when assigning
    `next_auto_value` to an implicit variant, instead of blindly `wrapping_add`.
 5. **Negative values on unsigned repr** — falls out of item 3's range check for free once
@@ -199,7 +199,7 @@ Now layered on top of the new architecture:
    (builder.rs:4048), same pattern as the typeset "must be integer" check
    (builder.rs:4798). New diagnostic code.
 7. **Type-mismatched explicit values** — a dedicated `expr.ty == ty` check after the
-   value expression is built, reusing `TypeMistmatch` (E1001). Runs *before* the
+   value expression is built, reusing `TypeMistmatch` (E1000). Runs *before* the
    `eval_const_expr` gate so `A = true` gets a proper type-mismatch message instead of a
    generic "not constant" one.
 

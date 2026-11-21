@@ -156,7 +156,7 @@ because that's exactly the complexity the user wants to avoid.
   find a `Y` that `m` only exposes via `m`'s own `pub use c::*;`.
 - New `report_ambiguous_reexport` (modeled on rustc's E0659, one secondary
   label per contributing `pub use` edge) and new diagnostic code
-  `DiagnosticCode::AmbiguousReexport` = `E2096`
+  `DiagnosticCode::AmbiguousReexport` = `E2069`
   (`crates/wx-compiler/src/diagnostics.rs`).
 
 ### Tests added this session

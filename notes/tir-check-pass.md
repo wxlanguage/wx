@@ -88,7 +88,7 @@ demand-driven `ensure_*` calls existed inside the normalizer. It is gone:
   name it (`Wrapper::Item::Value`) is the one case construction cannot decide, so
   it records `CheckProjectionMember` and lowers to `ERROR`. The check pass
   resolves what the projection's value is and which traits could supply the
-  name, as rustc does to build its suggestion, and reports E2104 "ambiguous
+  name, as rustc does to build its suggestion, and reports E2075 "ambiguous
   associated type" with one note per candidate:
   `qualify the trait: `<<Wrapper as Container>::Item as Element>::Value``. It is
   an error even when resolvable, because selecting through an impl unqualified is
@@ -390,7 +390,7 @@ inference does in its simplest case, without a table: slots start as the
 written arguments (`_` anywhere is `INFER`) or `INFER`, meet the expected
 type's (`TypeInterner::meet`), then learn from each field's value
 (`TypeInterner::learn`, walking the declared field type to the struct's own
-parameters). A slot still not known is E2002 "cannot infer type for type
+parameters). A slot still not known is E2003 "cannot infer type for type
 parameter"; every final argument's bounds are proved at the call, as every use
 proves its own instantiation (so an annotation's violation is reported there
 too). `TypeFlags` on interned types (`HAS_INFER`, `HAS_ERROR`, `HAS_UNTYPED`)
@@ -481,7 +481,7 @@ builtin traits.
   But when the loop also goes through a reduction, the answer depends on where
   it was entered: with `impl<T: Tr> Tr for Wrap<T> { type A = T::A; }`,
   `T: Tr where { A = <Wrap<T> as Tr>::A }` leaves `T::A` as `T::A` and
-  `<Wrap<T> as Tr>::A` as itself, so every use reports E2112 for the very
+  `<Wrap<T> as Tr>::A` as itself, so every use reports E2083 for the very
   equality the bound states. `StackValue::Repr` behaves the same
   (`notes/stack-value.md`). rustc's default solver rejects the bound with
   E0275 (overflow); `-Znext-solver` accepts it (checked with rustc 1.96
@@ -499,7 +499,7 @@ builtin traits.
   - It cannot run where clauses are built (definitions are unreadable
     mid-construction, `IMPL_WHILE_BUILDING`), and a check never rewrites a
     signature, so the clause cannot be dropped with a warning instead.
-  - Uses still read the clause and still report E2112. One diagnostic needs a
+  - Uses still read the clause and still report E2083. One diagnostic needs a
     poisoned mark per equality clause that their readers fail silently on, as
     for a failed `Verdict`; nothing records that today.
   - Not caught: a loop that needs another equality besides a definition

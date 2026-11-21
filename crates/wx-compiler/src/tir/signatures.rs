@@ -1078,7 +1078,8 @@ impl Semantics {
 	/// Checks the page limits a memory's `#[memory_limits]` records
 	/// (`MemoryDecl::limits`) against what its `Size` can address: each a
 	/// count of 64 KiB pages up to 65536 for `u32` and 2^48 for `u64`, and
-	/// the minimum no greater than the maximum. Each failure is E2130.
+	/// the minimum no greater than the maximum. Each failure is
+	/// `InvalidMemoryLimits`.
 	///
 	/// What a left-out bound means is codegen's rule: no maximum, and a
 	/// minimum of the pages the memory's static data takes.
@@ -10621,7 +10622,7 @@ pub(super) mod tests {
 
 	#[test]
 	fn an_enum_repr_of_several_fields_is_not_supported_yet() {
-		// `TestCase` drops E2114, which is the claim here.
+		// `TestCase` drops E2085, which is the claim here.
 		let mut strings = Keyword::create_interner();
 		let graph = source_graph(
 			"enum Direction(dx: i8, dy: i8) { Up = 0 }",

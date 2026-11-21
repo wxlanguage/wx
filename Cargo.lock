@@ -2266,6 +2266,7 @@ dependencies = [
  "tokio",
  "wx-compiler",
  "wx-fmt",
+ "wx-lint",
  "wx-lsp",
 ]
 
@@ -2305,7 +2306,20 @@ version = "0.5.0"
 dependencies = [
  "codespan-reporting",
  "indoc",
+ "serde",
+ "serde_json",
  "string-interner",
+ "wx-compiler",
+]
+
+[[package]]
+name = "wx-lint"
+version = "0.5.0"
+dependencies = [
+ "codespan-reporting",
+ "indoc",
+ "serde",
+ "serde_json",
  "wx-compiler",
 ]
 
@@ -2325,6 +2339,7 @@ dependencies = [
  "web-time",
  "wx-compiler",
  "wx-fmt",
+ "wx-lint",
 ]
 
 [[package]]

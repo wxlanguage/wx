@@ -856,17 +856,7 @@ impl Semantics {
 	}
 
 	fn owner_file(&self, owner: BodyOwner) -> FileId {
-		match owner {
-			BodyOwner::Const(index) => self
-				.decls
-				.file_id(self.decls.constants[usize::from(index)].loc),
-			BodyOwner::Function(index) => self
-				.decls
-				.file_id(self.decls.functions[usize::from(index)].loc),
-			BodyOwner::Global(index) => self
-				.decls
-				.file_id(self.decls.globals[usize::from(index)].loc),
-		}
+		self.decls.file_id(owner.loc(&self.decls))
 	}
 
 	fn env_owner_file(&self, owner: GenericEnvOwner) -> FileId {
@@ -2048,6 +2038,23 @@ mod tests {
 	}
 
 	#[test]
+	fn dropping_a_local_reads_it() {
+		let a = Analysis::clean(indoc! {"
+			func f(unused: u32) {
+				_ = unused;
+			}
+		"});
+		assert_eq!(
+			a.value("_ = unused", "unused"),
+			Reference::Local {
+				owner: BodyOwner::Function(a.function_index("f")),
+				local: LocalIdx::new(0),
+				access: AccessKind::Read,
+			}
+		);
+	}
+
+	#[test]
 	fn only_the_named_target_of_a_write_is_written() {
 		let a = Analysis::clean(indoc! {"
 			memory heap: u32;
@@ -2342,7 +2349,7 @@ mod tests {
 	}
 
 	/// In a literal an outer local cannot be used, but it still takes its
-	/// name there (E2140), so the item of that name is not offered either.
+	/// name there (E2108), so the item of that name is not offered either.
 	#[test]
 	fn in_static_data_an_outer_local_is_neither_usable_nor_an_item() {
 		let analysis = Analysis::new(indoc! {"

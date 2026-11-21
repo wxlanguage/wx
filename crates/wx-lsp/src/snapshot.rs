@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use codespan_reporting::diagnostic::Diagnostic;
 use tower_lsp_server::ls_types::Uri;
 use wx_compiler::diagnostics::{SourceSpan, TextOffset, TextSpan};
 use wx_compiler::symbols::{Keyword, StringInterner};
@@ -16,7 +17,7 @@ use wx_compiler::vfs::{self, AbsolutePath, FileId, FileSource as _};
 use crate::convert::file_id_to_uri;
 use crate::diagnostics::{AnalysisResult, add_compiler_diagnostic};
 use crate::documents::{OpenDocument, OverlayFileSource};
-use crate::projects::{ManifestState, ProjectState};
+use crate::projects::{Manifest, ProjectState};
 use crate::query;
 use crate::trace::Trace;
 
@@ -24,6 +25,9 @@ pub(crate) struct Snapshot {
 	pub(crate) compilation: vfs::CompilationUnit,
 	pub(crate) strings: StringInterner,
 	pub(crate) sema: Semantics,
+	/// What the root package's lints report; none when its `lint` section
+	/// is invalid.
+	pub(crate) lints: Vec<Diagnostic<FileId>>,
 	/// Every declared name, by where it is written.
 	definitions: BTreeMap<SourceSpan, Definition>,
 	/// Every impl, by its target's path (`query::impls`), the one span
@@ -50,12 +54,25 @@ impl Snapshot {
 		)?;
 		let sema =
 			trace.step("check", |_| tir::check(&compilation, &mut strings));
+		let lints = match projects[root].manifest.lint {
+			Some(config) => trace.step("lint", |_| {
+				wx_lint::lint(
+					&compilation,
+					&sema,
+					&strings,
+					compilation.root_package,
+					config,
+				)
+			}),
+			None => Vec::new(),
+		};
 		let definitions = query::definitions(&sema);
 		let impls = query::impls(&sema).collect();
 		Ok(Self {
 			compilation,
 			strings,
 			sema,
+			lints,
 			definitions,
 			impls,
 		})
@@ -150,8 +167,8 @@ impl Snapshot {
 			.map(|module| module.file_id)
 	}
 
-	/// Each file's diagnostics (loading's, then checking's), and the local
-	/// files this root reaches.
+	/// Each file's diagnostics (loading's, then checking's, then the
+	/// lints'), and the local files this root reaches.
 	pub(crate) fn analysis(&self) -> AnalysisResult {
 		let files = &self.compilation.files;
 		let mut diagnostics_by_file = HashMap::new();
@@ -168,7 +185,11 @@ impl Snapshot {
 			}
 		}
 		let diagnostics = self.compilation.collect_diagnostics();
-		for diagnostic in diagnostics.iter().chain(self.sema.diagnostics()) {
+		for diagnostic in diagnostics
+			.iter()
+			.chain(self.sema.diagnostics())
+			.chain(&self.lints)
+		{
 			add_compiler_diagnostic(
 				&mut diagnostics_by_file,
 				files,
@@ -212,13 +233,9 @@ pub(crate) fn load_compilation(
 				if !overlay.exists(&manifest_path) {
 					return Err(());
 				}
-				let parsed =
-					overlay.read_to_string(&manifest_path).and_then(|text| {
-						vfs::PackageManifest::parse(&text).map_err(|_| ())
-					});
-				let manifest = match parsed {
-					Ok(manifest) => ManifestState::Parsed(manifest),
-					Err(()) => ManifestState::Invalid,
+				let manifest = match overlay.read_to_string(&manifest_path) {
+					Ok(text) => Manifest::parse(&text),
+					Err(()) => Manifest::default(),
 				};
 				projects.insert(
 					path.clone(),
@@ -228,8 +245,7 @@ pub(crate) fn load_compilation(
 					},
 				);
 			}
-			let ManifestState::Parsed(manifest) = &projects[&path].manifest
-			else {
+			let Some(manifest) = &projects[&path].manifest.package else {
 				return Err(());
 			};
 			for dependency in manifest.dependencies.values() {
@@ -240,11 +256,11 @@ pub(crate) fn load_compilation(
 		let manifests: HashMap<_, _> = visited
 			.into_iter()
 			.map(|dir| {
-				let ManifestState::Parsed(manifest) =
-					&projects[Path::new(dir.as_str())].manifest
-				else {
-					unreachable!()
-				};
+				let manifest = projects[Path::new(dir.as_str())]
+					.manifest
+					.package
+					.as_ref()
+					.expect("every visited package parsed");
 				(dir, manifest)
 			})
 			.collect();

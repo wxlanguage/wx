@@ -21,7 +21,7 @@ Other problems come from the same place:
 
 - **`_` means more than one thing.** In a pattern it drops a value. In a
   parameter it is a binder that binds nothing and also takes the parameter's
-  name away, so the function can only be called by position (E2123,
+  name away, so the function can only be called by position (E2094,
   `PositionalOnlyCall`), and conformance has a special rule for it (an impl may
   name a parameter the trait leaves unnamed).
 - **An unnamed field can only be read with a pattern.** WX has no `t.0`, so
@@ -80,7 +80,7 @@ Whether anything can is decided where the slot is checked:
 
 - **A loop header** infers it from its initializer (`notes/loop-bindings.md`).
 - **A signature** (a parameter, a field, a repr) has nothing to infer it
-  from: no type is read from a body or a use. The slot is reported, E2051
+  from: no type is read from a body or a use. The slot is reported, E2036
   (`InferInSignature`, the code `_` in a signature already has), at the name
   for an omitted type and at the `_` for a written one, and keeps an `ERROR`
   type, so everything after it is silent. `func log(i32)` is such a slot: a
@@ -101,7 +101,7 @@ is valid, and the checker reports it:
 
 - **A lone identifier is a binder with no type.** `func log(i32);` is a
   parameter named `i32` with an `ERROR` type, so its uses are silent; the
-  missing type is reported (as revised: E2051 by the checker, "A slot's type
+  missing type is reported (as revised: E2036 by the checker, "A slot's type
   may be left to inference").
 - **A slot that starts with a type is a missing binder.** `func f(heap::&u8)`
   (an identifier followed by `::`, `<` or anything but `:`, `,` or `)`, or a
@@ -114,12 +114,12 @@ is valid, and the checker reports it:
 
 ### What disappears
 
-- **E2123** (`PositionalOnlyCall`): every function and every struct
+- **E2094** (`PositionalOnlyCall`): every function and every struct
   constructor has a name for each parameter, so every call may be by name.
 - **Conformance's leniency** for unnamed parameters
   (`tir/conformance.rs`, "may name a parameter the trait leaves unnamed"): an
   impl's parameter names are the trait's, compared like any other part of the
-  signature (E2080).
+  signature (E2058).
 - **The binder-or-type lookahead** in `parse_binding_and_type`.
 
 ### What it gives
@@ -146,10 +146,10 @@ impl Visit for Counter {
 `_ = param;` reads the parameter and drops the value. It changes nothing
 outside the body, which matters because a parameter's name is part of its
 function's interface: a call by name uses it, and a trait impl must keep the
-trait's names (E2080). Renaming a parameter to silence a warning would break
+trait's names (E2058). Renaming a parameter to silence a warning would break
 calls; dropping it does not.
 
-So the unused-variable warning (W2001, `notes/unused-definitions-plan.md`)
+So the unused-variable warning (L3000, `notes/unused-definitions-plan.md`)
 needs no exemption: not for `_`-prefixed names (no naming convention), and not
 for trait impls' parameters. A local or parameter that is never read is
 warned; the fix is to read it or drop it. `_ = x;` must count as a read of `x`
@@ -179,7 +179,7 @@ positional construction works with named fields; a padding or reserved field
 in a `#[fixed_order]` layout reads better named `reserved`. It would only take
 away the by-name construction and `.name` access.
 
-**`_` kept as a parameter binder.** It is what forces E2123 and the
+**`_` kept as a parameter binder.** It is what forces E2094 and the
 conformance rule, and its one use, marking a parameter unused, is served by
 `_ = param;` without touching the interface.
 
@@ -192,7 +192,7 @@ checker. It went simpler, in the parser alone:
   `Wildcard`), and every `FunctionParam` and `StructField` has one.
 - **`_: T` and a type alone** (`(u8, u16)`, `*u8`, `func(A) -> R`) are
   reported ("expected a name, found `_`", "expected a name before this type",
-  E1002 `UnexpectedToken`, no code of its own) and kept with a missing name,
+  E1001 `UnexpectedToken`, no code of its own) and kept with a missing name,
   the error symbol (`Binding::missing`), as `x.` keeps a missing
   `PathSegment`. The item keeps its arity, and checking treats the slot as
   unnamed and stays silent on it: no local, no name to call or match by, no
@@ -202,7 +202,7 @@ checker. It went simpler, in the parser alone:
   optional in the parser (`ty: Option<TypeId>` on `FunctionParam` and
   `StructField`), and signature building resolves a type left out as a
   written `_` (`resolve_infer` in `tir/signatures.rs`, the one place the
-  infer policy is applied), so a signature reports it with the same E2051, at
+  infer policy is applied), so a signature reports it with the same E2036, at
   the name; silent for a slot whose name the parser reported missing. E1023
   is retired. See "A
   slot's type may be left to inference". An identifier followed by
@@ -212,7 +212,7 @@ checker. It went simpler, in the parser alone:
   `skip_to_separator` now skips a group it opens whole (`(..)`, `[..]`,
   `{..}`), and stops at a keyword that only starts an item at any depth, so
   a group left open does not swallow the items after it.
-- **E2123** stays, for a value called through `Call` by name; its
+- **E2094** stays, for a value called through `Call` by name; its
   unnamed-parameter case is gone. **E2088** (`TupleStructBracePattern`) is
   retired: no valid struct has an unnamed field. **E1022** (`mut` needs a
   name) is retired: `mut` before something that is no name is "expected a
@@ -232,7 +232,7 @@ checker. It went simpler, in the parser alone:
    `tir/signatures.rs`), and as a field or repr binder (where the fields are
    built, `Declarations::fields`), one diagnostic per slot, with a new code.
    The loop header gets the same rule when it is built.
-3. **Remove** E2123 (`typecheck/calls.rs`, its tests in `typecheck.rs`) and
+3. **Remove** E2094 (`typecheck/calls.rs`, its tests in `typecheck.rs`) and
    conformance's unnamed-parameter leniency (`tir/conformance.rs`).
 4. **Migrate** the 20 unnamed reprs in core and the examples, naming each:
    `value` for most, `code` for an `Errno`. Core's are
@@ -246,6 +246,6 @@ checker. It went simpler, in the parser alone:
    `tir/conformance.rs` and `wx-fmt/src/tests.rs`.
 5. **Printers:** every place that prints a signature or a field list back as
    source (`tir/format.rs`, hover in wx-lsp, wx-fmt) prints each binder's name.
-6. **Docs:** CLAUDE.md's bullets on functions (parameter syntax, E2123, the
+6. **Docs:** CLAUDE.md's bullets on functions (parameter syntax, E2094, the
    impl naming rule), structs and enums, and "Trait-impl conformance";
-   `notes/unused-definitions-plan.md` records the W2001 decision above.
+   `notes/unused-definitions-plan.md` records the L3000 decision above.

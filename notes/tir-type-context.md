@@ -78,7 +78,7 @@ committed test covers it yet).
 - Normalization keeps symbolic source terms: a stored `Need<i32>` may stem from
   `T::Item = Need<U::Item>`. Both identities matter when matching subjects.
   Ambiguous or conflicting equalities keep their distinct representations.
-- Constants require an explicit annotation (E2105 otherwise, stored as
+- Constants require an explicit annotation (E2076 otherwise, stored as
   `TypeIndex::ERROR`). Free constants resolve in the root type scope and their
   own namespace; impl constants in the impl's `self_scope`. Initializers should
   be checked in the same scope. Signature construction does not evaluate them.
@@ -93,7 +93,7 @@ committed test covers it yet).
 | Generic or associated-value bound validation | Always recorded (`CheckBounds`) and run by the check pass |
 | Qualified member applicability | Form the known projection, record `CheckTraitMembership` |
 | Signature normalization | Keep the symbolic term; whoever reads it normalizes |
-| Unqualified declaration selection | Report E2104, suggest trait qualification |
+| Unqualified declaration selection | Report E2075, suggest trait qualification |
 | Assumption proof and impl matching | Propagate `Pending`; never treat it as a negative proof |
 
 A recursion-budget overflow is returned as `Unsolved::Overflow` and reported by
@@ -105,7 +105,7 @@ own concern.
 ## Known gaps
 
 - Impl conformance (`check_trait_conformance`): not implemented.
-- Deferred unqualified name selection (reports E2104 instead), a general
+- Deferred unqualified name selection (reports E2075 instead), a general
   symbolic equality solver, and proof of impl associated equalities and nested
   requirements.
 - Remaining `todo!()`s: generic args on a type-relative path segment (two

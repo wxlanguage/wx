@@ -233,7 +233,7 @@ scope (the tuple has a parameter), so nothing is cached across scopes.
 - A `<X as StackValue>::Repr` written as a part of another type is not
   itself assumed a `StackValue`.
 - An untyped literal gives `T` no type: `transmute(5)` is "cannot infer
-  type for type parameter `T`" (E2002), `transmute::<i32, _>(5)` checks.
+  type for type parameter `T`" (E2003), `transmute::<i32, _>(5)` checks.
 
 ## Not covered
 

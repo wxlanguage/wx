@@ -509,9 +509,7 @@ impl<'r> PathResolver<'r> {
 
 /// One code regardless of tier — matches rustc, which reports both
 /// "cannot find type `X`" and "cannot find value `X`" as the same E0425,
-/// only the noun in the message differing. `UndeclaredType` (E2021) stays
-/// unused rather than being pressed into service for the same concept a
-/// second time.
+/// only the noun in the message differing.
 fn report_not_found(
 	strings: &StringInterner,
 	file_id: FileId,

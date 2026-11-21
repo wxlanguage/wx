@@ -107,17 +107,25 @@ fn report_expected_use_segment(
 		)
 }
 
+/// A missing `,` is an error; a missing `;` only a warning, since the
+/// item after it starts unambiguously.
 fn report_missing_separator(
 	file_id: FileId,
 	span: TextSpan,
-	separator: Token,
+	separator: Separator,
 ) -> Diagnostic<FileId> {
-	Diagnostic::warning()
-		.with_code(DiagnosticCode::MissingSeparator.code())
-		.with_message("missing separator")
+	let diagnostic = match separator {
+		Separator::Comma => {
+			Diagnostic::error().with_code(DiagnosticCode::MissingComma.code())
+		}
+		Separator::Semicolon => Diagnostic::warning()
+			.with_code(DiagnosticCode::MissingSemicolon.code()),
+	};
+	diagnostic
+		.with_message(format!("missing `{}`", separator.token()))
 		.with_label(
 			Label::primary(file_id, span)
-				.with_message(format!("consider adding `{}` here", separator)),
+				.with_message(format!("add `{}` here", separator.token())),
 		)
 }
 
@@ -259,20 +267,6 @@ fn report_chained_assignments(
 		.with_note(
 			"an assignment's value is `()`; write each assignment as its own statement",
 		)
-}
-
-/// `const` where nothing else could be written: before a literal or `_`
-/// argument, or an array's length.
-fn report_redundant_const_marker(
-	file_id: FileId,
-	span: TextSpan,
-	why: &str,
-) -> Diagnostic<FileId> {
-	Diagnostic::warning()
-		.with_code(DiagnosticCode::RedundantConstMarker.code())
-		.with_message("redundant `const`")
-		.with_label(Label::primary(file_id, span).with_message(why))
-		.with_note("drop the `const`")
 }
 
 /// `local` in a pattern: a name binds by default, so the marker says
@@ -547,28 +541,44 @@ pub struct Parser<'input> {
 struct Delimiters {
 	open: Token,
 	close: Token,
-	separator: Token,
+	separator: Separator,
+}
+
+/// What separates the items of a delimited list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Separator {
+	Comma,
+	Semicolon,
+}
+
+impl Separator {
+	fn token(self) -> Token {
+		match self {
+			Separator::Comma => Token::Comma,
+			Separator::Semicolon => Token::SemiColon,
+		}
+	}
 }
 
 /// `( a, b )`
 const PARENS: Delimiters = Delimiters {
 	open: Token::OpenParen,
 	close: Token::CloseParen,
-	separator: Token::Comma,
+	separator: Separator::Comma,
 };
 
 /// `{ a, b }`
 const BRACES: Delimiters = Delimiters {
 	open: Token::OpenBrace,
 	close: Token::CloseBrace,
-	separator: Token::Comma,
+	separator: Separator::Comma,
 };
 
 /// `{ a; b }`
 const BLOCK: Delimiters = Delimiters {
 	open: Token::OpenBrace,
 	close: Token::CloseBrace,
-	separator: Token::SemiColon,
+	separator: Separator::Semicolon,
 };
 
 /// A delimited list as parsed: its items, its span, delimiters included,
@@ -836,7 +846,7 @@ impl<'ctx> Parser<'ctx> {
 						| Token::CloseBrace
 						| Token::CloseBracket
 						| Token::SemiColon
-				) && token.inner != delimiters.separator)
+				) && token.inner != delimiters.separator.token())
 			{
 				break self.report_unclosed(delimiters, open, token.span.start);
 			}
@@ -863,7 +873,7 @@ impl<'ctx> Parser<'ctx> {
 			let needs = !parsed.inner.ends_in_block(&self.ast);
 			items.push(parsed);
 			trailing = false;
-			if next == delimiters.separator {
+			if next == delimiters.separator.token() {
 				self.lexer.next();
 				trailing = true;
 			} else if next == delimiters.close {
@@ -920,7 +930,7 @@ impl<'ctx> Parser<'ctx> {
 					depth -= 1;
 				}
 				_ if depth > 0 => {}
-				_ if token == delimiters.separator => {
+				_ if token == delimiters.separator.token() => {
 					self.lexer.next();
 					return;
 				}
@@ -1121,7 +1131,7 @@ impl<'ctx> Parser<'ctx> {
 	/// What a parameter or a struct field is written as: `binding (: Type)?`,
 	/// a binding being `name` or `mut name`, and where its slot ends. A
 	/// binding alone (`func log(i32)`) has no type, which is no error here:
-	/// whether anything infers it is the checker's to say (E2051 in a
+	/// whether anything infers it is the checker's to say (E2036 in a
 	/// signature, `notes/binders.md`). A slot whose
 	/// name is missing, `_: u8` or a type alone (`(u8, u16)`, `*u8`), is
 	/// reported and kept with a missing name ([`Binding::missing`]), so the
@@ -1461,8 +1471,8 @@ impl<'ctx> Parser<'ctx> {
 
 	/// One type argument: a literal is a constant; `const` marks a path as
 	/// one; anything else is a type. `const` before a literal or `_` says
-	/// nothing (`_` is inferred as whatever its parameter is), so it is
-	/// reported as redundant and dropped.
+	/// nothing (`_` is inferred as whatever its parameter is) and is
+	/// dropped.
 	fn parse_type_argument(&mut self) -> Result<TypeArgument, ()> {
 		let const_span = match self.peek_keyword() {
 			Some(Keyword::Const) => Some(self.lexer.next().span),
@@ -1470,15 +1480,6 @@ impl<'ctx> Parser<'ctx> {
 		};
 		let at_underscore =
 			matches!(self.peek_keyword(), Some(Keyword::Underscore));
-		if let Some(span) = const_span
-			&& (self.at_literal() || at_underscore)
-		{
-			self.diagnostics.push(report_redundant_const_marker(
-				self.file_id,
-				span,
-				"this argument is a constant already",
-			));
-		}
 		if self.at_literal() || (const_span.is_some() && !at_underscore) {
 			return Ok(TypeArgument::Const(self.parse_const_argument()?));
 		}
@@ -1541,17 +1542,12 @@ impl<'ctx> Parser<'ctx> {
 
 	/// An array's length, in a type or a repeat, after the `;` that ends at
 	/// `after`: only a constant can be written there, so `const` says
-	/// nothing. A length not written yet (`[u8; ]`) is reported and kept as
-	/// an error node spanning the gap up to the `]`, as a missing type is,
-	/// so the array is kept too.
+	/// nothing and is dropped. A length not written yet (`[u8; ]`) is
+	/// reported and kept as an error node spanning the gap up to the `]`, as
+	/// a missing type is, so the array is kept too.
 	fn parse_length(&mut self, after: TextOffset) -> Result<ConstId, ()> {
 		if let Some(Keyword::Const) = self.peek_keyword() {
-			let span = self.lexer.next().span;
-			self.diagnostics.push(report_redundant_const_marker(
-				self.file_id,
-				span,
-				"a length is a constant already",
-			));
+			self.lexer.next();
 		}
 		let token = self.lexer.peek();
 		if token.inner == Token::CloseBracket {
@@ -3266,7 +3262,7 @@ impl<'ctx> Parser<'ctx> {
 					Delimiters {
 						open: Token::OpenBracket,
 						close: Token::CloseBracket,
-						separator: Token::Comma,
+						separator: Separator::Comma,
 					},
 					open_span,
 					at,
@@ -4003,7 +3999,7 @@ impl<'ctx> Parser<'ctx> {
 					continue;
 				};
 				parser.diagnostics.push(
-					Diagnostic::warning()
+					Diagnostic::error()
 						.with_code(
 							DiagnosticCode::VisibilityNotPermitted.code(),
 						)
@@ -4072,7 +4068,7 @@ impl<'ctx> Parser<'ctx> {
 				if let Some(Keyword::Pub) = parser.peek_keyword() {
 					let pub_span = parser.lexer.next().span;
 					parser.diagnostics.push(
-						Diagnostic::warning()
+						Diagnostic::error()
 							.with_code(
 								DiagnosticCode::VisibilityNotPermitted.code(),
 							)
@@ -4322,7 +4318,7 @@ impl<'ctx> Parser<'ctx> {
 			Delimiters {
 				open: open_token,
 				close: close_token,
-				separator: Token::Comma,
+				separator: Separator::Comma,
 			},
 			Parser::parse_struct_field,
 		)?;
@@ -4446,7 +4442,7 @@ impl<'ctx> Parser<'ctx> {
 			| Item::InherentImpl { .. }
 			| Item::TraitImpl { .. } => {
 				parser.diagnostics.push(
-					Diagnostic::warning()
+					Diagnostic::error()
 						.with_code(
 							DiagnosticCode::VisibilityNotPermitted.code(),
 						)

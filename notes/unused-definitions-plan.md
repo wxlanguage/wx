@@ -1,9 +1,10 @@
 # Unused-definition warnings in the new TIR
 
-Status as of 2026-11-11, branch `tir-refactor`. A plan, not a record: nothing
-here is implemented beyond what "Where we are" describes. Companion to
-`tir-check-pass.md` and `tir-body-checking-plan.md`. Open questions are at the
-end.
+Status as of 2026-11-21, branch `tir-refactor`. Step 1 is implemented for
+locals and labels (L3000, L3001, L3002; see "Done") as lints in
+`crates/wx-lint`; the rest is a plan.
+Companion to `tir-check-pass.md` and `tir-body-checking-plan.md`. Open
+questions are at the end.
 
 ## Goal
 
@@ -16,15 +17,16 @@ lowering):
 
 | Code | Subject |
 | --- | --- |
-| W2001 `UnusedVariable` | a local or parameter that is never read |
-| W2002 `UnnecessaryMutability` | `mut` on a local that is never assigned |
-| W2004 `UnusedItem` | a function, constant, global, struct, enum, trait, alias, memory, `use` item |
-| W2006 `UnusedTypeParam` | a type parameter never used in its declaration |
-| W2007 `UnusedStructField` | a private field that is never read |
-| W2008 `UnusedLabel` | a loop or block label no `break`/`continue` names |
-| W2009 `UnusedEnumVariant` | a variant never named |
+| L3000 `UnusedVariable` | a local or parameter that is never read |
+| L3001 `UnnecessaryMutability` | `mut` on a local that is never assigned |
+| `UnusedItem` | a function, constant, global, struct, enum, trait, alias, memory, `use` item |
+| `UnusedTypeParam` | a type parameter never used in its declaration |
+| `UnusedStructField` | a private field that is never read |
+| L3002 `UnusedLabel` | a loop or block label no `break`/`continue` names |
+| `UnusedEnumVariant` | a variant never named |
 
-All seven codes already exist in `diagnostics.rs`.
+Lints take codes in the L3xxx range. The three implemented ones have codes;
+the others get the next free L3 code when they are implemented.
 
 The disconnected legacy TIR source and tests have been removed; recover them
 from commit `05e2978` when comparing behavior. In particular, the old field
@@ -45,16 +47,52 @@ than exact parity; settle these explicitly when implementing the pass.
   recorded as written (`check_assignable`), so a local's `Write` means
   assigning needed `mut`. A field through a pointer is a place and does not
   reach it.
-- a named argument's label is `Site::Label` with `ArgumentLabel` (a constructor
-  field label means initialization); a `break`'s label is `Site::Label` with
-  `Referent::Label`.
+- a named argument's label is `Site::Label` with `Reference::Parameter` or a
+  `Reference::Field` of `Initialize` (a constructor field label); a `break`'s
+  or `continue`'s label is `Site::Label` with `Reference::Label { owner,
+  target }`, and the jump keyword itself a `Reference::Break`/`Continue`.
 - declarations are not entries: they live in their owning tables
-  (`Body::locals`, `Body::labels`, the per-kind declaration arenas).
+  (`Body::locals`, `Body::targets` with their labels, the per-kind
+  declaration arenas).
 
 So "which `use` items are unused" and "which locals are never read" are
 inverses of this table, as its module doc says. The table is **not enough for
 reachability** (below): it has no owner for a reference, and it misses uses the
 checker does not write as names (an operator calls an impl's method).
+
+## Done
+
+`crates/wx-lint/src/unused.rs`, run by `wx_lint::lint` over a finished
+`Semantics`, with the package to report on as a parameter; the CLI (`build`,
+`check`) and the LSP pass the root package. It runs only when neither the
+compilation (parse, package loading) nor checking reported an error or bug
+(`CompilationUnit::has_errors`). The compiler does not know the lints: their
+codes and names (`unused_variable`, `unnecessary_mutability`, `unused_label`)
+belong to `wx_lint::Lint`, and each one's level (`off`, `warn` (default),
+`error`) is set in the `lint` section of `wx.json`:
+
+```json
+{ "entry": "main.wx", "lint": { "unused_variable": "error" } }
+```
+
+An unknown lint name or level makes the section invalid: `wx build`/`check`
+stop with an error, and the LSP runs no lints for that package.
+
+- **L3000:** a local or parameter with no `Read` reference. `Write` and
+  `ReadWrite` are not reads, as in rustc: a local only assigned is reported as
+  "assigned but never read", one only compound-assigned as unused. `_ = x;`
+  records a `Read` (tested). No `_`-prefix exemption. Exempt: the receiver
+  `self` (a keyword, so never an ordinary local), as rustc does and as the old
+  pass did. Trait impl and trait default-method parameters are reported.
+- **L3001:** `mut_span` set and no `Write`/`ReadWrite`. Assigning through a
+  field (`s.x = ..`) writes the root local, so it counts.
+- **L3002:** a labelled target with no `Reference::Label` for it. A jump
+  keyword without a label (`break;`) does not use the label; a label named
+  only by `continue :l` does.
+- Not done: type parameters, fields, items, `use`, variants, reachability.
+
+Over `examples/` and core, the only finding was a real unused local
+(`examples/wasi_file_io`); no false positives.
 
 ## Two policies
 
@@ -80,9 +118,8 @@ warning and reachability warn about working code. That decides the order below.
 
 ### Step 1: references-based pass
 
-A new module, `tir/unused.rs`, one phase after `check_bodies` and the export
-resolution in `SemanticsBuilder::build`. It reads `Semantics` and pushes
-warnings; it builds no bodies.
+A lint pass in `crates/wx-lint` over the finished `Semantics`. It reads
+`Semantics` and returns diagnostics; it builds no bodies.
 
 - **Gate:** run only when checking reported no error or bug. A failed path
   records only its resolved prefix, so an item used only through one would look
@@ -90,17 +127,18 @@ warnings; it builds no bodies.
   mid-edit). rustc's lints are gated the same way.
 - **Locals and parameters:** for each `Body::locals()` entry, collect its
   references from the table (`Reference::Local { owner, local, access }`).
-  W2001 when no reference is a `Read` (decide `ReadWrite`, below); W2002 when
+  L3000 when no reference is a `Read` (decide `ReadWrite`, below); L3001 when
   `mut_span` is set and no reference is `Write` or `ReadWrite`.
-- **Labels:** for each `Body::labels`, W2008 when no `Site::Label` entry holds
-  that `LabelIdx`.
-- **Type parameters:** W2006 when no `Referent::TypeParam { env, index }` names
-  it. A trait's own `Self` is exempt.
-- **Fields:** W2007 for a non-`pub` field with no `Reference::Field` of `Read`
+- **Labels:** for each `Body::targets` entry with a label, L3002 when no
+  `Reference::Label` holds that `TargetIdx`.
+- **Type parameters:** `UnusedTypeParam` when no `Reference::TypeParam { env, index }`
+  names it. A trait's own `Self` is exempt.
+- **Fields:** `UnusedStructField` for a non-`pub` field with no `Reference::Field` of `Read`
   or `ReadWrite` (see "Data gaps": positional patterns).
-- **Items:** W2004/W2009 when nothing references the declaration (a variant is a
-  `Const`). `use` items: unused when no `Referent::Import { import }` names it;
-  a glob is used if any import referent points at it.
+- **Items:** `UnusedItem`/`UnusedEnumVariant` when nothing references the declaration (a variant is a
+  `Const`). `use` items: unused when no `Reference::Item` with
+  `Route::Import(item)` names it; a glob is used if any such route points at
+  it.
 - **Exemptions:** the std package, items of dependency packages (report the
   user's packages only), wasm `import` declarations, anything named by the
   export block, `pub` items of a `lib` package, trait declarations' members,
@@ -205,18 +243,21 @@ local to one body, so a graph adds nothing).
 
 ## Decisions to settle
 
-- Does `ReadWrite` count as a read for W2001? rustc flags a variable that is only
-  ever compound-assigned. Leaning: no, `Read` only.
+- ~~Does `ReadWrite` count as a read for L3000?~~ Decided 2026-11-20: no,
+  `Read` only, as in rustc.
 - ~~`_`-prefixed names exempt, or only the bare `_`?~~ Decided 2026-11-16
   (`notes/binders.md`): no exemption. `_` is no longer a binder, and a
   parameter's name is part of its function's interface (calls by name, trait
-  conformance), so renaming it to silence W2001 would break callers. A local
+  conformance), so renaming it to silence L3000 would break callers. A local
   or parameter that is never read is warned; the fix is to read it or drop it,
   `_ = x;`, which counts as a read of `x` (`ExprKind::Drop`'s operand is an
   ordinary value read).
 - Open enums name only some values; unused-variant warnings are probably wrong
   there.
-- Report only the root package, or every package the user owns?
+- ~~Report only the root package, or every package the user owns?~~ Decided
+  2026-11-20: the pass takes the one package to report on as a parameter;
+  the CLI and LSP pass the root. Reporting on several would take a set
+  indexed by `PackageId`, once that is decided.
 - Whether a trait's default method body keeps edges when no impl inherits it.
 
 ## Tests

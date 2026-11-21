@@ -57,7 +57,7 @@ ensure_signature(type Mem)              // Allocator's first member
       ├─ ensure_signature(Mem)          → InProgress → Cycle → SKIPPED
       │                                   ↑ never registers its entry
       ├─ ensure_signature(allocate)
-      │  └─ `Self::Mem` → Allocator.entries["Mem"] → MISSING → E1021 ✗
+      │  └─ `Self::Mem` → Allocator.entries["Mem"] → MISSING → E1015 ✗
       └─ ...
 ```
 
@@ -77,7 +77,7 @@ supertrait work):
 ```wx
 trait Tr { type X; }
 struct S { a: i32 }
-fn f(v: S::X) -> i32 { v }        // impl AFTER  → error[E1021]
+fn f(v: S::X) -> i32 { v }        // impl AFTER  → error[E1015]
 impl Tr for S { type X = i32; }   // move it above `f` and it compiles
 ```
 
@@ -241,7 +241,7 @@ known at prescan anyway (`push_struct`, `prescan.rs:117`).
 
 **That forcing is load-bearing, though.** `check_struct_fields_for_direct_recursion`
 (`types.rs:1507`) walks `structs[i].fields` of *other* structs to find `struct A { b: B }` /
-`struct B { a: A }` (E1032), and those fields are only populated because naming `B` forced its
+`struct B { a: A }` (E1021), and those fields are only populated because naming `B` forced its
 signature. Removing the forcing without an explicit "ensure fields" demand at that point makes
 the check silently incomplete and pushes an infinite layout into MIR. So the order is: split
 "name → index" from "fields/layout" into separate demands *first*, then prescan-resolved
@@ -312,7 +312,7 @@ Two findings worth keeping:
   impl members from the block header too"). `inherent_impl_dispatch` is keyed by
   `(ImplTarget, name)` and was filled at *member* signature time, so a block was invisible
   until the sweep reached its members — `const A: u32 = S::N;` above `impl S { const N ... }`
-  failed with E1007. It is now filled by `register_inherent_impl_decls` from the header.
+  failed with E1006. It is now filled by `register_inherent_impl_decls` from the header.
 
   That forced the decision the entry above flagged. Duplicate detection used to read the
   same bucket and the `members` behind it, which is no longer populated when it runs, so it

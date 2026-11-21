@@ -641,7 +641,7 @@ impl<'a> Lowerer<'a> {
 	/// expansion over its own parameters. Only something that needs the
 	/// function itself reaches here (an export); a call expands the
 	/// intrinsic in place (`lower_intrinsic`) and names no function. The
-	/// checker exports no generic function (E2019), so every intrinsic here
+	/// checker exports no generic function (E2018), so every intrinsic here
 	/// takes one scalar per parameter and no type argument.
 	fn lower_intrinsic_function(
 		&mut self,
@@ -925,7 +925,7 @@ impl<'a> Lowerer<'a> {
 		// The flat arguments cover the whole parameter chain: an enclosing
 		// impl's, then the function's own. Every instance comes from a
 		// checked call, and the checker refuses to export a generic function
-		// (E2019), so a missing argument is a broken invariant.
+		// (E2018), so a missing argument is a broken invariant.
 		assert_eq!(
 			self.sema.generic_envs.identity_args(type_params).len(),
 			instance.args.len(),
@@ -3140,15 +3140,15 @@ mod tests {
 		let source = r#"
 			func subtract(a: i32, b: i32) -> i32 { a - b }
 			func run() -> i32 {
-				local mut x: i32 = 0
+				local mut x: i32 = 0;
 				local a: i32 = core::i32_sub{
 					b: block { x = x + 1; x },
 					a: block { x = x + 1; x },
-				}
+				};
 				local b: i32 = subtract{
 					b: block { x = x + 1; x },
 					a: block { x = x + 1; x },
-				}
+				};
 				a * 100 + b * 10 + x
 			}
 			export { run as "run" }
@@ -3213,12 +3213,12 @@ mod tests {
 		let source = r#"
 			struct Value(a: i32, marker: (), b: i32);
 			func run() -> i32 {
-				local mut x: i32 = 0
+				local mut x: i32 = 0;
 				local p: Value = Value{
 					b: block { x = x + 1; x },
 					marker: block { x = x + 1; () },
 					a: block { x = x + 1; x },
-				}
+				};
 				p.a * 100 + p.b * 10 + x
 			}
 			export { run as "run" }
@@ -4310,7 +4310,7 @@ mod tests {
 		let source = r#"
             func double(x: i32) -> i32 { x * 2 }
             func plus_one(x: i32) -> i32 {
-                local y: i32 = x + 1
+                local y: i32 = x + 1;
                 y
             }
             func main() -> i32 { plus_one(double(4)) }
@@ -4399,8 +4399,8 @@ mod tests {
             struct Point(x: i32, y: i32);
             func first(p: Point) -> i32 { p.x }
             func local_field() -> i32 {
-                local mut p: Point = Point(10, 20)
-                p.y = 5
+                local mut p: Point = Point(10, 20);
+                p.y = 5;
                 p.x + p.y
             }
             func call_field() -> i32 { Point(7, 9).x }
@@ -4422,11 +4422,11 @@ mod tests {
 			struct Inner(a: i32, marker: (), b: i64);
 			struct Outer(marker: (), inner: Inner, c: i32);
 			func run() -> (i32, i64, i32) {
-				local mut x: i32 = 0
-				local mut o: Outer = Outer((), Inner(1, (), 2), 3)
-				o.inner = Inner(4, (), 5)
-				o.inner.b = 99
-				o.inner.marker = block { x = x + 1; () }
+				local mut x: i32 = 0;
+				local mut o: Outer = Outer((), Inner(1, (), 2), 3);
+				o.inner = Inner(4, (), 5);
+				o.inner.b = 99;
+				o.inner.marker = block { x = x + 1; () };
 				_ = o.inner.marker;
 				(o.inner.a + x, o.inner.b, o.c)
 			}
@@ -5157,8 +5157,8 @@ mod tests {
 		let source = r#"
             struct Point(x: i32, y: i32);
             func run() -> i32 {
-                local mut p: Point = Point(1, 2)
-                p = Point(3, 4)
+                local mut p: Point = Point(1, 2);
+                p = Point(3, 4);
                 p.x * 10 + p.y
             }
             export { run as "run" }
@@ -5176,7 +5176,7 @@ mod tests {
 	fn destructures_a_tuple_local_from_a_parameter() {
 		let source = r#"
             func run(pair: (i32, i32)) -> i32 {
-                local (a, b) = pair
+                local (a, b) = pair;
                 a * 10 + b
             }
             export { run as "run" }
@@ -5197,7 +5197,7 @@ mod tests {
             struct Outer(pair: Pair, c: i32);
             func make() -> Outer { Outer(Pair(1, 2), 3) }
             func run() -> i32 {
-                local Outer(Pair(a, _), c) = make()
+                local Outer(Pair(a, _), c) = make();
                 a * 10 + c
             }
             export { run as "run" }
@@ -5216,7 +5216,7 @@ mod tests {
 		let source = r#"
             struct Point(x: i32, y: i32);
             func run() -> i32 {
-                local Point{ x: a, y: b } = Point{ x: 1, y: 2 }
+                local Point{ x: a, y: b } = Point{ x: 1, y: 2 };
                 a * 10 + b
             }
             export { run as "run" }
@@ -5236,7 +5236,7 @@ mod tests {
             struct Pair(a: i32, b: i32);
             struct Outer(pair: Pair, marker: Marker, c: i32);
             func run() -> i32 {
-                local Outer(Pair(a, ..), .., c) = Outer(Pair(3, 2), Marker(), 4)
+                local Outer(Pair(a, ..), .., c) = Outer(Pair(3, 2), Marker(), 4);
                 a * 10 + c
             }
             export { run as "run" }
@@ -5253,7 +5253,7 @@ mod tests {
 	fn an_irrefutable_or_local_pattern_binds_its_first_alternative() {
 		let source = r#"
             func run(pair: (i32, i32)) -> i32 {
-                local (a, b) | (a, b) = pair
+                local (a, b) | (a, b) = pair;
                 a * 10 + b
             }
             export { run as "run" }
@@ -5271,7 +5271,7 @@ mod tests {
 		let source = r#"
             use core::trap as stop;
             func run() -> i32 {
-                local (a, b): (i32, i32) = stop()
+                local (a, b): (i32, i32) = stop();
                 a + b
             }
             export { run as "run" }
@@ -5289,11 +5289,11 @@ mod tests {
 	fn lowers_primitive_compound_assignment() {
 		let source = r#"
             func run() -> i32 {
-                local mut x: i32 = 1
-                x += 2
-                x *= 3
-                x <<= 1
-                x -= 4
+                local mut x: i32 = 1;
+                x += 2;
+                x *= 3;
+                x <<= 1;
+                x -= 4;
                 x
             }
             export { run as "run" }
@@ -5313,7 +5313,7 @@ mod tests {
             struct Inner(a: i32, marker: (), b: i64);
             struct Outer(marker: (), inner: Inner, c: i32);
             func run() -> (i32, i64, i32) {
-                local mut o: Outer = Outer((), Inner(1, (), 2), 3)
+                local mut o: Outer = Outer((), Inner(1, (), 2), 3);
                 o.inner.a += 4;
                 o.inner.b *= 7;
                 o.c += 2;
@@ -5340,8 +5340,8 @@ mod tests {
                 }
             }
             func run() -> i32 {
-                local mut total = Total(1)
-                total += Total(2)
+                local mut total = Total(1);
+                total += Total(2);
                 total.value
             }
             export { run as "run" }
@@ -5365,8 +5365,8 @@ mod tests {
                 }
             }
             func run() -> i32 {
-                local mut total = Total(1)
-                total += block { total = Total(10); Total(2) }
+                local mut total = Total(1);
+                total += block { total = Total(10); Total(2) };
                 total.value
             }
             export { run as "run" }
@@ -5385,8 +5385,8 @@ mod tests {
 	fn a_compound_operand_runs_before_the_target_read() {
 		let source = r#"
             func run() -> i32 {
-                local mut x: i32 = 1
-                x += block { x = 10; 2 }
+                local mut x: i32 = 1;
+                x += block { x = 10; 2 };
                 x
             }
             export { run as "run" }
@@ -5404,8 +5404,8 @@ mod tests {
 	fn a_compound_operand_keeps_the_operator_order() {
 		let source = r#"
             func run() -> i32 {
-                local mut x: i32 = 1
-                x -= block { x = 10; 2 }
+                local mut x: i32 = 1;
+                x -= block { x = 10; 2 };
                 x
             }
             export { run as "run" }
@@ -5424,8 +5424,8 @@ mod tests {
 		let source = r#"
             use core::trap as stop;
             func run() -> i32 {
-                local mut x: i32 = 1
-                x += stop()
+                local mut x: i32 = 1;
+                x += stop();
                 x
             }
             export { run as "run" }
@@ -5443,8 +5443,8 @@ mod tests {
             struct Marker();
             func make() -> Marker { Marker() }
             func run() -> i32 {
-                local m: Marker = make()
-                _ = m
+                local m: Marker = make();
+                _ = m;
                 5
             }
             export { run as "run" }
@@ -5461,7 +5461,7 @@ mod tests {
 		let source = r#"
             struct Point(x: i32, y: i32);
             func run() -> i32 {
-                _ = Point(1, 2)
+                _ = Point(1, 2);
                 5
             }
             export { run as "run" }
@@ -5570,7 +5570,7 @@ mod tests {
 		let source = r#"
             use core::trap as stop;
             func run() -> i32 {
-                local x = stop()
+                local x = stop();
                 x
             }
             export { run as "run" }
@@ -5589,7 +5589,7 @@ mod tests {
 		let source = r#"
             use core::trap as stop;
             func run() -> i32 {
-                _ = stop()
+                _ = stop();
                 7
             }
             export { run as "run" }
@@ -6633,7 +6633,7 @@ mod tests {
 	fn a_tuple_match_projects_and_binds() {
 		let source = r#"
             func run(a: i32, b: i32) -> i32 {
-                local pair = (a, b)
+                local pair = (a, b);
                 match (pair) {
                     (0, y) => { y },
                     (x, _) => { x },
@@ -6656,7 +6656,7 @@ mod tests {
 		let source = r#"
             struct Point(x: i32, y: i32);
             func run(a: i32, b: i32) -> i32 {
-                local p = Point(a, b)
+                local p = Point(a, b);
                 match (p) {
                     Point(0, y) => { y },
                     Point(x, _) => { x },
@@ -6679,7 +6679,7 @@ mod tests {
 		let source = r#"
             struct Point(x: i32, y: i32);
             func run(a: i32, b: i32) -> i32 {
-                local p = Point{ x: a, y: b }
+                local p = Point{ x: a, y: b };
                 match (p) {
                     Point{ x: 0, y } => { y },
                     Point{ x, .. } => { x },
@@ -6701,7 +6701,7 @@ mod tests {
 	fn an_or_pattern_selects_the_matching_alternative_binding() {
 		let source = r#"
             func run(a: i32, b: i32) -> i32 {
-                local pair = (a, b)
+                local pair = (a, b);
                 match (pair) {
                     (0, x) | (x, 1) => { x },
                     _ => { 99 },
@@ -6724,7 +6724,7 @@ mod tests {
 	fn a_nested_or_pattern_is_a_condition() {
 		let source = r#"
             func run(a: i32, b: i32) -> i32 {
-                local pair = (a, b)
+                local pair = (a, b);
                 match (pair) {
                     ((0 | 1), y) => { y },
                     _ => { 9 },
@@ -7011,7 +7011,7 @@ mod tests {
             struct Wrapper(value: Char);
             const A: Char = 'a';
             func run(c: Char) -> i32 {
-                local w = Wrapper(c)
+                local w = Wrapper(c);
                 match (w) {
                     Wrapper(const A) => 1,
                     Wrapper(_) => 2,
@@ -7034,7 +7034,7 @@ mod tests {
 		let source = r#"
             struct Wrapper(value: Char);
             func run(c: Char) -> i32 {
-                local w = Wrapper(c)
+                local w = Wrapper(c);
                 match (w) {
                     Wrapper('a') => { 1 },
                     Wrapper(_) => { 2 },
@@ -7108,7 +7108,7 @@ mod tests {
 		let source = r#"
             struct Marker();
             func run() -> i32 {
-                local m = Marker()
+                local m = Marker();
                 match (m) {
                     Marker() => { 7 },
                 }
@@ -7152,7 +7152,7 @@ mod tests {
 		let source = r#"
             struct Wrapper(value: i32);
             func run(a: i32) -> i32 {
-                local w = Wrapper{ value: a }
+                local w = Wrapper{ value: a };
                 match (w) {
                     Wrapper{ value: 0 } => { 1 },
                     Wrapper{ value } => { value },
@@ -7176,7 +7176,7 @@ mod tests {
             struct Pair(a: i32, b: i32);
             struct Holder(pair: Pair);
             func run(a: i32, b: i32) -> i32 {
-                local h = Holder{ pair: Pair(a, b) }
+                local h = Holder{ pair: Pair(a, b) };
                 match (h) {
                     Holder{ pair: Pair(0, y) } => { y },
                     Holder{ pair } => { pair.a },
@@ -7200,7 +7200,7 @@ mod tests {
             struct Point(x: i32, y: i32);
             struct Segment(a: Point, b: Point);
             func run(a: i32, b: i32, c: i32, d: i32) -> i32 {
-                local s = Segment(Point(a, b), Point(c, d))
+                local s = Segment(Point(a, b), Point(c, d));
                 match (s) {
                     Segment(Point(0, y), Point(_, z)) => { y + z },
                     Segment(Point(x, _), _) => { x },
@@ -7223,7 +7223,7 @@ mod tests {
 		let source = r#"
             struct Pair(a: i32, b: i32);
             func run(a: i32, b: i32) -> i32 {
-                local pair = Pair(a, b)
+                local pair = Pair(a, b);
                 match (pair) {
                     whole => { whole.a + whole.b },
                 }
@@ -7363,7 +7363,7 @@ mod tests {
 		let source = r#"
             struct Wrapper(value: Bool);
             func run(value: Bool) -> i32 {
-                local w = Wrapper(value)
+                local w = Wrapper(value);
                 match (w) {
                     Wrapper(const True) => { 1 },
                     Wrapper(const False) => { 2 },
@@ -7384,7 +7384,7 @@ mod tests {
 	fn a_break_in_a_match_arm_leaves_the_loop() {
 		let source = r#"
             func run(n: i32) -> i32 {
-                local mut i: i32 = 0
+                local mut i: i32 = 0;
                 loop {
                     match (i) {
                         3 => { break 7 },

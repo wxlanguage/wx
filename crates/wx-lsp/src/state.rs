@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use wx_compiler::vfs::{self, AbsolutePath, FileSource as _};
+use wx_compiler::vfs::{AbsolutePath, FileSource as _};
 
 use tower_lsp_server::ls_types::{Diagnostic, Uri};
 use wx_compiler::vfs::FileId;
@@ -15,7 +15,7 @@ use crate::diagnostics::{
 };
 use crate::documents::OpenDocument;
 use crate::documents::OverlayFileSource;
-use crate::projects::{ManifestState, ProjectState, discover_package_root};
+use crate::projects::{Manifest, ProjectState, discover_package_root};
 use crate::snapshot::Snapshot;
 use crate::trace::Trace;
 
@@ -114,12 +114,9 @@ pub(crate) fn refresh_project_manifest(
 		state.projects.remove(root);
 		return publications;
 	}
-	let parsed = overlay
-		.read_to_string(&manifest_path)
-		.and_then(|text| vfs::PackageManifest::parse(&text).map_err(|_| ()));
-	let manifest = match parsed {
-		Ok(manifest) => ManifestState::Parsed(manifest),
-		Err(()) => ManifestState::Invalid,
+	let manifest = match overlay.read_to_string(&manifest_path) {
+		Ok(text) => Manifest::parse(&text),
+		Err(()) => Manifest::default(),
 	};
 	if let Some(project) = state.projects.get_mut(root) {
 		project.manifest = manifest;

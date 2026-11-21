@@ -228,12 +228,12 @@ pub trait Array: Slice {
   the parser tells it from a type's entry by the keyword alone:
   `const N: u32` is a representability clause (step 8), `const N = 10` a constant
   equality (rustc's `ConstEquate`), parsed and formatted but reported
-  unsupported (E2114) until something needs it. `Size: Sub` and
+  unsupported (E2085) until something needs it. `Size: Sub` and
   `Size = u32` stay a type's.
 - Why nothing more general: per-method clauses are needed only where a
   method cannot move. An inherent impl's method that needs more of `T` goes
   in another block bounded so (std's `RawPtr` blocks); a trait impl's may
-  require no more than its declaration (E2124); a method's own parameters
+  require no more than its declaration (E2095); a method's own parameters
   take bounds where they are declared. What is left is a trait's function
   about `Self`.
 - A `where` list on a trait or impl header would collide with the bound's
@@ -245,7 +245,7 @@ An impl function's clauses are exactly the ones it writes, `Self` included,
 as for its own parameters today (rustc's `#[refine]`, RFC 3245): a call
 through the trait proves the declaration's clauses, a direct call proves
 the impl's, and conformance proves the impl's follow from the
-declaration's (E2124). Nothing is inherited from the declaration.
+declaration's (E2095). Nothing is inherited from the declaration.
 
 ```wx
 trait Container {
@@ -333,7 +333,7 @@ Each leaves the suite green.
    `Self` in a trait's function lowers as clauses about the trait's
    `Self` into the function's env (`self_entry`; such a function
    gets a frame even with no parameter of its own, so it has an env); a
-   `Self` anywhere else is E2131 (`MisplacedSelfBound`), in a trait impl's
+   `Self` anywhere else is E2099 (`MisplacedSelfBound`), in a trait impl's
    function still unsupported (6d). A use proves its item's own env whole,
    one `BoundRequirements::Frame { env, args }` per frame on the chain
    (`Subjects::All`), so clauses about an enclosing frame's parameter (the
@@ -393,7 +393,7 @@ Each leaves the suite green.
    the rename): a `Clause::Representable` variant, published in the final
    stage (its type names siblings, `const LEN: Mem::Size`), the `const N: Ty`
    entry in a binding block, `satisfies_clauses`' arm, the body's lookup
-   (`assumed_representable`, `tir/representable.rs`); E2133 when unmet.
+   (`assumed_representable`, `tir/representable.rs`); E2101 when unmet.
    `Array::as_slice`/`as_slice_mut` have bodies in std.
 
 ## To audit
@@ -417,7 +417,7 @@ Each leaves the suite green.
   function's own parameters, whose frame is on no chain the env knows
   about. Nothing reads a subject's frame from the context: assumptions are
   matched by subject, substitution and `is_abstract` read identity from
-  the types. The E2124 suite passes unchanged.
+  the types. The E2095 suite passes unchanged.
 - **Lookup cost.** Lookup by subject scans an env's clauses instead of
   indexing a parameter's run. The lists are small; measure on the std
   sweep before adding an index.
@@ -437,7 +437,7 @@ Each leaves the suite green.
   type would mean something only relative to an item: `T` from two
   unrelated functions would be one `TypeIndex`, display would need the item,
   and substitution would change shape. Independent of this plan.
-- **A syntactic subset check for E2124** (E0276). Comparing clause lists
+- **A syntactic subset check for E2095** (E0276). Comparing clause lists
   rejects impls Rust accepts (a bound that follows from an equality, from
   the impl block's own assumptions, or after normalization). Conformance
   proves clauses, and keeps doing so.

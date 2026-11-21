@@ -715,7 +715,7 @@ Where each is checked: 1, 4 and a non-generic 2 by the type checker, from
 the signature; a generic 2 per instance by lowering, since `func id<T:
 StackValue>(x: T) -> T` returns one value for `u32` and two for
 `heap::&[u8]`; 3 by lowering, on the instances. Lowering already reports
-diagnostics (E2114). The stricter alternative for generics, a bound
+diagnostics (E2085). The stricter alternative for generics, a bound
 requiring one value, is too restrictive.
 
 A large function returning a struct then has two explicit choices: enable

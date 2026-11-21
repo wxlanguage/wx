@@ -43,7 +43,7 @@ promises that equal values are indistinguishable. A hand-written `eq` that
 compares every field would not give the checker that, so the declaration is
 "this type has structural equality", not "generate this code".
 `impl Eq for T {}` stays as `notes/structural-eq.md` describes it. `Eq`
-declares no members, so the empty body is just ordinary conformance (E2078
+declares no members, so the empty body is just ordinary conformance (E2056
 for anything written in it).
 
 Rust found the same split the hard way: `#[derive(PartialEq)]` expands to an
@@ -72,7 +72,7 @@ const FIELDS = info::<Point>().fields;   // an array of FieldInfo
   hidden associated constant (`const LEN: const_int; const NAME: [u8;
   Self::LEN];`), which today's `Type::Const` already handles, rigid over an
   abstract `Self`. Placing it in an abstract memory as a slice still needs a
-  representability fact (the E2133 case): someone has to state that the
+  representability fact (the E2101 case): someone has to state that the
   length fits every `PointerSize`.
 - **Enums are the easy case**: no payloads, so an enum's structure is its repr
   and a table of variant names, an ordinary constant array of `Self`.

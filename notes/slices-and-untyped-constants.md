@@ -62,7 +62,7 @@ After it:
   `M::*[T; N]` from an allocator.
 - A type held by value (a parameter, a result, a function type's parameter
   or result, a local, an ascription) is a `StackValue`, which no slice or
-  array is, nor anything holding one: E2129 (`NotStackValue`), recorded as
+  array is, nor anything holding one: E2098 (`NotStackValue`), recorded as
   `TypeObligation::CheckValueType` where the type is lowered. A field, a
   tuple's element, a type argument, a constant's declared type, a type alias
   and a qualified path's root (`<[u8; 4] as Array>::LEN`) need nothing. See
@@ -91,7 +91,7 @@ type, and the literal pseudo-types `{array}` and `{string}` are gone:
   (`TypeInterner::needs_context`, from the `HAS_UNPLACED` flag, which only a
   tuple passes on): with an expected type it is coerced, and
   without one (`local x = "hi";`, a statement, a method's receiver) it is
-  E2002, at the point an untyped literal is. Such data has no operators of its
+  E2003, at the point an untyped literal is. Such data has no operators of its
   own (`"a" + "b"`).
 - Coercing it to a pointer places it (`coerce_static`): it becomes static
   data in the pointer's memory, its elements take their type, and the pointer
@@ -120,7 +120,7 @@ type, and the literal pseudo-types `{array}` and `{string}` are gone:
 - Not done: an array of arrays placed in memory (`heap::&[[u8; 2]; 2]`)
   checks but does not evaluate, since `layout` gives an array no layout until
   `Sized`; and a literal kind inside a constant's array type
-  (`const C: [const_int; 3]`) is still E2128.
+  (`const C: [const_int; 3]`) is still E2097.
 
 ## Runtime positions
 
@@ -140,13 +140,13 @@ Inside a constant's declared type neither half applies: a constant may be
 
 ## Values are `StackValue`s (implemented)
 
-Decided on 2026-10-30, implemented on 2026-11-01. It replaced E2129's slice
+Decided on 2026-10-30, implemented on 2026-11-01. It replaced E2098's slice
 check and E2130 (`SliceArgument`, removed), the `Slice`-bound rule below.
 
 ### What was weak in the `Slice`-bound rule
 
 Only a parameter bounded by `Slice` stood for a slice or an array (E2130),
-and a slice or an array held by value was E2129.
+and a slice or an array held by value was E2098.
 
 The `Slice` bound does two jobs: it says a type has elements, and it is the
 only way a parameter may stand for something not held by value.
@@ -157,7 +157,7 @@ only way a parameter may stand for something not held by value.
 - `T: Slice` does not mean unsized: arrays are `Slice` and sized. It means
   "not held by value" only because everything that implements `Slice` happens
   to be held only by a pointer.
-- A field may not hold an array (E2129), so a record laid out in memory with
+- A field may not hold an array (E2098), so a record laid out in memory with
   an inline buffer, `Header(len: u32, data: [u8; 16])`, cannot be written.
 - (Fixed 2026-10-31 by the `Pointer` trait.) A pointer to an abstract
   pointee bounded by `Slice` was no `StackValue`; its metadata is now the
@@ -225,7 +225,7 @@ struct Box<M: Memory, T>(p: M::*T);       // holds u32, [u8], later dyn alike
   and left out: for `x: Wrap<T>` they need `T: StackValue` derived backwards
   from `Wrap<T>: StackValue`, which the solver does not do. Adding them later
   only relaxes the rule.
-- E2129 is "this position needs a `StackValue`", answered by the solver;
+- E2098 is "this position needs a `StackValue`", answered by the solver;
   E2130 and `may_be_slice` are gone, `id::<[u8]>` being an unmet bound of
   `id`'s own. `Slice` means only "has elements".
 - `dyn Tr` would be one more type that is neither, plus its pointer's shape.
@@ -244,13 +244,13 @@ struct Box<M: Memory, T>(p: M::*T);       // holds u32, [u8], later dyn alike
   even when an equality makes its output concrete. A cold reduction collects
   the representation once, rather than first collecting it for membership.
   After a failed query, `explain_non_stack_value` locates an offending part
-  separately from representation collection. E2129 names it: "`Header` cannot
+  separately from representation collection. E2098 names it: "`Header` cannot
   be held by value, since it holds `[u8; 16]`", with the suggestion
   `require T: StackValue` for an abstract part. The walk normalizes `Deep`, as
   a declaration's other checks do, so a
   loop through an equality (`First = (T::First, T::First)`) stays the rigid
   projection instead of unfolding a step at a time, and keeps the structs on
-  its path, so a struct containing itself is poisoned (E2032 reports it)
+  its path, so a struct containing itself is poisoned (E2025 reports it)
   rather than overflowing.
 - Signatures record `CheckValueType` for parameters, results, a function
   type's parts, and a local's or an ascription's written type. Two values
@@ -488,8 +488,8 @@ own:
 - `[T; N]` is well-formed for any `N`.
 - `M::&[T; N]` is well-formed only when `N` fits `M::Size`: `CheckConstantRepresentable`
   is recorded by the pointer, not the array (`length_representable`), a concrete
-  `Size`'s range (E2004), or every member of the typesets an abstract `Size`
-  is bounded by (`PointerSize`, so `u32`; E2047). It may later tighten to
+  `Size`'s range (E2005), or every member of the typesets an abstract `Size`
+  is bounded by (`PointerSize`, so `u32`; E2033). It may later tighten to
   `<[T; N] as Sized>::SIZE`, the real addressing limit. A pointer type made by
   substitution (`M::&S` with `S = [u8; N]`) is not checked again: see the
   open point under "Representability clauses".
@@ -551,14 +551,14 @@ pub trait Array: Slice {
   cannot be inferred (`Size` does not determine its memory).
 - It was `SIZE`; renamed because `Sized::SIZE` is the size in bytes, and on
   `[u32; 4]` the two are 4 and 16. With `T: Array + Sized` one name would make
-  `T::SIZE` ambiguous (E2059). `LEN` matches `len()`, and `SIZE` means bytes
+  `T::SIZE` ambiguous (E2043). `LEN` matches `len()`, and `SIZE` means bytes
   everywhere.
 - `Value: Sized` (with `Sized`) because a slice is well-formed only over sized
   elements, so code bounded by `Slice` may index without a bound of its own.
 - The receiver conversion: a method that takes `self: M::&Self` called on an
   exclusive `M::*[T]` takes `receiver.*.&` (only the receiver, only that
   direction). A shared receiver for a `self: M::*Self` method is a mismatch
-  (E2001).
+  (E2002).
 
 ## Indexing is a place
 
@@ -571,7 +571,7 @@ the slice's or array's element type, or `<S as Slice>::Value` for an abstract
 against the length and an offset from the data pointer. `index`, `index_mut`,
 `first_mut` and `last_mut` are removed from std: `.&` is shared only, so
 there is no exclusive pointer to an element until `.&mut` exists, and then
-`first_mut` is `self[0].&mut`. Indexing anything else is E2125; a pointer to
+`first_mut` is `self[0].&mut`. Indexing anything else is E2096; a pointer to
 a pointer to a slice is one step too far (`x.*[i]`).
 
 ## Untyped constants
@@ -597,11 +597,11 @@ const U: const_char = 'u';
 - A literal kind is currently allowed only as the whole annotation of a free
   or trait constant. Runtime annotations (`func f(x: const_int)`, `local x:
   const_int`), type aliases and kinds nested in compound annotations remain
-  E2128. Untyped impl constants and tuple/array annotations containing kinds
+  E2097. Untyped impl constants and tuple/array annotations containing kinds
   remain unimplemented.
 - The kind is written, never inferred from the initializer: inferring it
   would read another constant's body while building signatures
-  (`const Y = X + 1`). `const X = 4;` stays E2002, suggesting `: const_int`.
+  (`const Y = X + 1`). `const X = 4;` stays E2003, suggesting `: const_int`.
 - `const_int` checks nothing at the definition but the kind: the initializer
   is an integer literal, another `const_int` constant, or an operator over
   them (`const_char` is a char literal; `'a' + 1` is one too, so it is not an
@@ -628,14 +628,14 @@ const U: const_char = 'u';
   `Const` of literal type that reads its value and runs `coerce_int`'s check.
   In a function body the value is known; in a constant body (checked
   value-free) it is a `DeferredCheck`, as a literal's length already is. No
-  defaulting: `local x = X;` is E2002, as `local x = 4;` is.
+  defaulting: `local x = X;` is E2003, as `local x = 4;` is.
 - A typed constant (`const X: u32 = 4`) keeps the exact-type rule; only an
   untyped one coerces. This is not the "any integer constant whose value
   fits" relaxation declined on 2026-10-25.
 - A trait constant may be untyped. Done for the compiler's `Array::LEN`: over
   a concrete array its use reads the length (`untyped_value`, through
   `resolve_constant`); over an abstract one it needs a representability clause
-  (E2133 without one). Not done: an impl's member of an
+  (E2101 without one). Not done: an impl's member of an
   untyped trait constant (conformance: it has the declaration's kind).
 
 ## Representability clauses (done)
@@ -658,12 +658,12 @@ func f<T: Array where { const LEN: u8 }>() -> u8 { T::LEN }  // fine
 
 - It is a bound, not a type: the clause states a fact about the value (its
   range), and each use still gives the constant its type, as a literal's
-  context does. A failure is an unmet bound, not a type mismatch: E2133,
+  context does. A failure is an unmet bound, not a type mismatch: E2101,
   "constant `<T as Array>::LEN` cannot be represented as `u8`", at the use in
   a body or at the argument of a call, with the clause to write as a note. A
   known value says it in the label ("its value `256` is out of range").
   Literals say the same ("literal `300` cannot be represented as `u8`",
-  E2004).
+  E2005).
 - `Clause::Representable(RepresentableClause)`, beside `Trait` and
   `Equality`, published in the final stage (its type may name siblings,
   `const LEN: Mem::Size`), inherited from a supertrait's bound. A clause about
@@ -686,11 +686,11 @@ func f<T: Array where { const LEN: u8 }>() -> u8 { T::LEN }  // fine
   Self::F;` with `where { F = func() -> i32 }`). A generic constant (`const
   N<S: PointerSize>: S`) is typed per instance, and its value is checked
   against every member once, at the definition.
-- A representability clause on a *typed* constant is E2134
+- A representability clause on a *typed* constant is E2102
   (`TypedConstantBound`), reported where the entry is lowered, pointing at
   the declared type; no clause is built.
 - `const LEN = 4` (a value, rustc's `ConstEquate`) is parsed and reported
-  unsupported (E2114).
+  unsupported (E2085).
 - Open: a pointer to an abstract count, `M::&[u8; T::LEN]`, needs `T::LEN`
   representable as `M::Size` for well-formedness. Either the signature writes
   the clause, or the obligation is proved where the signature is
@@ -816,7 +816,7 @@ Mem::Size }`. At a call:
 
 - `Layout::<heap>::of::<[u8; 16]>()` is fine: `SIZE` is 16, which fits `u32`.
 - `Layout::<heap>::of::<[u8]>()` and `Layout::<heap>::of::<func(u32) ->
-  u32>()` are an unmet bound (E2063).
+  u32>()` are an unmet bound (E2046).
 - `Layout::<heap32>::of::<[u8; 1 << 33]>()` names a well-formed, `Sized` type
   whose `SIZE` does not fit `u32`: the representability clause fails at the call, where
   allocating it in a 32-bit memory is what is wrong.
@@ -846,7 +846,7 @@ Each step ends with tests green.
 3. Done (2026-10-30). The split: `Pointer { to: Slice | Array }` across
    `tir/` and the AST, the fit check on the pointer, `layout`/
    `stack_elements`/evaluation reading the pointee, `implements_structurally`
-   on the pointee, `SliceByValue` (E2129) and `SliceArgument` (E2130), the
+   on the pointee, `SliceByValue` (E2098) and `SliceArgument` (E2130), the
    receiver conversion, std's traits as above (`Array::LEN`), literals as
    arrays, placement through `coerce_static`, constants holding arrays placed
    at each use, `M::&[u8; _]` learned from the literal, the literal
@@ -862,7 +862,7 @@ Each step ends with tests green.
    `is_fat_pointee`, std's `Pointer` trait answered structurally, its rigid
    `Metadata` making a pointer to an unknown shape a `StackValue`,
    `from_raw_parts`/`metadata`/`address` in std); E2130 and `may_be_slice`
-   removed, E2129 reworded; an abstract pointee thin only when assumed a
+   removed, E2098 reworded; an abstract pointee thin only when assumed a
    `StackValue` or an `Array`; std's traits and generic functions given
    `StackValue` bounds. Done ahead of it: `!` held as `!`.
 6. Representability clauses (done): the `where { const NAME: ty }` syntax, `RepresentableClause`, the

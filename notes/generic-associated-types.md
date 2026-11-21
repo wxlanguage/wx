@@ -41,7 +41,7 @@ What carries over from rustc:
   is replaced by the impl's (`GenericArgs::rebase_onto`), so the value is
   read with `impl_args ++ own_args`.
 - Conformance (`compare_impl_ty`): parameter count and kinds; the impl's
-  bounds implied by the declaration's (E0276, wx's E2124); the value meets
+  bounds implied by the declaration's (E0276, wx's E2095); the value meets
   the declared bounds for every argument, with the parameters as
   placeholders (`check_type_bounds`).
 - No `for<T>` bounds over types in stable Rust (`non_lifetime_binders` is

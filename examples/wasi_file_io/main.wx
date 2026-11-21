@@ -140,7 +140,7 @@ impl Point {
 }
 
 func test() {
-    local p = Point::new();
+    _ = Point::new();
     match (True) {
         Bool::False => {},
         Bool::True => {},

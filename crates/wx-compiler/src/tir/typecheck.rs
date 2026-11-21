@@ -7571,7 +7571,7 @@ mod tests {
 			"});
 		// In both, the second arm is covered by the first. Each global's
 		// `match` is a constant in principle, but the evaluator folds no
-		// control flow yet, so its initializer is not evaluated (E2015).
+		// control flow yet, so its initializer is not evaluated (E2014).
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::UnreachableMatchArm,
 			DiagnosticCode::NonConstantGlobalInitializer,
@@ -8951,7 +8951,7 @@ mod tests {
 		"});
 		DiagnosticView::new("parse", &parser, &case.files).assert_codes(&[
 			DiagnosticCode::UnexpectedToken,
-			DiagnosticCode::MissingSeparator,
+			DiagnosticCode::MissingSemicolon,
 		]);
 		case.diagnostics().assert_codes(&[
 			DiagnosticCode::IntegerLiteralOutOfRange,
@@ -8973,7 +8973,7 @@ mod tests {
 		"});
 		DiagnosticView::new("parse", &parser, &case.files).assert_codes(&[
 			DiagnosticCode::MissingInitializer,
-			DiagnosticCode::MissingSeparator,
+			DiagnosticCode::MissingSemicolon,
 			DiagnosticCode::UnexpectedToken,
 		]);
 		case.diagnostics().assert_none();

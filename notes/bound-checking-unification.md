@@ -230,7 +230,7 @@ memory-seeding work; each one below reproduces today.
   deferred.
 - **`Self` does not resolve in a trait impl's `where` clause.** It resolves in
   the trait *declaration* (`type Elem: X where { Y = Self }` works, and is
-  tested), but the same clause on the impl's method gives `E1021: undeclared
+  tested), but the same clause on the impl's method gives `E1015: undeclared
   type`. An inconsistency in name resolution, not in bound checking.
 
 **By design, for now**

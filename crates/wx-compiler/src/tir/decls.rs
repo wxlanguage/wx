@@ -17,6 +17,7 @@ use crate::{
 	index::index_newtype,
 	small_vec::SmallVec,
 	tir::{
+		body::BodyOwner,
 		imports::ImportResolver,
 		literals::unescape_string_literal,
 		resolutions::{NameResolutions, Reference, Route, Site},
@@ -2590,6 +2591,16 @@ impl Declared for PackageInstanceIdx {
 	}
 }
 
+impl Declared for BodyOwner {
+	fn loc(self, decls: &Declarations) -> ItemLoc {
+		match self {
+			Self::Const(index) => index.loc(decls),
+			Self::Function(index) => index.loc(decls),
+			Self::Global(index) => index.loc(decls),
+		}
+	}
+}
+
 impl Declared for MemberKind {
 	fn loc(self, decls: &Declarations) -> ItemLoc {
 		match self {
@@ -2701,6 +2712,11 @@ impl Declarations {
 	/// written in one file.
 	pub fn file_id(&self, loc: ItemLoc) -> FileId {
 		self.namespaces.file_id(loc.namespace)
+	}
+
+	/// The package `loc` is declared in.
+	pub fn package_id(&self, loc: ItemLoc) -> PackageId {
+		self.namespaces.scope(self.scope(loc)).package_id
 	}
 
 	/// The name `index`'s declaration is written with, from its row.
@@ -3260,7 +3276,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 	/// What a memory's `#[memory_limits]` says: the first one with an
 	/// argument list (`scan_attributes` reports any other). An argument
 	/// that says nothing (an unknown name, a name written twice, a value
-	/// that is not a number) is reported (E2130) and left out.
+	/// that is not a number) is reported (`InvalidMemoryLimits`) and left out.
 	fn resolve_memory_limits(
 		&mut self,
 		file_id: FileId,

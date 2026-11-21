@@ -444,14 +444,14 @@ Interim resolution: removed `impl Rem for f32` and `impl Rem for f64` from
 the stdlib's impl set. Checked source therefore fails with a named diagnostic
 instead of reaching the integer-only opt path:
 
-- `x % y` on floats — E2063 (`TraitBoundViolation`): "the trait bound
+- `x % y` on floats — E2046 (`TraitBoundViolation`): "the trait bound
   `f64: Rem` is not satisfied".
-- `x.rem(y)` on floats — E2049 (`MethodNotFound`): "no function or constant
+- `x.rem(y)` on floats — E2034 (`MethodNotFound`): "no function or constant
   named `rem` found for type `f64`".
 
 No MIR is produced and the `opt/builder.rs` "remainder has integer operands"
 unreachable is no longer reachable from checked source. A constant is checked
-the same way (`const E: f64 = 5.0 % 2.0` is E2063), so the evaluator's float
+the same way (`const E: f64 = 5.0 % 2.0` is E2046), so the evaluator's float
 `Rem` arms (`eval.rs`'s `binary`) are `unreachable!` too.
 
 The diagnostics regression is `a_float_has_no_remainder` (`tir/typecheck.rs`:

@@ -177,24 +177,22 @@ pub(crate) fn add_compiler_diagnostic(
 		format!("{}\n{}", diagnostic.message, label_messages.join("\n"))
 	};
 
-	let tags = diagnostic.code.as_ref().and_then(|code| {
+	let tags = diagnostic.code.as_deref().and_then(|code| {
 		use std::str::FromStr;
 		use wx_compiler::diagnostics::DiagnosticCode;
-		DiagnosticCode::from_str(code)
-			.ok()
-			.and_then(|code| match code {
-				DiagnosticCode::UnreachableCode
-				| DiagnosticCode::UnusedVariable
-				| DiagnosticCode::UnusedTypeParam
-				| DiagnosticCode::UnnecessaryMutability
-				| DiagnosticCode::UnusedItem
-				| DiagnosticCode::UnusedEnumVariant
-				| DiagnosticCode::UnusedLabel
-				| DiagnosticCode::UnusedStructField => {
-					Some(vec![DiagnosticTag::UNNECESSARY])
-				}
-				_ => None,
-			})
+		let unnecessary = match wx_lint::Lint::from_code(code) {
+			Some(
+				wx_lint::Lint::UnusedVariable
+				| wx_lint::Lint::UnnecessaryMutability
+				| wx_lint::Lint::UnusedLabel,
+			) => true,
+			None => matches!(
+				DiagnosticCode::from_str(code),
+				Ok(DiagnosticCode::UnreachableCode
+					| DiagnosticCode::UnreachableMatchArm)
+			),
+		};
+		unnecessary.then(|| vec![DiagnosticTag::UNNECESSARY])
 	});
 
 	for (path, range) in diagnostic_locations(files, diagnostic) {

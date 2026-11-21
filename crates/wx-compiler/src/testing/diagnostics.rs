@@ -23,8 +23,8 @@ use crate::vfs::{FileId, Files};
 /// into so failures can be rendered with source context.
 ///
 /// `stage` names the stage in panic messages ("parse", "link", "check"). With
-/// three stages reporting into the same `FileId` space, "expected E1015" is a
-/// good deal less useful than "expected E1015 during check".
+/// three stages reporting into the same `FileId` space, "expected E1012" is a
+/// good deal less useful than "expected E1012 during check".
 ///
 /// Borrows throughout — a stage whose diagnostics are not already in one
 /// place (linker diagnostics live per package, parse diagnostics per module)
@@ -329,7 +329,7 @@ mod tests {
 	#[test]
 	fn no_errors_passes_when_only_warnings_were_reported() {
 		let (files, items) =
-			fixture(&[(DiagnosticCode::UnusedVariable, Severity::Warning)]);
+			fixture(&[(DiagnosticCode::UnreachableCode, Severity::Warning)]);
 		view(&files, &items).assert_no_errors();
 	}
 
@@ -366,20 +366,20 @@ mod tests {
 		// it. This is exactly what the `has_error_code` helper it replaces got
 		// wrong.
 		let (files, items) =
-			fixture(&[(DiagnosticCode::UnusedVariable, Severity::Warning)]);
+			fixture(&[(DiagnosticCode::UnreachableCode, Severity::Warning)]);
 		let message = fails(|| {
-			view(&files, &items).assert_error(DiagnosticCode::UnusedVariable)
+			view(&files, &items).assert_error(DiagnosticCode::UnreachableCode)
 		});
 		assert!(message.contains("expected error"), "{message}");
-		view(&files, &items).assert_warning(DiagnosticCode::UnusedVariable);
-		view(&files, &items).assert_reported(DiagnosticCode::UnusedVariable);
+		view(&files, &items).assert_warning(DiagnosticCode::UnreachableCode);
+		view(&files, &items).assert_reported(DiagnosticCode::UnreachableCode);
 	}
 
 	#[test]
 	fn assert_absent_rejects_a_reported_code() {
 		let (files, items) =
 			fixture(&[(DiagnosticCode::PrivateItem, Severity::Error)]);
-		view(&files, &items).assert_absent(DiagnosticCode::UnusedVariable);
+		view(&files, &items).assert_absent(DiagnosticCode::UnreachableCode);
 		let message = fails(|| {
 			view(&files, &items).assert_absent(DiagnosticCode::PrivateItem)
 		});
@@ -390,16 +390,16 @@ mod tests {
 	fn assert_codes_is_exact_and_ordered() {
 		let (files, items) = fixture(&[
 			(DiagnosticCode::PrivateItem, Severity::Error),
-			(DiagnosticCode::UnusedVariable, Severity::Warning),
+			(DiagnosticCode::UnreachableCode, Severity::Warning),
 		]);
 		view(&files, &items).assert_codes(&[
 			DiagnosticCode::PrivateItem,
-			DiagnosticCode::UnusedVariable,
+			DiagnosticCode::UnreachableCode,
 		]);
 		// order matters
 		let message = fails(|| {
 			view(&files, &items).assert_codes(&[
-				DiagnosticCode::UnusedVariable,
+				DiagnosticCode::UnreachableCode,
 				DiagnosticCode::PrivateItem,
 			])
 		});
@@ -441,7 +441,7 @@ mod tests {
 	#[test]
 	fn assert_none_rejects_even_a_warning() {
 		let (files, items) =
-			fixture(&[(DiagnosticCode::UnusedVariable, Severity::Warning)]);
+			fixture(&[(DiagnosticCode::UnreachableCode, Severity::Warning)]);
 		let message = fails(|| view(&files, &items).assert_none());
 		assert!(
 			message.contains("expected no check diagnostics"),

@@ -11,13 +11,28 @@ use crate::documents::OpenDocument;
 /// Invalid manifests remain project boundaries. Removing a manifest from both
 /// disk and the editor removes the project after its publications are cleared.
 pub(crate) struct ProjectState {
-	pub(crate) manifest: ManifestState,
+	pub(crate) manifest: Manifest,
 	pub(crate) published_files: HashSet<PathBuf>,
 }
 
-pub(crate) enum ManifestState {
-	Parsed(vfs::PackageManifest),
-	Invalid,
+/// Each tool's view of one `wx.json`, parsed independently: `None` is a
+/// section that is invalid, or a manifest that could not be read. The
+/// default is a manifest none of whose sections parsed.
+#[derive(Default)]
+pub(crate) struct Manifest {
+	pub(crate) package: Option<vfs::PackageManifest>,
+	pub(crate) format: Option<wx_fmt::RendererConfig>,
+	pub(crate) lint: Option<wx_lint::LintConfig>,
+}
+
+impl Manifest {
+	pub(crate) fn parse(text: &str) -> Self {
+		Self {
+			package: vfs::PackageManifest::parse(text).ok(),
+			format: wx_fmt::RendererConfig::from_manifest(text).ok(),
+			lint: wx_lint::LintConfig::from_manifest(text).ok(),
+		}
+	}
 }
 
 /// Finds the project directory governing `file_path` — the nearest

@@ -2,7 +2,6 @@ use string_interner::symbol::SymbolU32;
 use wx_compiler::ast;
 use wx_compiler::diagnostics::{TextOffset, TextSpan};
 use wx_compiler::tir::unescape_string_literal;
-use wx_compiler::vfs::LineEnding;
 
 #[cfg(test)]
 mod tests;
@@ -3265,24 +3264,49 @@ impl Default for RendererConfig {
 	}
 }
 
+/// The line break the formatter prints.
+#[derive(serde::Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LineEnding {
+	#[default]
+	Lf,
+	Crlf,
+}
+
+/// The formatter's view of a `wx.json`: only its `format` section, every
+/// other key ignored. Each field is optional, so a manifest can override
+/// one setting without restating the others.
+#[derive(serde::Deserialize)]
+struct Manifest {
+	#[serde(default)]
+	format: FormatSection,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct FormatSection {
+	max_line_width: Option<u32>,
+	indent_width: Option<u8>,
+	line_ending: Option<LineEnding>,
+}
+
 impl RendererConfig {
-	/// Overlays a manifest's `format` section onto the defaults, field by
-	/// field, so a `wx.json` can override one setting without restating the
-	/// others.
+	/// Reads the `format` section of the `wx.json` text `manifest` and
+	/// overlays it onto the defaults, field by field.
 	///
 	/// Lives here rather than in either caller because `wx format` and the
 	/// LSP's formatting request must agree byte for byte — formatting a
 	/// file on save and formatting it from the CLI are the same operation,
 	/// and two copies of this overlay would be free to drift apart.
-	pub fn from_manifest(format: wx_compiler::vfs::FormatManifest) -> Self {
+	pub fn from_manifest(manifest: &str) -> Result<Self, serde_json::Error> {
+		let Manifest { format } = serde_json::from_str(manifest)?;
 		let default = Self::default();
-		Self {
+		Ok(Self {
 			max_line_width: format
 				.max_line_width
 				.unwrap_or(default.max_line_width),
 			indent_width: format.indent_width.unwrap_or(default.indent_width),
 			line_ending: format.line_ending.unwrap_or(default.line_ending),
-		}
+		})
 	}
 }
 

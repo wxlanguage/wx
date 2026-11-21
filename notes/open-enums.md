@@ -59,7 +59,7 @@ impl alone is `notes/structural-eq.md`'s.
 
 - **Exhaustiveness.** A struct has one constructor, and its constants do not
   cover it, so a `match` needs a catch-all, `Errno(code)` or `_`. Without one it
-  is E2066 with the witness `Errno(_)`. Checked on the current compiler.
+  is E2049 with the witness `Errno(_)`. Checked on the current compiler.
 - **Construction.** `Errno(77)` builds any code, through the struct's ordinary
   constructor: no `transmute`.
 - **Reading the number.** `local Errno(code) = e`, a struct pattern.
@@ -146,7 +146,7 @@ means on a struct, restricted by the enum being closed:
 
 | Part | Meaning | |
 | --- | --- | --- |
-| Type, `(i8)` | The repr. What a closed enum needs of it is `Repr: Eq + StackValue` (`notes/structural-eq.md`, "Enum reprs"); E2055 keeps it to integers until a wider repr is implemented | As today |
+| Type, `(i8)` | The repr. What a closed enum needs of it is `Repr: Eq + StackValue` (`notes/structural-eq.md`, "Enum reprs"); E2040 keeps it to integers until a wider repr is implemented | As today |
 | Name, `(value: i8)` | The number is read by name, `o.value` and `Ordering({ value })`, as well as by position | Allowed |
 | `_`, `(_: i8)` | No name, the same as `(i8)` (`Binding::name` is `None` for both), as on a struct field or a parameter | Allowed |
 | `pub`, `(pub i8)` | Code outside the enum's module may read the number | Allowed; private by default |
@@ -164,7 +164,7 @@ means on a struct, restricted by the enum being closed:
   visibility, so `pub` grants what the type allows and keeps one meaning.
   Without `pub` the enum's module and its descendants may read it (the
   default visibility, `CLAUDE.md`), elsewhere it is the private-field error
-  (E2076) for the pattern and the field access alike. Private by default
+  (E2054) for the pattern and the field access alike. Private by default
   because seeing the numbers in the declaration is not the same as their being
   API: if any module can read them, renumbering the variants breaks code, as
   `e as i32` makes every Rust enum's discriminants public whether the author
@@ -185,8 +185,8 @@ means on a struct, restricted by the enum being closed:
 - **Namespace.** Decided: the enum's name is in the value namespace too, as a
   struct's is (so it may not share its name with a function or a struct in the
   same scope). `E(n)` then resolves as a struct pattern does, `E(x)` reaches the
-  construction error (E2142), and a bare `E` is "expected a value, found enum"
-  (E2110).
+  construction error (E2110), and a bare `E` is "expected a value, found enum"
+  (E2081).
 - **Field access** `o.value` is a read of the one field, as on a struct; there
   is no positional access (`o.0`), as there is none on a struct or a tuple.
 - **Several fields** are the deferred wider reprs below: written with this
@@ -201,8 +201,8 @@ means on a struct, restricted by the enum being closed:
 Step 1 (syntax) is done: the repr is parsed as a list of struct fields
 (`List<StructField>`, empty when no parentheses are written), so several fields
 need no new syntax when wider reprs come; until then the signature check reports
-them unsupported (E2114). wx-fmt prints the list as a struct's, and `mut` is
-reported by the signature check (E2141, `MutableEnumRepr`), since it is
+them unsupported (E2085). wx-fmt prints the list as a struct's, and `mut` is
+reported by the signature check (E2109, `MutableEnumRepr`), since it is
 well-formed syntax that means nothing here.
 
 Step 2 (reading) is done. The repr's fields live in the same field arena as a
@@ -211,17 +211,17 @@ pattern and field access code reads either: `PatternKind::Fields { owner, .. }`
 replaces `PatternKind::Struct`, and `ExprKind::FieldAccess` takes its owner
 from the object's type. On an enum:
 
-- a pattern of its fields holds no test (E2143, `TestInEnumRepr`, and the
+- a pattern of its fields holds no test (E2111, `TestInEnumRepr`, and the
   pattern is then the error pattern); usefulness counts it as `_`, so after
   every variant it is unreachable and before some a catch-all;
 - a field access is always a value, never a place, so `=`, `op=` and `.&` on
-  it are refused (E2013, "cannot assign to the repr of enum");
-- reading needs every field read to be visible (E2076);
+  it are refused (E2012, "cannot assign to the repr of enum");
+- reading needs every field read to be visible (E2054);
 - lowering reuses the struct path: a pattern retypes the matched scalar as the
   repr, and a field read is the enum's value itself.
 
 Step 3 (the construction error) came with it: `E(5)` and `E({ value: 5 })`
-are E2142, `EnumConstructedFromRepr`.
+are E2110, `EnumConstructedFromRepr`.
 
 Step 4 is done: core declares `pub enum Bool(pub u8)` and
 `pub enum Ordering(pub i8)`. No `transmute` in core or the examples was
@@ -242,7 +242,7 @@ The body `..` goes: `ast::EnumEntry::Rest` (the body is variants again),
 body becomes a parse error with a hint to use a struct with constants.
 
 Done 2026-11-14: the body is a `List<EnumVariant>` again (`EnumVariantId`), and
-a `..` is E1030 (`RestInEnumBody`), reported and skipped. `examples/hello_wasi`
+a `..` is E1020 (`RestInEnumBody`), reported and skipped. `examples/hello_wasi`
 and `examples/wasi` (`Errno`, `Fd`) are structs with constants; `Fd` is never
 compared, so it has no `Eq`.
 `examples/hello_wasi`'s `Errno` becomes the struct above, with its `Eq` impl
@@ -282,7 +282,7 @@ closed (`notes/structural-eq.md`, "Enum reprs").
 
 What it costs: each name is longer to write (`pub const BADF: Self = Self(8)`
 against `Badf = 8`), the type needs its `Eq` impl, and the enum's checks on its
-values (duplicate values, the anchor auto-increment requires, E2071) do not
+values (duplicate values, the anchor auto-increment requires, E2052) do not
 apply to constants. Both are acceptable for the few types whose values come
 from outside the program, and a closed enum, the common case, is unchanged.
 
@@ -312,7 +312,7 @@ switch on it with `br_table` directly (a small tuple could be packed into one
 integer key, `(i8, i8)` in 16 bits); usefulness needs a constructor per variant
 where `Ctor::Value(u64)` holds one scalar; and data per case is often still
 better served by a closed integer enum and a method matching on `self`. Until
-then E2055 keeps reprs to integers.
+then E2040 keeps reprs to integers.
 
 ## The design this replaces
 
@@ -333,15 +333,15 @@ lowering were unchanged. Its weakness was the one described above, and
 Write each where the code under test is (`CLAUDE.md`, "Testing patterns").
 
 - **The struct form** (works today; pin it): the `describe` program checks;
-  without the catch-all it is E2066 with witness `Errno(_)`; without the `Eq`
-  impl it is E2063. Lowering (`tir/lower.rs`, under wasmtime):
+  without the catch-all it is E2049 with witness `Errno(_)`; without the `Eq`
+  impl it is E2046. Lowering (`tir/lower.rs`, under wasmtime):
   `describe(Errno(77))` takes the catch-all.
 - **Change 1**: `local Ordering(n) = o`, `Signal({ number })` and `s.number`
   give the variant's number at runtime; `Ordering(5)` and
   `Ordering({ value: 5 })` as expressions are the new error; `Ordering(n)`
   after every variant is unreachable and before them a catch-all; a pattern
   other than a binding or `_` inside is refused; outside the module, reading a
-  repr without `pub` is E2076 and with `pub` is fine; `(mut v: i8)` is the
+  repr without `pub` is E2054 and with `pub` is fine; `(mut v: i8)` is the
   error; `(_: i8)` is `(i8)`; wx-fmt round-trips each form.
 - **Change 2**: a `..` in an enum body is the parse error; the parser, TIR and
   wx-fmt tests for open enums are removed with the code.

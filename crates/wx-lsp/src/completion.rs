@@ -251,7 +251,7 @@ pub(crate) fn completion(
 				.filter(|(name, _)| !written.contains(name))
 				.collect()
 		}
-		// A name written twice is reported (E2121), so the ones written are
+		// A name written twice is reported (E2092), so the ones written are
 		// not offered again.
 		Site::PackageKey { .. } => return None,
 		Site::Pattern(_) => unreachable!("pattern provider dispatched above"),

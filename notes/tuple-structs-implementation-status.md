@@ -226,7 +226,7 @@ being usable as a value. If a module already has `fn Point(a: i32, b: i32)`
 and *also* declares `struct Point(i32, i32);`, what should `Point(1, 2)`
 mean? Reserving the Value-namespace slot for the struct (even though
 nothing real backs it) means a colliding `fn Point` becomes an ordinary
-**duplicate-definition error (E2005)** at declaration time — not a silent,
+**duplicate-definition error (E2006)** at declaration time — not a silent,
 lookup-order-dependent ambiguity discovered later at a call site.
 
 **Decision**: `prescan.rs` keeps its existing dual-namespace claim for

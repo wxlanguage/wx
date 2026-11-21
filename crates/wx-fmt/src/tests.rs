@@ -4151,12 +4151,39 @@ fn test_format_crlf_line_ending() {
 		format_source(lf, LineEnding::Lf).replace('\n', "\r\n")
 	);
 
-	let manifest = vfs::PackageManifest::parse(
+	let config = RendererConfig::from_manifest(
 		r#"{ "entry": "main.wx", "format": { "line_ending": "crlf" } }"#,
 	)
 	.unwrap();
+	assert!(config.line_ending == LineEnding::Crlf);
+}
+
+#[test]
+fn a_manifest_without_a_format_section_gives_the_defaults() {
+	let config =
+		RendererConfig::from_manifest(r#"{ "entry": "main.wx" }"#).unwrap();
+	let default = RendererConfig::default();
+	assert_eq!(config.max_line_width, default.max_line_width);
+	assert_eq!(config.indent_width, default.indent_width);
+	assert!(config.line_ending == default.line_ending);
+}
+
+#[test]
+fn a_format_section_overrides_only_the_fields_it_sets() {
+	let config = RendererConfig::from_manifest(
+		r#"{ "entry": "main.wx", "format": { "max_line_width": 100 } }"#,
+	)
+	.unwrap();
+	assert_eq!(config.max_line_width, 100);
+	assert_eq!(config.indent_width, RendererConfig::default().indent_width);
+}
+
+#[test]
+fn an_invalid_format_section_is_reported() {
 	assert!(
-		RendererConfig::from_manifest(manifest.format).line_ending
-			== LineEnding::Crlf
+		RendererConfig::from_manifest(
+			r#"{ "entry": "main.wx", "format": { "indent_width": "wide" } }"#,
+		)
+		.is_err()
 	);
 }

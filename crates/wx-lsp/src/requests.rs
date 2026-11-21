@@ -20,7 +20,7 @@ use crate::convert::{
 };
 use crate::diagnostics::diagnostic_locations;
 use crate::hover;
-use crate::projects::{ManifestState, discover_package_root};
+use crate::projects::discover_package_root;
 use crate::query;
 use crate::semantic_tokens;
 use crate::snapshot::load_compilation;
@@ -192,11 +192,7 @@ pub(crate) fn format(
 	}
 	let file = compilation.files.get(module.file_id).ok()?;
 	let source = file.source.as_str();
-	let ManifestState::Parsed(manifest) = &state.projects.get(&root)?.manifest
-	else {
-		return None;
-	};
-	let config = wx_fmt::RendererConfig::from_manifest(manifest.format);
+	let config = state.projects.get(&root)?.manifest.format?;
 	let formatted = trace.step("render", |_| {
 		wx_fmt::format(
 			ast,
@@ -243,6 +239,7 @@ pub(crate) fn render_full_diagnostic(
 	let diagnostic = loading
 		.iter()
 		.chain(snapshot.sema.diagnostics())
+		.chain(&snapshot.lints)
 		.flat_map(|diagnostic| {
 			let target_path = &target_path;
 			diagnostic_locations(files, diagnostic)

@@ -112,12 +112,12 @@ Each clause is normalized in the full env's parent:
 - **No parameter** (`type Item = Bytes`: `Bytes: Show`) is proved there:
   dropped if it holds, reported at its written bound if not (rustc's
   `check_false_global_bounds`).
-- **A parameter, not abstract** (`Wrap2<T>: Show`): unsupported (E2114)
+- **A parameter, not abstract** (`Wrap2<T>: Show`): unsupported (E2085)
   for now. Later: replaced by the requirements of the one impl that
   matches, so every kept clause is abstract.
 - An equality is kept when its projection is still abstract, compared when
-  neither side has a parameter (E2112 at the equality), and otherwise an
-  error (E2132, `UnassumableEquality`): `Item = u8` where `Item` is `T`
+  neither side has a parameter (E2083 at the equality), and otherwise an
+  error (E2100, `UnassumableEquality`): `Item = u8` where `Item` is `T`
   would make a parameter equal a type, which no clause can state and
   normalization never reads (it rewrites projections only). rustc has no
   `T == u8` where-clauses either. Unlike `Wrap2<T>: Show`, this is not
@@ -153,7 +153,7 @@ own clauses do not take part in normalizing each other.
 
 The contract env (`contract_env`) holds what the declaration's own clauses
 mean with `Self` as the target: instantiated, then normalized in the impl's
-env (`normalize_clauses`), keeping what is about an abstract type. E2124
+env (`normalize_clauses`), keeping what is about an abstract type. E2095
 (`check_own_bounds`) compares only what the impl function assumes, its
 requirements normalized in the impl's env the same way: a clause about a
 type that is not abstract holds or not of its own and is reported where it

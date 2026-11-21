@@ -44,7 +44,8 @@ pub fn expand_project(
 	let manifest_path = dir.join(&RelativePath::new("wx.json"));
 	let manifest_source = source.read_to_string(&manifest_path)?;
 	let manifest = PackageManifest::parse(&manifest_source).map_err(|_| ())?;
-	let config = RendererConfig::from_manifest(manifest.format);
+	let config =
+		RendererConfig::from_manifest(&manifest_source).map_err(|_| ())?;
 
 	let mut interner = wx_compiler::symbols::Keyword::create_interner();
 	let mut builder = CompilationUnitBuilder::new(&mut interner);

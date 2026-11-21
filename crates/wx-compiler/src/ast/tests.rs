@@ -1165,7 +1165,7 @@ fn test_a_match_arm_expression_body_needs_a_separator() {
         }
     "});
 	case.diagnostics()
-		.assert_codes(&[DiagnosticCode::MissingSeparator]);
+		.assert_codes(&[DiagnosticCode::MissingComma]);
 }
 
 #[test]
@@ -1750,7 +1750,7 @@ fn an_enum_repr_is_written_as_a_struct_field() {
 
 #[test]
 fn a_mut_enum_repr_is_parsed_as_written() {
-	// Whether it means anything is the checker's to say (E2141).
+	// Whether it means anything is the checker's to say (E2109).
 	let case = TestCase::new("enum E(mut value: i8) { X = 0 }");
 	case.diagnostics().assert_none();
 	let Item::Enum { repr, variants, .. } = case.item(0) else {
@@ -2505,7 +2505,7 @@ fn test_missing_semicolon_warns_but_parses() {
     "});
 
 	case.diagnostics()
-		.assert_codes(&[DiagnosticCode::MissingSeparator]);
+		.assert_codes(&[DiagnosticCode::MissingSemicolon]);
 	assert_eq!(case.function_block(0).len(), 2);
 }
 
@@ -2532,7 +2532,7 @@ fn test_invalid_function_param_type_reports_parse_error() {
 
 	case.diagnostics().assert_codes(&[
 		DiagnosticCode::UnexpectedToken,
-		DiagnosticCode::MissingSeparator,
+		DiagnosticCode::MissingComma,
 		DiagnosticCode::UnexpectedToken,
 	]);
 	let params = case.ast.list(case.function_signature(0).params);
@@ -2667,7 +2667,7 @@ fn test_missing_comma_between_struct_fields_warns_but_parses() {
     "});
 
 	case.diagnostics()
-		.assert_codes(&[DiagnosticCode::MissingSeparator]);
+		.assert_codes(&[DiagnosticCode::MissingComma]);
 	assert_eq!(case.struct_fields(0).len(), 2);
 }
 
@@ -2979,14 +2979,9 @@ fn a_type_argument_is_a_constant_when_it_is_a_literal_or_marked() {
 }
 
 #[test]
-fn a_const_marker_on_a_literal_or_an_inferred_argument_is_redundant() {
+fn a_const_marker_on_a_literal_or_an_inferred_argument_is_accepted() {
 	let case = TestCase::new("func f() { g::<const 5, const _>(); }");
-	case.diagnostics().assert_codes(&[
-		DiagnosticCode::RedundantConstMarker,
-		DiagnosticCode::RedundantConstMarker,
-	]);
-	case.diagnostics()
-		.assert_warning(DiagnosticCode::RedundantConstMarker);
+	case.diagnostics().assert_none();
 	assert_eq!(call_type_args(&case, 0), ["literal", "type"]);
 }
 
@@ -3049,8 +3044,7 @@ fn an_array_length_is_a_literal_or_a_path() {
 	// Only a constant can be a length, so `const` says nothing; and a
 	// computation is not one.
 	let case = TestCase::new("func f(a: heap::&[u8; const N]) {}");
-	case.diagnostics()
-		.assert_warning(DiagnosticCode::RedundantConstMarker);
+	case.diagnostics().assert_none();
 	let case = TestCase::new("func f(a: heap::&[u8; N + 1]) {}");
 	case.diagnostics()
 		.assert_error(DiagnosticCode::UnexpectedToken);
@@ -3110,8 +3104,7 @@ fn an_array_length_can_be_left_to_its_context() {
 	let case = TestCase::new(
 		"func f() { local a: heap::&[u8; _] = [0; _]; local b = [0; const _]; }",
 	);
-	case.diagnostics()
-		.assert_warning(DiagnosticCode::RedundantConstMarker);
+	case.diagnostics().assert_none();
 	let Entry::Statement(Statement::LocalDefinition { ty: Some(ty), .. }) =
 		case.function_block(0)[0]
 	else {
@@ -4487,7 +4480,7 @@ fn test_unknown_token_reports() {
 	// here records what happens rather than anything that must hold.
 	let case = TestCase::new("func f() -> i32 { 1 @ 2 }");
 	case.diagnostics().assert_codes(&[
-		DiagnosticCode::MissingSeparator,
+		DiagnosticCode::MissingSemicolon,
 		DiagnosticCode::UnknownToken,
 	]);
 }
@@ -4833,7 +4826,7 @@ fn a_keyword_after_a_dot_starts_the_next_statement() {
 	// The unfinished statement has no `;` either, which is reported too.
 	case.diagnostics().assert_codes(&[
 		DiagnosticCode::UnexpectedToken,
-		DiagnosticCode::MissingSeparator,
+		DiagnosticCode::MissingSemicolon,
 	]);
 	case.diagnostics()
 		.assert_error_saying("expected a member name after `.`, found `local`");
@@ -4953,7 +4946,7 @@ fn a_path_with_no_last_segment_keeps_its_prefix() {
 	"});
 	case.diagnostics().assert_codes(&[
 		DiagnosticCode::InvalidNamespace,
-		DiagnosticCode::MissingSeparator,
+		DiagnosticCode::MissingSemicolon,
 	]);
 	let block = case.function_block(0);
 	assert_eq!(block.len(), 2);
@@ -4985,7 +4978,7 @@ fn a_qualified_path_with_no_segment_keeps_its_root() {
 	"});
 	case.diagnostics().assert_codes(&[
 		DiagnosticCode::InvalidNamespace,
-		DiagnosticCode::MissingSeparator,
+		DiagnosticCode::MissingSemicolon,
 	]);
 	let block = case.function_block(0);
 	assert_eq!(block.len(), 2);

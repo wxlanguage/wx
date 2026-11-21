@@ -125,7 +125,7 @@ problem. Type-level functions over instances belong in traits.
 | A projection as the value: `impl<I: Iterator> P<I> { type Item = I::Item; }` | substituted, then normalized by the solver |
 | A projection as the receiver: `T::Out::X` with `T: Tr<Out = Wrap<i32>>` | selected through the assumed equality |
 | `<i32 as Tr>::Out::X` | to verify: `select_inherent_member` normalizes with `RewriteFlags::EQUALITIES` only |
-| `func X()` and `type X` in one impl, or in two impls of one head | E2000 |
+| `func X()` and `type X` in one impl, or in two impls of one head | E2001 |
 | A private alias in a public signature | accepted: expansion leaves only the underlying type |
 | `pub type` in a trait impl | still an error |
 | An inherent `Item` where a trait requires `Item` | does not satisfy the trait |
