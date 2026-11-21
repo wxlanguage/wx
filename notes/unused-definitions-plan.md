@@ -77,6 +77,9 @@ belong to `wx_lint::Lint`, and each one's level (`off`, `warn` (default),
 
 An unknown lint name or level makes the section invalid: `wx build`/`check`
 stop with an error, and the LSP runs no lints for that package.
+`--cap-lints <off|warn|error>` on `wx build`/`check` lowers every lint
+stricter than the cap for that run (`LintConfig::capped`); it never raises one.
+Capped `off`, the CLI runs no lints and does not read the `lint` section.
 
 - **L3000:** a local or parameter with no `Read` reference. `Write` and
   `ReadWrite` are not reads, as in rustc: a local only assigned is reported as

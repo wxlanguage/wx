@@ -52,8 +52,9 @@ impl Lint {
 	}
 }
 
-/// What a lint reports as.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Deserialize)]
+/// What a lint reports as, ordered from quietest to strictest.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+#[derive(serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Level {
 	Off,
@@ -90,6 +91,14 @@ impl LintConfig {
 		self.levels[lint as usize]
 	}
 
+	/// Lowers every lint stricter than `cap` to `cap`, as for a build that
+	/// cares less about lints than the manifest does.
+	pub fn capped(self, cap: Level) -> Self {
+		Self {
+			levels: self.levels.map(|level| level.min(cap)),
+		}
+	}
+
 	/// What `lint` reports as, or `None` when it is off.
 	pub fn severity(self, lint: Lint) -> Option<Severity> {
 		match self.level(lint) {
@@ -110,7 +119,12 @@ pub fn lint(
 	package: PackageId,
 	config: LintConfig,
 ) -> Vec<Diagnostic<FileId>> {
-	if compilation.has_errors() || sema.diagnostics().has_errors() {
+	if compilation.has_errors()
+		|| sema.diagnostics().has_errors()
+		|| Lint::ALL
+			.into_iter()
+			.all(|lint| config.level(lint) == Level::Off)
+	{
 		return Vec::new();
 	}
 	let mut diagnostics = Vec::new();

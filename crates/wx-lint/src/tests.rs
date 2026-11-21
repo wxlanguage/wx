@@ -257,6 +257,29 @@ fn a_lint_section_names_only_known_lints_and_levels() {
 }
 
 #[test]
+fn a_cap_lowers_only_stricter_lints() {
+	let config = LintConfig::from_manifest(
+		r#"{ "lint": { "unused_variable": "error", "unused_label": "off" } }"#,
+	)
+	.unwrap();
+	let capped = config.capped(Level::Warn);
+	assert_eq!(capped.level(Lint::UnusedVariable), Level::Warn);
+	assert_eq!(capped.level(Lint::UnnecessaryMutability), Level::Warn);
+	assert_eq!(capped.level(Lint::UnusedLabel), Level::Off);
+	assert_eq!(config.capped(Level::Error), config);
+	for lint in Lint::ALL {
+		assert_eq!(config.capped(Level::Off).level(lint), Level::Off);
+	}
+}
+
+#[test]
+fn nothing_is_reported_when_every_lint_is_off() {
+	let source = "func f() { local unused: u32 = 1; }";
+	let config = LintConfig::default().capped(Level::Off);
+	assert_eq!(lint_with(source, config), []);
+}
+
+#[test]
 fn each_lint_has_its_own_code() {
 	for lint in Lint::ALL {
 		assert_eq!(Lint::from_code(lint.code()), Some(lint));

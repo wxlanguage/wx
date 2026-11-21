@@ -22,6 +22,11 @@ fn main() {
 			clap::builder::PossibleValue::new("json"),
 		]))
 		.default_value("human");
+	let cap_lints = clap::Arg::new("cap-lints")
+		.long("cap-lints")
+		.value_name("LEVEL")
+		.value_parser(["off", "warn", "error"])
+		.help("Report no lint above this level");
 
 	let matches = clap::Command::new("wx")
 		.name("wx")
@@ -34,7 +39,7 @@ fn main() {
 				.about("Build a WX project to WebAssembly")
 				.arg(
 					clap::Arg::new("path")
-						.help("The project directory to build (default: .)")
+						.help("The project directory to build")
 						.default_value("."),
 				)
 				.arg(
@@ -47,17 +52,19 @@ fn main() {
 							 for stdout (default: <project-dir-name>.wasm)",
 						),
 				)
-				.arg(message_format.clone()),
+				.arg(message_format.clone())
+				.arg(cap_lints.clone()),
 		)
 		.subcommand(
 			clap::Command::new("check")
 				.about("Type-check a WX project without emitting output")
 				.arg(
 					clap::Arg::new("path")
-						.help("The project directory to check (default: .)")
+						.help("The project directory to check")
 						.default_value("."),
 				)
-				.arg(message_format),
+				.arg(message_format)
+				.arg(cap_lints),
 		)
 		.subcommand(
 			clap::Command::new("format")
@@ -65,7 +72,7 @@ fn main() {
 				.about("Format a WX project's source files in-place")
 				.arg(
 					clap::Arg::new("path")
-						.help("The project directory to format (default: .)")
+						.help("The project directory to format")
 						.default_value("."),
 				)
 				.arg(
@@ -101,14 +108,14 @@ fn main() {
 			let format = parse_message_format(
 				sub.get_one::<String>("message-format").unwrap(),
 			);
-			cmd_build(path, output, format);
+			cmd_build(path, output, format, parse_cap_lints(sub));
 		}
 		Some(("check", sub)) => {
 			let path = sub.get_one::<String>("path").unwrap();
 			let format = parse_message_format(
 				sub.get_one::<String>("message-format").unwrap(),
 			);
-			cmd_check(path, format);
+			cmd_check(path, format, parse_cap_lints(sub));
 		}
 		Some(("format", sub)) => {
 			let path = sub.get_one::<String>("path").unwrap();
@@ -262,6 +269,36 @@ fn load_compilation(
 	}
 }
 
+/// The level `--cap-lints` names, if given.
+fn parse_cap_lints(matches: &clap::ArgMatches) -> Option<wx_lint::Level> {
+	matches
+		.get_one::<String>("cap-lints")
+		.map(|level| match level.as_str() {
+			"off" => wx_lint::Level::Off,
+			"warn" => wx_lint::Level::Warn,
+			"error" => wx_lint::Level::Error,
+			_ => unreachable!("clap accepts only the listed levels"),
+		})
+}
+
+/// What the root package's lints report, at the levels `wx.json` sets,
+/// capped at `cap`. Capped `off`, nothing runs and the manifest's `lint`
+/// section is not read.
+fn run_lints(
+	path: &str,
+	cap: Option<wx_lint::Level>,
+	compilation: &vfs::CompilationUnit,
+	sema: &tir::Semantics,
+	strings: &symbols::StringInterner,
+) -> Vec<Diagnostic<vfs::FileId>> {
+	if cap == Some(wx_lint::Level::Off) {
+		return Vec::new();
+	}
+	let config = load_lint_config(path);
+	let config = cap.map_or(config, |cap| config.capped(cap));
+	wx_lint::lint(compilation, sema, strings, compilation.root_package, config)
+}
+
 /// The `lint` section of the project's `wx.json`.
 fn load_lint_config(path: &str) -> wx_lint::LintConfig {
 	let manifest_path =
@@ -330,7 +367,12 @@ fn abort_if_errors(count: usize) {
 	std::process::exit(1);
 }
 
-fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
+fn cmd_build(
+	project_path: &str,
+	output: Option<&str>,
+	format: MessageFormat,
+	cap_lints: Option<wx_lint::Level>,
+) {
 	let mut strings = symbols::Keyword::create_interner();
 	let compilation = load_compilation(project_path, &mut strings);
 
@@ -338,15 +380,9 @@ fn cmd_build(project_path: &str, output: Option<&str>, format: MessageFormat) {
 	emit_diagnostics(&compilation, &diagnostics, format.clone());
 	abort_if_errors(diagnostics.error_count());
 
-	let lint_config = load_lint_config(project_path);
 	let mut sema = tir::check(&compilation, &mut strings);
-	let lints = wx_lint::lint(
-		&compilation,
-		&sema,
-		&strings,
-		compilation.root_package,
-		lint_config,
-	);
+	let lints =
+		run_lints(project_path, cap_lints, &compilation, &sema, &strings);
 	let lowered = tir::lower(&mut sema, &strings);
 	emit_diagnostics(&compilation, sema.diagnostics(), format.clone());
 	emit_diagnostics(&compilation, &lints, format.clone());
@@ -392,7 +428,11 @@ fn output_stem(path: &str) -> String {
 		.to_string()
 }
 
-fn cmd_check(project_path: &str, format: MessageFormat) {
+fn cmd_check(
+	project_path: &str,
+	format: MessageFormat,
+	cap_lints: Option<wx_lint::Level>,
+) {
 	let mut strings = symbols::Keyword::create_interner();
 	let compilation = load_compilation(project_path, &mut strings);
 
@@ -402,15 +442,9 @@ fn cmd_check(project_path: &str, format: MessageFormat) {
 	emit_diagnostics(&compilation, &diagnostics, format.clone());
 	abort_if_errors(diagnostics.error_count());
 
-	let lint_config = load_lint_config(project_path);
 	let sema = tir::check(&compilation, &mut strings);
-	let lints = wx_lint::lint(
-		&compilation,
-		&sema,
-		&strings,
-		compilation.root_package,
-		lint_config,
-	);
+	let lints =
+		run_lints(project_path, cap_lints, &compilation, &sema, &strings);
 	emit_diagnostics(&compilation, sema.diagnostics(), format.clone());
 	emit_diagnostics(&compilation, &lints, format.clone());
 	abort_if_errors(sema.diagnostics().error_count() + lints.error_count());
