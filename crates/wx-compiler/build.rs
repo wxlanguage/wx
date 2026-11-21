@@ -1,9 +1,9 @@
-//! Embeds every `std/**/*.wx` file into the compiler at build time.
+//! Embeds every `core/**/*.wx` file into the compiler at build time.
 //!
-//! The stdlib has to be available with no filesystem behind it: `wx` ships as
+//! The core has to be available with no filesystem behind it: `wx` ships as
 //! a single binary, and `wx-lsp-wasm` runs in a browser. Walking the directory
 //! here, rather than maintaining a hand-written `include_str!` list, means
-//! adding a stdlib file is just creating it and writing the `module`
+//! adding a core file is just creating it and writing the `module`
 //! declaration that references it — there is no third place to update and
 //! forget, which would otherwise surface as a confusing "module file not
 //! found" pointing at a file that is right there on disk.
@@ -18,20 +18,20 @@ fn main() {
 		env::var("CARGO_MANIFEST_DIR")
 			.expect("cargo always sets CARGO_MANIFEST_DIR"),
 	);
-	let std_dir = manifest_dir.join("std");
+	let core_dir = manifest_dir.join("core");
 
 	// Cargo rescans a directory target recursively, so this covers files being
 	// added and removed, not just edited.
-	println!("cargo:rerun-if-changed={}", std_dir.display());
+	println!("cargo:rerun-if-changed={}", core_dir.display());
 
 	let mut entries = Vec::new();
-	collect_wx_files(&std_dir, &std_dir, &mut entries);
+	collect_wx_files(&core_dir, &core_dir, &mut entries);
 	// Sorted so the generated table, and therefore the build, is reproducible.
 	entries.sort();
 
 	assert!(
 		entries.iter().any(|(relative, _)| relative == "/main.wx"),
-		"std/main.wx is the stdlib crate root and must exist"
+		"core/main.wx is the core crate root and must exist"
 	);
 
 	let mut generated = String::from("&[\n");
@@ -43,17 +43,17 @@ fn main() {
 
 	let out_path =
 		PathBuf::from(env::var("OUT_DIR").expect("cargo always sets OUT_DIR"))
-			.join("stdlib_files.rs");
+			.join("core_files.rs");
 	fs::write(&out_path, generated)
 		.expect("OUT_DIR should be writable during a build");
 }
 
-/// Collects `("/"-prefixed path relative to `std/`, absolute path)` for
+/// Collects `("/"-prefixed path relative to `core/`, absolute path)` for
 /// every `.wx` file under `dir`, recursively.
 ///
 /// The first element is `/`-prefixed and always uses `/` as a separator, on
 /// every platform, matching `vfs::AbsolutePath`'s own convention directly —
-/// `load_stdlib` can then wrap each entry as-is, with no runtime
+/// `load_core` can then wrap each entry as-is, with no runtime
 /// string-patching step to make it absolute.
 fn collect_wx_files(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
 	let read = fs::read_dir(dir)

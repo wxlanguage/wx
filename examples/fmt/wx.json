@@ -1,0 +1,4 @@
+{
+    "entry": "main.wx",
+    "dependencies": { "slices": { "type": "local", "path": "../slices" } }
+}

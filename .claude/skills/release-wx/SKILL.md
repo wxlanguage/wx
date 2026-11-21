@@ -40,8 +40,8 @@ the diff for this.
 
 ## 3. Version bump locations (wx itself)
 
-All in lockstep, all six:
-`crates/{wx-compiler,wx-cli,wx-fmt,wx-compiler-wasm,wx-lsp-wasm,wx-lsp}/Cargo.toml`
+All in lockstep, all seven:
+`crates/{wx-compiler,wx-cli,wx-fmt,wx-lint,wx-compiler-wasm,wx-lsp-wasm,wx-lsp}/Cargo.toml`
 Plus npm: `cli/package.json` and each
 `cli/npm/{darwin-arm64,darwin-x64,linux-x64,win32-x64}/package.json`
 (their `optionalDependencies` in `cli/package.json` use `workspace:*`, so

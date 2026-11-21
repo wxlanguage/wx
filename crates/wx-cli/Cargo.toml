@@ -18,6 +18,7 @@ serde_json = { workspace = true }
 string-interner = { workspace = true }
 wx-compiler = { path = "../wx-compiler" }
 wx-fmt = { path = "../wx-fmt" }
+wx-lint = { path = "../wx-lint" }
 wx-lsp = { path = "../wx-lsp" }
 # `rt`: the `lsp` subcommand builds a current-thread runtime itself (see
 # `cmd_lsp`), everything else in this binary is synchronous. `io-std`: it

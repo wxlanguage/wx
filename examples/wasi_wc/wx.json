@@ -1,0 +1,13 @@
+{
+    "entry": "main.wx",
+    "dependencies": {
+        "wasi": {
+            "type": "local",
+            "path": "../wasi"
+        },
+        "fmt": {
+            "type": "local",
+            "path": "../fmt"
+        }
+    }
+}

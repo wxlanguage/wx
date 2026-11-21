@@ -1,12 +1,10 @@
-use std::*;
+func pow(base: i32, exp: i32) -> i32 {
+    if (exp < 0) { return 0 };
 
-pub fn pow(base: i32, mut exp: i32) -> i32 {
-  if exp < 0 { return 0 };
-
-  local mut result: i32 = 1;
-  loop {
-    if exp == 0 { break result };
-    result *= base;
-    exp -= 1;
-  }
+    loop (result: i32 = 1, exp = exp) {
+        if (exp == 0) { break result };
+        (result * base, exp - 1)
+    }
 }
+
+export pow;

@@ -13,7 +13,7 @@ import {
 } from "./vfs";
 
 // `open` always fires on a file click, even if it's already the active
-// file — e.g. the user navigated into a read-only stdlib view via
+// file — e.g. the user navigated into a read-only core view via
 // hover/go-to-definition (which doesn't touch `activeFileId` at all) and
 // then re-clicks the same tree row to get back. A plain `watch` on
 // `activeFileId` wouldn't see a change in that case; the caller (App.vue)

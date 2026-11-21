@@ -2,23 +2,18 @@ mod k_cosf;
 mod k_sinf;
 mod scalbn;
 mod rem_pio2f;
-mod sinf;
-mod cosf;
+pub mod sinf;
+pub mod cosf;
 mod k_cos;
 mod k_sin;
 mod rem_pio2;
-mod sin;
-mod cos;
+pub mod sin;
+pub mod cos;
 
-pub use sinf::sinf;
-pub use cosf::cosf;
-pub use sin::sin;
-pub use cos::cos;
+pub trait Float: StackValue {
+    func cos(self: Self) -> Self;
 
-trait Float {
-    fn cos(self) -> Self;
-
-    fn sin(self) -> Self;
+    func sin(self: Self) -> Self;
 
     const PI: Self;
 
@@ -26,12 +21,12 @@ trait Float {
 }
 
 impl Float for f32 {
-    fn sin(self) -> Self {
-        sinf(self)
+    func sin(self: Self) -> Self {
+        sinf::sinf(self)
     }
 
-    fn cos(self) -> Self {
-        cosf(self)
+    func cos(self: Self) -> Self {
+        cosf::cosf(self)
     }
 
     /// Archimedes' constant (π)
@@ -42,12 +37,12 @@ impl Float for f32 {
 }
 
 impl Float for f64 {
-    fn sin(self) -> Self {
-        sin(self)
+    func sin(self: Self) -> Self {
+        sin::sin(self)
     }
 
-    fn cos(self) -> Self {
-        cos(self)
+    func cos(self: Self) -> Self {
+        cos::cos(self)
     }
 
     /// Archimedes' constant (π)

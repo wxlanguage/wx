@@ -1,6 +1,11 @@
 target/
 .DS_Store
+*.snap.new
+*.pending-snap
 out/
 node_modules/
 cli/npm/*/bin
 thesis/
+# Built by `wx build`; examples/raycaster/main.wasm is tracked on purpose
+examples/*/*.wasm
+notes/backend-comparison/
