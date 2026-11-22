@@ -24,10 +24,10 @@ use tower_lsp_server::ls_types::{
 use wx_compiler::ast::{
 	AST, AssocBinding, AssocBindingKind, Block, BlockId, BoundExpression,
 	BoundId, Branch, Comment, CommentMap, ConstArgument, ConstId, Destructure,
-	EnumVariant, ExprId, Expression, FunctionSignature, FunctionTypeParam,
-	ImplItem, ImportDeclaration, ImportEntry, InColumn, Item, List,
-	NamedArgument, PatId, Path, PathSegment, Pattern, PatternElement,
-	PatternFieldItem, QualifiedPathRoot, Spanned, Statement, TraitItem,
+	EnumVariant, ExprId, Expression, FunctionTypeParam, ImplItem,
+	ImportDeclaration, ImportEntry, InColumn, Item, List, NamedArgument, PatId,
+	Path, PathSegment, Pattern, PatternElement, PatternFieldItem,
+	QualifiedPathRoot, SignatureId, Spanned, Statement, TraitItem,
 	TypeArgument, TypeExpression, TypeId, TypeParam, UseTree, rest_span,
 };
 use wx_compiler::diagnostics::{SourceSpan, TextOffset, TextSpan};
@@ -669,9 +669,9 @@ impl Cursor<'_> {
 		match item {
 			Item::Function {
 				signature, block, ..
-			} => self.function(signature, Some(*block)),
+			} => self.function(*signature, Some(*block)),
 			Item::FunctionDeclaration { signature, .. }
-			| Item::PackageFunction { signature, .. } => self.function(signature, None),
+			| Item::PackageFunction { signature, .. } => self.function(*signature, None),
 			Item::PackageConst { name, ty, .. }
 			| Item::Memory { name, size: ty, .. } => {
 				Within::Signature(Anchor::Name(name.span))
@@ -746,7 +746,7 @@ impl Cursor<'_> {
 					.or_else(|| match &self.node(*items)? {
 						TraitItem::Function {
 							signature, body, ..
-						} => self.function(signature, *body),
+						} => self.function(*signature, *body),
 						TraitItem::Const {
 							name, ty, value, ..
 						} => self.constant(name.span, Some(*ty), *value),
@@ -766,12 +766,14 @@ impl Cursor<'_> {
 				type_params,
 				target,
 				items,
+				..
 			} => self.impl_block(*type_params, None, target, *items),
 			Item::TraitImpl {
 				type_params,
 				trait_name,
 				target,
 				items,
+				..
 			} => self.impl_block(*type_params, Some(trait_name), target, *items),
 			Item::Import {
 				entries,
@@ -791,7 +793,7 @@ impl Cursor<'_> {
 				};
 				match declaration {
 					ImportDeclaration::Function { signature } => {
-						self.function(signature, None)
+						self.function(*signature, None)
 					}
 					ImportDeclaration::Global { name, ty, .. }
 					| ImportDeclaration::Memory { name, size: ty } => {
@@ -914,9 +916,10 @@ impl Cursor<'_> {
 	/// A function, by its name: its signature, then its body if it has one.
 	fn function(
 		&self,
-		signature: &FunctionSignature,
+		signature: SignatureId,
 		body: Option<BlockId>,
 	) -> Option<Position> {
+		let signature = self.ast.signature(signature);
 		let name = signature.name.span;
 		let site = self
 			.type_params(signature.type_params)
@@ -960,7 +963,7 @@ impl Cursor<'_> {
 			match &self.node(items)? {
 				ImplItem::Function {
 					signature, block, ..
-				} => self.function(signature, Some(*block)),
+				} => self.function(*signature, Some(*block)),
 				ImplItem::Constant {
 					name, ty, value, ..
 				} => self.constant(name.span, *ty, Some(*value)),
@@ -1355,7 +1358,7 @@ impl Cursor<'_> {
 			TypeExpression::Tuple { elements } => self
 				.ty(*self
 					.child_by(ast.list(elements), |&e| ast.type_span(e))?),
-			TypeExpression::Function { params, result } => self
+			TypeExpression::Function { params, result, .. } => self
 				.child(ast.list(params))
 				.and_then(|param| self.ty(param.ty))
 				.or_else(|| self.ty(result?)),

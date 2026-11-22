@@ -19,7 +19,7 @@ func uppercase(bytes: host::buffer::*[u8]) {
         if (i == bytes.len()) { break };
         local byte = bytes[i];
         if (byte >= 97 && byte <= 122) { bytes[i] = byte - 32 };
-        continue(i + 1);
+        continue i + 1;
     }
 }
 

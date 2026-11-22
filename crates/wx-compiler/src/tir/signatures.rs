@@ -1811,7 +1811,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 					} = ast.item(item)
 					{
 						self.check_function_body(
-							sema, entry, &signature, block,
+							sema,
+							entry,
+							ast.signature(signature),
+							block,
 						);
 					}
 				}
@@ -1824,7 +1827,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 					} = ast.trait_item(item)
 					{
 						self.check_function_body(
-							sema, entry, &signature, block,
+							sema,
+							entry,
+							ast.signature(signature),
+							block,
 						);
 					}
 				}
@@ -1835,7 +1841,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 					} = ast.impl_item(item)
 					{
 						self.check_function_body(
-							sema, entry, &signature, block,
+							sema,
+							entry,
+							ast.signature(signature),
+							block,
 						);
 					}
 				}
@@ -2995,7 +3004,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					namespace,
 					function_index,
 					self_scope,
-					signature,
+					ast.signature(*signature),
 				)
 			}
 			AstNodeRef::TraitConst {
@@ -3138,7 +3147,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					namespace,
 					function_index,
 					scope,
-					signature,
+					ast.signature(*signature),
 				)
 			}
 			AstNodeRef::TraitImplConstant {
@@ -3485,7 +3494,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					file_id,
 					namespace,
 					function_index,
-					signature,
+					ast.signature(*signature),
 				)
 			}
 			AstNodeRef::ImportedFunction {
@@ -3513,7 +3522,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					file_id,
 					namespace,
 					function_index,
-					signature,
+					ast.signature(*signature),
 				)
 			}
 			AstNodeRef::InherentImplBlock { item, block_index } => {
@@ -3597,7 +3606,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					namespace,
 					function_index,
 					scope,
-					signature,
+					ast.signature(*signature),
 				)
 			}
 			AstNodeRef::InherentImplConst {
@@ -5133,7 +5142,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					infer_policy,
 				)
 			}
-			ast::TypeExpression::Function { params, result } => {
+			ast::TypeExpression::Function { params, result, .. } => {
 				// One parameter type: a single one is itself, any other count
 				// is its tuple (`()` for none). Each is held by value.
 				let mut elements = Vec::with_capacity(params.len());

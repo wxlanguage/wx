@@ -41,12 +41,11 @@ pub func hex<M: Memory>(buffer: M::*[u8], value: u32) -> M::&[u8] {
     local at = loop (mut at = buffer.len(), value = value) {
         at -= 1;
         local digit = value % 16;
-        buffer[at]
-            = transmute(if (digit < 10) {
-                '0' + digit
-            } else {
-                'a' + digit - 10
-            });
+        buffer[at] = transmute(if (digit < 10) {
+            '0' + digit
+        } else {
+            'a' + digit - 10
+        });
         local rest = value / 16;
         if (rest == 0) { break at };
         (at, rest)

@@ -67,7 +67,7 @@ func decide(packet: host::io::&[u8]) -> Verdict {
             if (table[i + 3] == 1) { break Verdict::Accept };
             break Verdict::Drop;
         }
-        continue(i + RULE_LEN);
+        continue i + RULE_LEN;
     }
 }
 

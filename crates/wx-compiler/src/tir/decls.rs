@@ -3844,6 +3844,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 			| ast::Item::PackageFunction {
 				signature, pub_at, ..
 			} => {
+				let signature = ast.signature(*signature);
 				let func_index = FunctionIdx::new(
 					u32::try_from(self.functions.len()).unwrap(),
 				);
@@ -4351,6 +4352,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						self.scan_attributes(file_id, target, attributes);
 					let (member, key) = match item {
 						ast::TraitItem::Function { signature, .. } => {
+							let signature = ast.signature(*signature);
 							let params = self.scan_impl_function_params(
 								file_id,
 								signature.params,
@@ -4591,6 +4593,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						ast::ImplItem::Function {
 							signature, pub_at, ..
 						} => {
+							let signature = ast.signature(*signature);
 							let params = self.scan_impl_function_params(
 								file_id,
 								signature.params,
@@ -4841,6 +4844,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						ast::ImportDeclaration::Function {
 							signature, ..
 						} => {
+							let signature = ast.signature(*signature);
 							let params = self.scan_free_function_params(
 								file_id,
 								signature.params,
@@ -5089,6 +5093,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 						self.scan_attributes(file_id, target, attributes);
 					let (member, key) = match item {
 						ast::ImplItem::Function { signature, .. } => {
+							let signature = ast.signature(*signature);
 							let params = self.scan_impl_function_params(
 								file_id,
 								signature.params,

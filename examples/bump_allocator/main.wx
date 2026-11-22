@@ -23,10 +23,8 @@ global mut bump: u32 = 4;
 // ── core allocator ────────────────────────────────────────────────────────────
 // Allocates space for one T, respecting its alignment.
 pub func alloc<T: StackValue>() -> heap::*T {
-    local ptr =
-        RawPtr::<heap, T>::from_addr(bump.get()).align_up(
-            align_of::<T, heap>(),
-        );
+    local ptr = RawPtr::<heap, T>::from_addr(bump.get())
+        .align_up(align_of::<T, heap>());
     local new_end = ptr.addr() + size_of::<T, heap>();
     local cur_end = heap.size_bytes();
     if (new_end > cur_end) {

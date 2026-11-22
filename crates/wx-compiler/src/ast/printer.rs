@@ -152,14 +152,20 @@ impl<'a> Printer<'a> {
 				"func",
 				pub_at,
 				attributes,
-				&signature,
+				self.ast.signature(signature),
 				Some(block),
 			),
 			Item::FunctionDeclaration {
 				pub_at,
 				attributes,
 				signature,
-			} => self.function("func", pub_at, attributes, &signature, None),
+			} => self.function(
+				"func",
+				pub_at,
+				attributes,
+				self.ast.signature(signature),
+				None,
+			),
 			Item::PackageFunction {
 				pub_at,
 				attributes,
@@ -169,7 +175,7 @@ impl<'a> Printer<'a> {
 				"package-func",
 				pub_at,
 				attributes,
-				&signature,
+				self.ast.signature(signature),
 				None,
 			),
 			Item::PackageConst {
@@ -288,6 +294,7 @@ impl<'a> Printer<'a> {
 				type_params,
 				target,
 				items,
+				..
 			} => Sexp::head(
 				"impl",
 				[Sexp::atom(self.type_path(target.segments))]
@@ -305,6 +312,7 @@ impl<'a> Printer<'a> {
 				trait_name,
 				target,
 				items,
+				..
 			} => Sexp::head(
 				"impl",
 				[
@@ -327,6 +335,7 @@ impl<'a> Printer<'a> {
 				name,
 				type_params,
 				fields,
+				..
 			} => Sexp::head(
 				"struct",
 				self.visibility(pub_at)
@@ -458,6 +467,7 @@ impl<'a> Printer<'a> {
 				type_params,
 				body,
 				attributes,
+				..
 			} => Sexp::head(
 				"type",
 				self.visibility(pub_at)
@@ -481,7 +491,7 @@ impl<'a> Printer<'a> {
 				"func",
 				pub_at,
 				attributes,
-				&signature,
+				self.ast.signature(signature),
 				Some(block),
 			),
 			ImplItem::Constant {
@@ -521,7 +531,13 @@ impl<'a> Printer<'a> {
 				attributes,
 				signature,
 				body,
-			} => self.function("func", None, attributes, &signature, body),
+			} => self.function(
+				"func",
+				None,
+				attributes,
+				self.ast.signature(signature),
+				body,
+			),
 			TraitItem::Const {
 				name,
 				attributes,
@@ -675,9 +691,10 @@ impl<'a> Printer<'a> {
 				match declaration {
 					ImportDeclaration::Function { signature } => Sexp::head(
 						"func",
-						external
-							.into_iter()
-							.chain(self.signature(&signature, List::EMPTY)),
+						external.into_iter().chain(self.signature(
+							self.ast.signature(signature),
+							List::EMPTY,
+						)),
 					),
 					ImportDeclaration::Global { mut_at, name, ty } => {
 						Sexp::head(
@@ -783,7 +800,9 @@ impl<'a> Printer<'a> {
 	) -> Sexp {
 		let Block { statements, tail } = self.ast.block(block);
 		let header = header.map(|header| {
-			let LoopHeader { params, initials } = self.ast.loop_header(header);
+			let LoopHeader {
+				params, initials, ..
+			} = self.ast.loop_header(header);
 			let params = (self.ast.list(params).iter())
 				.zip(self.ast.list(initials))
 				.map(|(param, &initial)| {
@@ -1100,7 +1119,7 @@ impl<'a> Printer<'a> {
 					elements => format!("({})", self.types(elements)),
 				}
 			}
-			TypeExpression::Function { params, result } => {
+			TypeExpression::Function { params, result, .. } => {
 				let params = self
 					.ast
 					.list(params)

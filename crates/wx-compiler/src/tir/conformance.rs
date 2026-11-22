@@ -1476,7 +1476,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				else {
 					unreachable!("a trait's function")
 				};
-				signature
+				*ast.signature(signature)
 			}
 			AstNodeRef::TraitImplFunction { item, .. } => {
 				let ast::ImplItem::Function { signature, .. } =
@@ -1484,7 +1484,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				else {
 					unreachable!("a trait impl's function")
 				};
-				signature
+				*ast.signature(signature)
 			}
 			_ => unreachable!("a trait's or a trait impl's function"),
 		}

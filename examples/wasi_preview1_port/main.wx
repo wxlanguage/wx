@@ -342,9 +342,8 @@ struct SubscriptionU(tag: Eventtype, clock: SubscriptionClock);
 func subscription_u_as_fd_readwrite(
     u: heap::*SubscriptionU,
 ) -> heap::*SubscriptionFdReadwrite {
-    RawPtr::<heap, SubscriptionFdReadwrite>::from_addr(
-        address(u.clock.&),
-    ).as_ptr()
+    RawPtr::<heap, SubscriptionFdReadwrite>::from_addr(address(u.clock.&))
+        .as_ptr()
 }
 
 // ── `$subscription` ──────────────────────────────────────────────────────────
@@ -679,7 +678,8 @@ func main() {
 
     // clock_time_get: a plain scalar (u64) out-param.
     local time_ptr = alloc.allocate_value::<u64>(0);
-    if (wasi::clock_time_get(ClockId::Monotonic, 0, time_ptr) != Errno::Success) {
+    if (wasi::clock_time_get(ClockId::Monotonic, 0, time_ptr)
+        != Errno::Success) {
         trap()
     }
     write_all(Fd::Stdout, "clock_time_get: ok\n");
@@ -723,8 +723,7 @@ func main() {
         fd_readwrite: EventFdReadwrite{ nbytes: 0, flags: 0 },
     });
     local nevents_ptr = alloc.allocate_value::<u32>(0);
-    local poll_result =
-        wasi::poll_oneoff(sub_ptr.*.&, event_ptr, 1, nevents_ptr);
+    local poll_result = wasi::poll_oneoff(sub_ptr, event_ptr, 1, nevents_ptr);
     write_all(Fd::Stdout, "poll_oneoff: errno=");
     write_decimal(Fd::Stdout, transmute(poll_result));
     write_all(Fd::Stdout, " nevents=");

@@ -199,7 +199,7 @@ pub func slice_from_parts<Mem: Memory, T: StackValue>(
     data: Mem::&T,
     len: Mem::Size,
 ) -> Mem::&[T] {
-    transmute((data, len))
+    transmute(data, len)
 }
 
 /// The exclusive slice of `len` values starting at `data`.
@@ -208,7 +208,7 @@ pub func slice_from_parts_mut<Mem: Memory, T: StackValue>(
     data: Mem::*T,
     len: Mem::Size,
 ) -> Mem::*[T] {
-    transmute((data, len))
+    transmute(data, len)
 }
 
 /// The array of the one value `data` points at.
@@ -2278,23 +2278,17 @@ impl<Mem: Memory, T: StackValue> RawPtr<Mem, T> {
     pub func as_ptr(self: Self) -> Mem::*T {
         transmute(self.addr)
     }
-}
 
-impl<Mem: Memory where { Size: Sub }, T> RawPtr<Mem, T> {
     #[inline]
     pub func sub(self: Self, count: Mem::Size) -> Self {
         Self{ addr: self.addr - count * size_of::<T, Mem>() }
     }
-}
 
-impl<Mem: Memory where { Size: Add }, T> RawPtr<Mem, T> {
     #[inline]
     pub func add(self: Self, count: Mem::Size) -> Self {
         Self{ addr: self.addr + count * size_of::<T, Mem>() }
     }
-}
 
-impl<Mem: Memory where { Size: BitAnd + BitNot }, T> RawPtr<Mem, T> {
     /// Rounds `addr` up to the next multiple of `align`.
     /// **`align` must be a power of two.**
     #[inline]

@@ -368,6 +368,8 @@ pub struct NamedArgument {
 pub struct LoopHeader {
 	pub params: List<FunctionParam>,
 	pub initials: List<ExprId>,
+	/// The parentheses, `(` through `)`.
+	pub span: TextSpan,
 }
 
 /// One arm of a `match` expression: `{pattern} => { ... }` or
@@ -627,6 +629,8 @@ pub enum TypeExpression {
 	/// `func(i32, i32) -> i32`
 	Function {
 		params: List<FunctionTypeParam>,
+		/// The parentheses, `(` through `)`.
+		params_span: TextSpan,
 		result: Option<TypeId>,
 	},
 	/// `*u8` or `&u8`; `heap::*u8` names the memory it points into, and
@@ -873,7 +877,7 @@ pub enum ImplItem {
 	Function {
 		pub_at: Option<TextOffset>,
 		attributes: List<Attribute>,
-		signature: FunctionSignature,
+		signature: SignatureId,
 		block: BlockId,
 	},
 	Constant {
@@ -901,7 +905,7 @@ pub enum TraitItem {
 	/// A method with an optional default body.
 	Function {
 		attributes: List<Attribute>,
-		signature: FunctionSignature,
+		signature: SignatureId,
 		/// `None` = abstract (must be provided by impl); `Some` = default
 		/// implementation.
 		body: Option<BlockId>,
@@ -971,7 +975,11 @@ pub struct FunctionSignature {
 	pub name: Spanned<SymbolU32>,
 	/// Generic type parameters `<T, U: Bound>`. Empty = monomorphic.
 	pub type_params: List<TypeParam>,
+	/// `<` through `>`, when written.
+	pub type_params_span: Option<TextSpan>,
 	pub params: List<FunctionParam>,
+	/// The parentheses, `(` through `)`.
+	pub params_span: TextSpan,
 	pub result: Option<TypeId>,
 }
 
@@ -1030,7 +1038,7 @@ impl ExportEntry {
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub enum ImportDeclaration {
 	Function {
-		signature: FunctionSignature,
+		signature: SignatureId,
 	},
 	Global {
 		mut_at: Option<TextOffset>,
@@ -1072,20 +1080,20 @@ pub enum Item {
 	Function {
 		pub_at: Option<TextOffset>,
 		attributes: List<Attribute>,
-		signature: FunctionSignature,
+		signature: SignatureId,
 		block: BlockId,
 	},
 	FunctionDeclaration {
 		pub_at: Option<TextOffset>,
 		attributes: List<Attribute>,
-		signature: FunctionSignature,
+		signature: SignatureId,
 	},
 	/// A package contract member whose implementation is supplied externally.
 	PackageFunction {
 		pub_at: Option<TextOffset>,
 		package_at: TextOffset,
 		attributes: List<Attribute>,
-		signature: FunctionSignature,
+		signature: SignatureId,
 	},
 	PackageConst {
 		pub_at: Option<TextOffset>,
@@ -1100,6 +1108,8 @@ pub enum Item {
 		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		type_params: List<TypeParam>,
+		/// `<` through `>`, when written.
+		type_params_span: Option<TextSpan>,
 	},
 	Global {
 		pub_at: Option<TextOffset>,
@@ -1137,12 +1147,16 @@ pub enum Item {
 	/// `impl Type { ... }`
 	InherentImpl {
 		type_params: List<TypeParam>,
+		/// `<` through `>`, when written.
+		type_params_span: Option<TextSpan>,
 		target: Path,
 		items: List<ImplItem>,
 	},
 	/// `impl Trait for Type { ... }` / `impl<T> Trait for Type<T> { ... }`
 	TraitImpl {
 		type_params: List<TypeParam>,
+		/// `<` through `>`, when written.
+		type_params_span: Option<TextSpan>,
 		/// Plain path to the trait, e.g. `module::Trait`.
 		trait_name: Path,
 		target: Path,
@@ -1157,6 +1171,8 @@ pub enum Item {
 		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
 		type_params: List<TypeParam>,
+		/// `<` through `>`, when written.
+		type_params_span: Option<TextSpan>,
 		fields: List<StructField>,
 	},
 	Memory {
@@ -1225,6 +1241,8 @@ pub enum Item {
 		pub_at: Option<TextOffset>,
 		name: Spanned<SymbolU32>,
 		type_params: List<TypeParam>,
+		/// `<` through `>`, when written.
+		type_params_span: Option<TextSpan>,
 		body: Option<TypeId>,
 		attributes: List<Attribute>,
 	},
@@ -1376,6 +1394,10 @@ index_newtype!(
 index_newtype!(
 	/// A loop's state, in its file's [`AST`].
 	LoopHeaderId
+);
+index_newtype!(
+	/// A function's signature, in its file's [`AST`].
+	SignatureId
 );
 index_newtype!(
 	/// A pattern, in its file's [`AST`].
@@ -1606,6 +1628,7 @@ pub struct AST {
 	blocks: Column<Block>,
 	qualified_roots: Box<[QualifiedPathRoot]>,
 	loop_headers: Box<[LoopHeader]>,
+	signatures: Box<[FunctionSignature]>,
 	segments: Box<[PathSegment]>,
 	type_args: Box<[TypeArgument]>,
 	type_lists: Box<[TypeId]>,
@@ -1645,6 +1668,7 @@ struct AstBuilder {
 	blocks: ColumnBuilder<Block>,
 	qualified_roots: Vec<QualifiedPathRoot>,
 	loop_headers: Vec<LoopHeader>,
+	signatures: Vec<FunctionSignature>,
 	segments: Vec<PathSegment>,
 	type_args: Vec<TypeArgument>,
 	type_lists: Vec<TypeId>,
@@ -1685,6 +1709,7 @@ impl AstBuilder {
 			blocks: self.blocks.finish(),
 			qualified_roots: self.qualified_roots.into_boxed_slice(),
 			loop_headers: self.loop_headers.into_boxed_slice(),
+			signatures: self.signatures.into_boxed_slice(),
 			segments: self.segments.into_boxed_slice(),
 			type_args: self.type_args.into_boxed_slice(),
 			type_lists: self.type_lists.into_boxed_slice(),
@@ -1763,6 +1788,13 @@ impl AstBuilder {
 		let id =
 			LoopHeaderId::new(u32::try_from(self.loop_headers.len()).unwrap());
 		self.loop_headers.push(header);
+		id
+	}
+
+	fn push_signature(&mut self, signature: FunctionSignature) -> SignatureId {
+		let id =
+			SignatureId::new(u32::try_from(self.signatures.len()).unwrap());
+		self.signatures.push(signature);
 		id
 	}
 
@@ -1934,6 +1966,10 @@ impl AST {
 
 	pub fn loop_header(&self, id: LoopHeaderId) -> LoopHeader {
 		self.loop_headers[usize::from(id)]
+	}
+
+	pub fn signature(&self, id: SignatureId) -> &FunctionSignature {
+		&self.signatures[usize::from(id)]
 	}
 
 	pub fn list<T: Listed>(&self, list: List<T>) -> &[T] {

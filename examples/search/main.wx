@@ -13,8 +13,8 @@ func find<M: Memory>(text: M::&[u8], pattern: M::&[u8]) -> (Bool, M::Size) {
         if (start + pattern.len() > text.len()) { break (False, 0) };
         loop (k: M::Size = 0) {
             if (k == pattern.len()) { break :outer (True, start) };
-            if (text[start + k] != pattern[k]) { continue :outer(start + 1) };
-            continue(k + 1);
+            if (text[start + k] != pattern[k]) { continue :outer start + 1 };
+            continue k + 1;
         }
     }
 }

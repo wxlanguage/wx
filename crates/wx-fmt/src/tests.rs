@@ -39,6 +39,38 @@ impl TestCase {
 }
 
 #[test]
+fn absent_documents_do_not_allocate_nodes() {
+	let mut arena = Arena::new();
+	let node = arena.texts[Text::Space as usize];
+	let node_count = arena.nodes.len();
+	let child_count = arena.children.len();
+
+	assert_eq!(arena.concat_optional(&[]), None);
+	assert_eq!(arena.concat_optional(&[node]), Some(node));
+	assert_eq!(arena.append(node, None), node);
+	assert_eq!(arena.prepend(None, node), node);
+	assert_eq!(arena.nodes.len(), node_count);
+	assert_eq!(arena.children.len(), child_count);
+}
+
+#[test]
+fn optional_node_ids_keep_the_compact_index_representation() {
+	assert_eq!(std::mem::size_of::<NodeId>(), std::mem::size_of::<u32>());
+	assert_eq!(
+		std::mem::size_of::<Option<NodeId>>(),
+		std::mem::size_of::<NodeId>()
+	);
+	assert_eq!(NodeId::from_index(0).index(), 0);
+	assert_eq!(NodeId::from_index(42).index(), 42);
+}
+
+#[test]
+fn empty_files_have_no_document_content() {
+	assert_eq!(checked_format("", 80, 4), "");
+	assert_eq!(checked_format(" \n\t", 80, 4), "");
+}
+
+#[test]
 fn test_format_simple_function() {
 	let case = TestCase::new(indoc! {"
         func add(a: i32, b: i32) -> i32 {
@@ -1262,7 +1294,7 @@ fn test_format_call_args_wrap() {
         "},
 	);
 
-	// Long method call wraps the same way.
+	// An isolated method call keeps its callee attached and wraps arguments.
 	assert_eq!(
 		fmt(
 			"func f() { obj.render(food_x * CELL_SIZE, food_y * CELL_SIZE, CELL_SIZE, CELL_SIZE, 0xFFFFFF00); }"
@@ -1278,6 +1310,339 @@ fn test_format_call_args_wrap() {
                 );
             }
         "},
+	);
+}
+
+#[test]
+fn short_method_chains_stay_inline_and_long_chains_break_before_each_method() {
+	assert_formatted_body(
+		"local value = source.read().finish();",
+		"local value = source.read().finish();",
+	);
+	assert_eq!(
+		checked_format(
+			"func f() { local value = source.decode::<Packet>().validate().finish(); }",
+			48,
+			4,
+		),
+		indoc! {"
+			func f() {
+			    local value = source
+			        .decode::<Packet>()
+			        .validate()
+			        .finish();
+			}
+		"},
+	);
+}
+
+#[test]
+fn methods_in_a_broken_chain_can_also_break_their_arguments() {
+	assert_eq!(
+		checked_format(
+			"func f() { local result = source.payload.transform(first_long_argument, second_long_argument).finish(); }",
+			48,
+			4,
+		),
+		indoc! {"
+			func f() {
+			    local result = source.payload
+			        .transform(
+			            first_long_argument,
+			            second_long_argument,
+			        )
+			        .finish();
+			}
+		"},
+	);
+}
+
+#[test]
+fn a_method_chains_receiver_can_break_its_own_arguments() {
+	assert_eq!(
+		checked_format(
+			"func f() { local result = make_source(first_long_argument, second_long_argument).finish(); }",
+			48,
+			4,
+		),
+		indoc! {"
+			func f() {
+			    local result = make_source(
+			        first_long_argument,
+			        second_long_argument,
+			    )
+			        .finish();
+			}
+		"},
+	);
+}
+
+#[test]
+fn assignment_calls_break_their_arguments_before_leaving_the_assignment_line() {
+	assert_eq!(
+		checked_format(
+			indoc! {"
+				func f() {
+				    local value = transform(first_very_long_argument, second_very_long_argument);
+				    _ = transform(first_very_long_argument, second_very_long_argument) + more_adjustments;
+				    local bytes = width * height + first_adjustment + second_adjustment;
+				}
+			"},
+			48,
+			4,
+		),
+		indoc! {"
+			func f() {
+			    local value = transform(
+			        first_very_long_argument,
+			        second_very_long_argument,
+			    );
+			    _ = transform(
+			        first_very_long_argument,
+			        second_very_long_argument,
+			    )
+			        + more_adjustments;
+			    local bytes = width * height
+			        + first_adjustment
+			        + second_adjustment;
+			}
+		"},
+	);
+}
+
+#[test]
+fn allocator_assignments_keep_their_call_and_receiver_chain_attached() {
+	assert_eq!(
+		checked_format(
+			indoc! {"
+				func alloc<T: StackValue>() -> heap::*T {
+				    local ptr = RawPtr::<heap, T>::from_addr(bump.get()).align_up(align_of::<T, heap>());
+				    if (new_end > cur_end) {
+				        _ = heap.grow((new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE);
+				    }
+				    ptr.as_ptr()
+				}
+			"},
+			80,
+			4,
+		),
+		indoc! {"
+			func alloc<T: StackValue>() -> heap::*T {
+			    local ptr = RawPtr::<heap, T>::from_addr(bump.get())
+			        .align_up(align_of::<T, heap>());
+			    if (new_end > cur_end) {
+			        _ = heap.grow(
+			            (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE,
+			        );
+			    }
+			    ptr.as_ptr()
+			}
+		"},
+	);
+}
+
+#[test]
+fn assignment_values_break_inside_the_rhs_before_leaving_the_assignment_line() {
+	assert_eq!(
+		checked_format(
+			indoc! {"
+				func f() {
+				    _ = heap.grow(needed) + first_adjustment + second_adjustment;
+				    total += first_adjustment + second_adjustment + third_adjustment;
+				    local result = first_adjustment + second_adjustment + third_adjustment;
+				}
+			"},
+			48,
+			4,
+		),
+		indoc! {"
+			func f() {
+			    _ = heap.grow(needed)
+			        + first_adjustment
+			        + second_adjustment;
+			    total += first_adjustment
+			        + second_adjustment
+			        + third_adjustment;
+			    local result = first_adjustment
+			        + second_adjustment
+			        + third_adjustment;
+			}
+		"},
+	);
+}
+
+#[test]
+fn assignment_values_can_still_break_after_equals_when_the_first_operand_does_not_fit()
+ {
+	assert_eq!(
+		checked_format(
+			"func f() { very_long_destination = initial_value + additional_value; }",
+			32,
+			4,
+		),
+		indoc! {"
+			func f() {
+			    very_long_destination =
+			        initial_value
+			        + additional_value;
+			}
+		"},
+	);
+}
+
+#[test]
+fn assignment_values_move_below_equals_only_when_they_fit_there_whole() {
+	assert_eq!(
+		checked_format(
+			indoc! {"
+				func f() {
+				    local (address, _) = transmute::<P, (P::Memory::Size, P::Metadata)>(pointer);
+				    local result = transform(first_long_argument, second_long_argument, third);
+				    total = first_value + second_value + third_value + fourth_value;
+				    local ptr = RawPtr::<heap, T>::from_addr(bump.get()).align_up(align_of::<T, heap>());
+				}
+			"},
+			64,
+			4,
+		),
+		indoc! {"
+			func f() {
+			    local (address, _) =
+			        transmute::<P, (P::Memory::Size, P::Metadata)>(pointer);
+			    local result = transform(
+			        first_long_argument,
+			        second_long_argument,
+			        third,
+			    );
+			    total =
+			        first_value + second_value + third_value + fourth_value;
+			    local ptr = RawPtr::<heap, T>::from_addr(bump.get())
+			        .align_up(align_of::<T, heap>());
+			}
+		"},
+	);
+}
+
+#[test]
+fn a_value_below_equals_counts_its_terminator_against_the_width() {
+	let source = "func f() { local value = compute(first_argument, second); }";
+	assert_eq!(
+		checked_format(source, 40, 4),
+		indoc! {"
+			func f() {
+			    local value =
+			        compute(first_argument, second);
+			}
+		"},
+	);
+	assert_eq!(
+		checked_format(source, 39, 4),
+		indoc! {"
+			func f() {
+			    local value = compute(
+			        first_argument,
+			        second,
+			    );
+			}
+		"},
+	);
+}
+
+#[test]
+fn a_commented_value_does_not_move_below_equals() {
+	let source = indoc! {"
+		func f() {
+		    local value = transform(first, // why
+		        second);
+		}
+	"};
+	assert_eq!(
+		checked_format(source, 80, 4),
+		indoc! {"
+			func f() {
+			    local value = transform(
+			        first, // why
+			        second,
+			    );
+			}
+		"},
+	);
+}
+
+#[test]
+fn singleton_conditions_hug_their_expression_without_list_indentation_or_comma()
+{
+	assert_eq!(
+		checked_format(
+			"func f() { if ((table[i] == 0 || table[i] == protocol) && be16(table, i + 1) == port) { accept(); } }",
+			60,
+			4,
+		),
+		indoc! {"
+			func f() {
+			    if ((table[i] == 0 || table[i] == protocol)
+			        && be16(table, i + 1) == port) {
+			        accept();
+			    }
+			}
+		"},
+	);
+}
+
+#[test]
+fn singleton_match_subjects_use_the_same_hanging_expression_layout() {
+	assert_eq!(
+		checked_format(
+			"func f() { match (first_long_subject_value + second_long_subject_value) { _ => done() } }",
+			40,
+			4,
+		),
+		indoc! {"
+			func f() {
+			    match (first_long_subject_value
+			        + second_long_subject_value) {
+			        _ => done(),
+			    }
+			}
+		"},
+	);
+}
+
+#[test]
+fn multiple_subjects_and_subject_comments_keep_list_layout() {
+	assert_eq!(
+		checked_format(
+			"func f() { match (first_long_subject_value, second_long_subject_value) { _ => done() } }",
+			40,
+			4,
+		),
+		indoc! {"
+			func f() {
+			    match (
+			        first_long_subject_value,
+			        second_long_subject_value,
+			    ) {
+			        _ => done(),
+			    }
+			}
+		"},
+	);
+	assert_eq!(
+		checked_format(
+			"func f() { if (// condition\nready) { accept(); } }",
+			40,
+			4,
+		),
+		indoc! {"
+			func f() {
+			    if (
+			        // condition
+			        ready,
+			    ) {
+			        accept();
+			    }
+			}
+		"},
 	);
 }
 
@@ -1308,8 +1673,7 @@ fn test_format_local_definition_wraps() {
         "},
 	);
 
-	// Long non-block-like value: breaks after =, value indented on next line.
-	// Using FB_WIDTH (a named constant) makes the expression exceed 80 cols.
+	// A long binary value that fits whole on the next line moves there.
 	assert_eq!(
 		fmt(
 			"memory heap: Memory32; func set_pixel(x: u32, y: u32) { local base: heap::*u8 = fb_ptr() + (y * FB_WIDTH + x) * BYTES_PER_PIXEL + HEADER_SIZE; }"
@@ -2697,7 +3061,8 @@ fn checked_format(source: &str, width: u32, indent: u8) -> String {
 
 /// Compares the roles of two trees' nested blocks, the source's (`a`) and
 /// its formatted output's (`b`): each block keeps its statements and its
-/// tail, while redundant `else { if .. }` wrappers may become `else if ..`.
+/// tail. Singleton tuples may disappear, and redundant `else { if .. }`
+/// wrappers may become `else if ..`; operators and tuple boundaries stay.
 struct Roles<'t> {
 	a: &'t ast::AST,
 	b: &'t ast::AST,
@@ -2741,9 +3106,61 @@ impl Roles<'_> {
 
 	fn expr(&self, a: ast::ExprId, b: ast::ExprId) {
 		use ast::Expression as E;
+		fn ungroup(ast: &ast::AST, mut expression: ast::ExprId) -> ast::ExprId {
+			while let E::Tuple { elements } = ast.expr(expression) {
+				let &[inner] = ast.list(elements) else { break };
+				expression = inner;
+			}
+			expression
+		}
+		let (a, b) = (ungroup(self.a, a), ungroup(self.b, b));
 		let (ea, eb) = (self.a.expr(a), self.b.expr(b));
 		assert_eq!(std::mem::discriminant(&ea), std::mem::discriminant(&eb));
 		match (ea, eb) {
+			(
+				E::Binary {
+					left: al,
+					operator: ao,
+					right: ar,
+					..
+				},
+				E::Binary {
+					left: bl,
+					operator: bo,
+					right: br,
+					..
+				},
+			) => {
+				assert_eq!(ao, bo, "operator changed");
+				self.expr(al, bl);
+				self.expr(ar, br);
+			}
+			(
+				E::Unary {
+					operator: ao,
+					operand: a,
+				},
+				E::Unary {
+					operator: bo,
+					operand: b,
+				},
+			) => {
+				assert_eq!(ao, bo);
+				self.expr(a, b);
+			}
+			(E::Tuple { elements: a }, E::Tuple { elements: b }) => {
+				let (a, b) = (self.a.list(a), self.b.list(b));
+				assert_eq!(a.len(), b.len(), "tuple boundaries changed");
+				for (&a, &b) in a.iter().zip(b) {
+					self.expr(a, b);
+				}
+			}
+			(
+				E::Ascription { value: a, .. },
+				E::Ascription { value: b, .. },
+			) => {
+				self.expr(a, b);
+			}
 			(E::Block { block: a, .. }, E::Block { block: b, .. }) => {
 				self.block(a, b)
 			}
@@ -2787,6 +3204,16 @@ impl Roles<'_> {
 					else_block: be,
 				},
 			) => {
+				assert_eq!(
+					std::mem::discriminant(&self.a.expr(a)),
+					std::mem::discriminant(&self.b.expr(b)),
+					"call changed between positional and named arguments",
+				);
+				assert_eq!(
+					matches!(self.a.expr(ac), E::ObjectAccess { .. }),
+					matches!(self.b.expr(bc), E::ObjectAccess { .. }),
+					"field-value call changed to or from a method call",
+				);
 				self.expr(ac, bc);
 				self.block(at, bt);
 				assert_eq!(ae.is_some(), be.is_some());
@@ -2862,6 +3289,21 @@ impl Roles<'_> {
 				E::ObjectAccess { object: a, .. },
 				E::ObjectAccess { object: b, .. },
 			) => self.expr(a, b),
+			(E::Deref { pointer: a }, E::Deref { pointer: b })
+			| (E::AddressOf { value: a }, E::AddressOf { value: b }) => self.expr(a, b),
+			(
+				E::Index {
+					object: a,
+					index: ai,
+				},
+				E::Index {
+					object: b,
+					index: bi,
+				},
+			) => {
+				self.expr(a, b);
+				self.expr(ai, bi);
+			}
 			(
 				E::Return { value: a } | E::Break { value: a, .. },
 				E::Return { value: b } | E::Break { value: b, .. },
@@ -3747,7 +4189,7 @@ fn test_format_current_syntax_forms() {
 // }
 
 /// A tuple of one is its element, so a type or a pattern is printed as the
-/// element; an expression keeps the parentheses, which may group it.
+/// element; an expression keeps parentheses only when they still group it.
 #[test]
 fn test_format_one_element_tuple_as_its_element() {
 	let case = TestCase::new(indoc! {"
@@ -3770,7 +4212,7 @@ fn test_format_one_element_tuple_as_its_element() {
 		output,
 		indoc! {"
             func f(x: u8, w: u16) -> u8 {
-                local y = (x);
+                local y = x;
                 local z = y;
                 z
             }
@@ -3855,6 +4297,198 @@ fn ascriptions_and_labels_are_printed_as_written() {
 	}
 }
 
+/// Check a body fragment without repeating the surrounding function.
+/// `checked_format` also checks reparsing, structure, and idempotence.
+fn assert_formatted_body(source: &str, expected: &str) {
+	assert_eq!(
+		checked_format(&format!("func test() {{ {source} }}"), 80, 4),
+		format!("func test() {{\n    {expected}\n}}\n"),
+		"{source}",
+	);
+}
+
+#[test]
+fn singleton_value_wrappers_are_removed() {
+	for (source, expected) in [
+		("((x))", "x"),
+		("(x,)", "x"),
+		("continue (x + 1)", "continue x + 1"),
+		("return (f(x))", "return f(x)"),
+		("break (x)", "break x"),
+		("local y = (a + b);", "local y = a + b;"),
+		("(())", "()"),
+	] {
+		assert_formatted_body(source, expected);
+	}
+}
+
+#[test]
+fn a_sole_tuple_supplies_the_positional_call_list() {
+	for (source, expected) in [
+		("f((x))", "f(x)"),
+		("transmute((data, len))", "transmute(data, len)"),
+		("f(())", "f()"),
+		// Only the whole argument list is flattened, not tuples within it.
+		("f(x, (a, b))", "f(x, (a, b))"),
+		("f((a, (b, c)))", "f(a, (b, c))"),
+	] {
+		assert_formatted_body(source, expected);
+	}
+}
+
+#[test]
+fn removing_parentheses_keeps_ascriptions_on_the_same_value() {
+	for (source, expected) in [
+		// A call already provides delimiters for an element's ascription.
+		("f((x: u32))", "f(x: u32)"),
+		("f((a: u32, b))", "f(a: u32, b)"),
+		// Ascribing the whole tuple must not become ascribing one element.
+		("f(((a, b): Pair))", "f((a, b): Pair)"),
+		// Outside a list, the ascription still needs its own parentheses.
+		("((x: u32))", "(x: u32)"),
+	] {
+		assert_formatted_body(source, expected);
+	}
+}
+
+/// Preserve written operator grouping, even when precedence or
+/// associativity would make it optional. Only duplicate layers disappear.
+#[test]
+fn operator_grouping_is_preserved() {
+	assert_formatted_body("((a + b)) * c", "(a + b) * c");
+	for source in [
+		"(a + b) + c",
+		"a + (b * c)",
+		"a - (b - c)",
+		// Ungrouped comparisons and assignments would be invalid chains.
+		"(a == b) == c",
+		"x = (y = z)",
+		"-(a + b)",
+		// Removing this pair would change the value being returned.
+		"(return x) + y",
+	] {
+		assert_formatted_body(source, source);
+	}
+}
+
+#[test]
+fn callee_and_receiver_parentheses_preserve_syntax_and_dispatch() {
+	for (source, expected) in [
+		// A field-value call must not become a method call.
+		("((object.field))(x)", "(object.field)(x)"),
+		// The dot must not be consumed as part of a floating-point literal.
+		("(1).method()", "(1).method()"),
+		// Block-like expressions require grouping when used as operands.
+		(
+			"(if (c) { f } else { g })(x)",
+			"(if (c) { f } else { g })(x)",
+		),
+		("((a + b))[i]", "(a + b)[i]"),
+		// Simple receivers do not need grouping.
+		("(x).field", "x.field"),
+		("(p).*", "p.*"),
+		("(x).&", "x.&"),
+	] {
+		assert_formatted_body(source, expected);
+	}
+}
+
+#[test]
+fn tuple_values_and_named_arguments_keep_their_delimiters() {
+	for source in ["((a, b), c)", "continue (a, b)"] {
+		assert_formatted_body(source, source);
+	}
+	// Keep named arguments distinct from positional values, even when the
+	// positional form will later be rejected by checking.
+	for source in ["continue ({ i })", "continue { i }", "f({})", "f{}"] {
+		assert_formatted_body(source, source);
+	}
+}
+
+#[test]
+fn control_flow_subjects_keep_one_required_pair_of_parentheses() {
+	assert_eq!(
+		checked_format(
+			"func test() { if ((c)) { x }; match ((x)) { _ => y } }",
+			80,
+			4,
+		),
+		indoc! {"
+			func test() {
+			    if (c) { x };
+			    match (x) {
+			        _ => y,
+			    }
+			}
+		"},
+	);
+}
+
+#[test]
+fn redundant_parentheses_keep_wrapper_comments() {
+	for (source, expected) in [
+		// The inner pair owns comments, so it must stay.
+		(
+			"func test() { f((// before\nx // after\n)); }",
+			indoc! {"
+				func test() {
+				    f(
+				        (
+				            // before
+				            x, // after
+				        ),
+				    );
+				}
+			"},
+		),
+		// A comment between tuple elements also prevents call-list flattening.
+		(
+			"func test() { f((a, // between\nb)); }",
+			indoc! {"
+				func test() {
+				    f(
+				        (
+				            a, // between
+				            b,
+				        ),
+				    );
+				}
+			"},
+		),
+		// A comment on the outer call does not protect redundant inner pairs.
+		(
+			"func test() { f(// call\n((x))); }",
+			indoc! {"
+				func test() {
+				    f(
+				        // call
+				        x,
+				    );
+				}
+			"},
+		),
+	] {
+		assert_eq!(checked_format(source, 80, 4), expected);
+	}
+}
+
+#[test]
+fn normalized_parentheses_use_the_same_layout_on_the_first_format() {
+	for expression in [
+		"(f(if (c) { 1 } else { 2 }))",
+		"f((if (c) { 1 } else { 2 }))",
+		"f(((Point{ x, y })))",
+	] {
+		for width in [20, 40, 80] {
+			checked_format(
+				&format!("func test() {{ local y = {expression}; }}"),
+				width,
+				4,
+			);
+		}
+	}
+}
+
 #[test]
 fn a_slot_without_a_type_is_printed_as_written() {
 	assert_eq!(
@@ -3901,11 +4535,14 @@ fn loop_parameters_and_a_continue_value_are_printed_after_their_labels() {
             }
         }
     "};
-	assert_eq!(checked_format(source, 80, 4), source);
+	assert_eq!(
+		checked_format(source, 80, 4),
+		source.replace("continue (i + 1);", "continue i + 1;")
+	);
 	for (source, expected) in [
 		(
 			"loop(i:u32=0){ continue ( i+1 ) }",
-			"loop (i: u32 = 0) { continue (i + 1) }",
+			"loop (i: u32 = 0) { continue i + 1 }",
 		),
 		("loop (i: u32 = 0,) { }", "loop (i: u32 = 0) {}"),
 		// No parameters are no list.
@@ -4185,5 +4822,71 @@ fn an_invalid_format_section_is_reported() {
 			r#"{ "entry": "main.wx", "format": { "indent_width": "wide" } }"#,
 		)
 		.is_err()
+	);
+}
+
+#[test]
+fn comments_in_parameter_lists_are_kept() {
+	let source = indoc! {"
+		func f<
+		    T, // the element
+		    U,
+		>(
+		    a: i32, // first
+		    // about b
+		    b: i32,
+		) {
+		    loop (
+		        i: u32 = 0, // counter
+
+		        j: u32 = 1,
+		    ) {
+		        break;
+		    }
+		}
+	"};
+	assert_eq!(checked_format(source, 80, 4), source);
+}
+
+#[test]
+fn comments_in_type_lists_are_kept() {
+	let source = indoc! {"
+		type F = func(
+		    i32, // first
+		    i32,
+		) -> i32;
+		type T = (
+		    i32, // first
+		    i64,
+		);
+		trait Sized {
+		    type Size;
+		}
+		func f<P: Sized where {
+		    Size = u32, // a wasm32 address
+		}>() {}
+	"};
+	assert_eq!(
+		checked_format(source, 80, 4),
+		indoc! {"
+			type F = func(
+			    i32, // first
+			    i32,
+			) -> i32;
+			type T = (
+			    i32, // first
+			    i64,
+			);
+
+			trait Sized {
+			    type Size;
+			}
+
+			func f<
+			    P: Sized where {
+			        Size = u32, // a wasm32 address
+			    },
+			>() {}
+		"},
 	);
 }

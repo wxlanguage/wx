@@ -187,7 +187,7 @@ fn compilation_units_share_a_caller_owned_interner() {
 		else {
 			panic!("expected a function");
 		};
-		signature.name.inner
+		unit.ast(module.file_id).signature(signature).name.inner
 	}
 
 	let mut strings = Keyword::create_interner();

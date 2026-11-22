@@ -66,7 +66,7 @@ impl TestCase {
 			)
 		};
 
-		signature
+		self.ast.signature(*signature)
 	}
 
 	/// The printer over this file's tree.
@@ -456,7 +456,7 @@ fn test_fn_pointer_param() {
 
 	let param = &case.ast.list(case.function_signature(0).params)[0];
 	let ty = case.ast.ty(param.ty.unwrap());
-	let TypeExpression::Function { params, result } = ty else {
+	let TypeExpression::Function { params, result, .. } = ty else {
 		panic!("expected a function type, got {ty:?}")
 	};
 	assert_eq!(params.len(), 1);
@@ -562,6 +562,7 @@ fn test_impl() {
 	else {
 		panic!("expected a method")
 	};
+	let signature = case.ast.signature(*signature);
 	assert_eq!(case.name(signature.name.inner), "double");
 	assert!(pub_at.is_some(), "`pub func` should record a pub span");
 	assert_eq!(attributes.len(), 1);
@@ -690,6 +691,7 @@ fn test_trait_items() {
 	else {
 		panic!("expected a trait method")
 	};
+	let signature = case.ast.signature(*signature);
 	assert_eq!(case.name(signature.name.inner), "render");
 	assert!(
 		body.is_none(),
@@ -705,6 +707,7 @@ fn test_trait_items() {
 	else {
 		panic!("expected a trait method")
 	};
+	let signature = case.ast.signature(*signature);
 	assert_eq!(case.name(signature.name.inner), "grow");
 	assert!(body.is_some(), "`grow` has a default body");
 	assert_eq!(attributes.len(), 1);
@@ -3415,6 +3418,7 @@ fn test_generic_application_type_args() {
 	let Item::Function { signature, .. } = case.item(1) else {
 		panic!("expected function")
 	};
+	let signature = case.ast.signature(*signature);
 	let param_ty = case.ast.ty(case.ast.list(signature.params)[0].ty.unwrap());
 	let TypeExpression::Path(segments) = param_ty else {
 		panic!("expected a path")
@@ -3441,6 +3445,7 @@ fn test_path_continues_after_a_segment_with_type_args() {
 	let Item::Function { signature, .. } = case.item(0) else {
 		panic!("expected function")
 	};
+	let signature = case.ast.signature(*signature);
 	let param_ty = case.ast.ty(case.ast.list(signature.params)[0].ty.unwrap());
 	let TypeExpression::Path(segments) = param_ty else {
 		panic!("expected a path")
@@ -3475,6 +3480,7 @@ fn test_where_binding_parses_as_bound_with_bindings() {
 	let Item::Function { signature, .. } = case.item(0) else {
 		panic!("expected function")
 	};
+	let signature = case.ast.signature(*signature);
 	let bounds = bounds(&case.ast.list(signature.type_params)[0])
 		.expect("expected bounds");
 	let BoundExpression::WithBindings { path, bindings, .. } =
@@ -3495,6 +3501,7 @@ fn a_constant_binding_is_marked_const() {
 	let Item::Function { signature, .. } = case.item(0) else {
 		panic!("expected function")
 	};
+	let signature = case.ast.signature(*signature);
 	let kinds: Vec<_> = case
 		.ast
 		.list(signature.type_params)
@@ -3534,6 +3541,7 @@ fn self_is_a_type_parameter_name() {
 	else {
 		panic!("expected function")
 	};
+	let signature = case.ast.signature(*signature);
 	assert_eq!(signature.type_params.len(), 2);
 	assert_eq!(
 		case.strings
@@ -3684,6 +3692,7 @@ fn a_missing_bound_keeps_its_owner_and_spans_the_gap() {
 				bound
 			}
 			Item::Function { signature, .. } => {
+				let signature = case.ast.signature(*signature);
 				let bound =
 					bounds(&case.ast.list(signature.type_params)[0]).unwrap();
 				if let BoundExpression::WithBindings { bindings, .. } =
@@ -4137,6 +4146,7 @@ fn a_missing_function_result_keeps_the_body_and_spans_the_gap() {
 			}
 			_ => panic!("expected a function in {source:?}"),
 		};
+		let signature = case.ast.signature(*signature);
 		let result = signature.result.expect("the result annotation survives");
 		assert!(matches!(case.ast.ty(result), TypeExpression::Error));
 		let result = case.ast.type_span(result);
@@ -4253,6 +4263,7 @@ fn test_imported_function_is_a_declaration_without_a_body() {
 	else {
 		panic!("expected an imported function")
 	};
+	let signature = case.ast.signature(*signature);
 	assert_eq!(case.name(signature.name.inner), "log");
 }
 
@@ -4280,6 +4291,7 @@ fn test_bodyless_function_is_a_declaration() {
 			item_kind(case.item(0))
 		)
 	};
+	let signature = case.ast.signature(*signature);
 	assert_eq!(case.name(signature.name.inner), "raw_load");
 	assert_eq!(
 		case.name(case.ast.list(*attributes)[0].name.inner),
@@ -4312,7 +4324,7 @@ fn test_crate_contract_items_parse_and_keep_visibility() {
 	assert!(matches!(
 		case.item(2),
 		Item::PackageFunction { pub_at: Some(_), signature, .. }
-			if case.name(signature.name.inner) == "choose"
+			if case.name(case.ast.signature(*signature).name.inner) == "choose"
 	));
 	assert!(matches!(case.item(3), Item::PackageInstance { .. }));
 }

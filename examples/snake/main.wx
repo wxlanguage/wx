@@ -13,17 +13,15 @@ import "host" as host {
 global mut bump: u32 = 4;
 
 func alloc<T: StackValue>() -> heap::*T {
-    local ptr =
-        RawPtr::<heap, T>::from_addr(bump.get()).align_up(
-            align_of::<T, heap>(),
-        );
+    local ptr = RawPtr::<heap, T>::from_addr(bump.get())
+        .align_up(align_of::<T, heap>());
+
     local new_end = ptr.addr() + size_of::<T, heap>();
     local cur_end = heap.size_bytes();
     if (new_end > cur_end) {
-        _
-            = heap.grow(
-                (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE,
-            );
+        _ = heap.grow(
+            (new_end - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE,
+        );
     }
     bump.set(new_end);
     ptr.as_ptr()
@@ -71,7 +69,7 @@ func pop_back() {
             curr.as_ptr().next = RawPtr::null();
             break;
         }
-        continue (next);
+        continue next;
     }
 }
 
@@ -80,7 +78,7 @@ func contains(x: i32, y: i32) -> Bool {
         if (curr.is_null()) { break False };
         local n = curr.as_ref();
         if (n.x == x && n.y == y) { break True };
-        continue (n.next);
+        continue n.next;
     }
 }
 
