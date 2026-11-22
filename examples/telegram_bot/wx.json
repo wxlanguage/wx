@@ -1,0 +1,7 @@
+{
+    "entry": "main.wx",
+    "dependencies": {
+        "telegram": { "type": "local", "path": "../telegram" },
+        "utf8": { "type": "local", "path": "../utf8" }
+    }
+}

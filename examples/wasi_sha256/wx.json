@@ -1,0 +1,7 @@
+{
+    "entry": "main.wx",
+    "dependencies": {
+        "wasi": { "type": "local", "path": "../wasi" },
+        "sha256": { "type": "local", "path": "../sha256" }
+    }
+}

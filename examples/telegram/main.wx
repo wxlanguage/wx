@@ -1,0 +1,420 @@
+// A small Telegram bot framework for WX.
+//
+// Telegram's Bot API is HTTPS + JSON and WASI Preview 1 has no sockets, so
+// this package starts at the boundary the host can actually provide:
+//
+//   host::io       a host-owned memory: request text in, reply bytes out
+//   random_u32     a seed for the bot's own generator
+//
+// A host adapter polls `getUpdates`, extracts `message.chat.id` and
+// `message.text`, calls `serve_raw`, and sends the returned text back. The
+// framework does the rest in Wasm: command parsing, reply formatting, routing
+// through the application's declarative table, and generated help. It has no
+// commands of its own.
+//
+// There is intentionally no allocator. The host owns the output buffer; the
+// builder writes into it and clamps to its length. Static strings live in the
+// public `text` memory, which applications also use for their own literals.
+// Application state belongs in a memory the application declares itself.
+// Input reaches handlers as raw bytes; applications that need validated text
+// use the separate `utf8` package and its `Str<M>` type.
+//
+// Host ABI (`serve_raw`):
+//
+//   handle(chat_id: i64, input_ptr: i32, input_len: i32,
+//          output_ptr: i32, output_cap: i32) -> i32
+//
+// The return value is the number of reply bytes written at `output_ptr`.
+// Replies are plain text (no `parse_mode`), so there is no markup to escape.
+
+import "host" as host {
+    memory io: u32;
+    /// A seed for the bot's own xorshift generator. The host should use a real
+    /// entropy source; the module only needs 32 bits once, on first use.
+    func random_u32() -> u32;
+}
+
+/// Static strings and application literals. The framework does not export it;
+/// an application that wants its state hidden should declare its own memory.
+pub memory text: u32;
+
+pub type Input = host::io::&[u8];
+pub type Output = host::io::*[u8];
+pub type Text = text::&[u8];
+
+// ── reply buffer ─────────────────────────────────────────────────────────────
+// A by-value builder over host-owned `io`. `len` is the number of bytes the
+// reply *wants*; `written` clamps it to the host's capacity. Nothing here
+// traps on a short buffer.
+pub struct Response(bytes: host::io::*[u8], len: u32);
+
+impl Response {
+    pub func new(bytes: Output) -> Self {
+        Self{ bytes, len: 0 }
+    }
+
+    pub func push(self: Self, byte: u8) -> Self {
+        if (self.len < self.bytes.len()) { self.bytes[self.len] = byte };
+        Self{ bytes: self.bytes, len: self.len + 1 }
+    }
+
+    /// Appends a literal that lives in the framework's `text` memory.
+    pub func text(self: Self, text: Text) -> Self {
+        loop (res = self, i: u32 = 0) {
+            if (i == text.len()) { break res };
+            (res.push(text[i]), i + 1)
+        }
+    }
+
+    /// Appends bytes the host supplied.
+    pub func input(self: Self, text: Input) -> Self {
+        loop (res = self, i: u32 = 0) {
+            if (i == text.len()) { break res };
+            (res.push(text[i]), i + 1)
+        }
+    }
+
+    pub func space(self: Self) -> Self {
+        self.push(' ')
+    }
+
+    pub func newline(self: Self) -> Self {
+        self.push('\n')
+    }
+
+    /// Unsigned decimal, written in place and then reversed.
+    pub func decimal(self: Self, value: u32) -> Self {
+        if (value == 0) { return self.push('0') };
+        local start = self.len;
+        local res = loop (res = self, rest = value) {
+            local digit = rest % 10;
+            local next = res.push(transmute('0' + digit));
+            local more = rest / 10;
+            if (more == 0) { break next };
+            (next, more)
+        };
+        res.reverse_from(start)
+    }
+
+    pub func decimal64(self: Self, value: u64) -> Self {
+        if (value == 0) { return self.push('0') };
+        local start = self.len;
+        local res = loop (res = self, rest = value) {
+            local digit = transmute::<i32, u32>(
+                i32_wrap_i64(transmute::<u64, i64>(rest % 10)),
+            );
+            local next = res.push(transmute('0' + digit));
+            local more = rest / 10;
+            if (more == 0) { break next };
+            (next, more)
+        };
+        res.reverse_from(start)
+    }
+
+    /// Signed decimal for Telegram ids. The magnitude of `i64::MIN` still
+    /// fits in a `u64`.
+    pub func signed64(self: Self, value: i64) -> Self {
+        local (negative, magnitude) = if (value < 0) {
+            (True, 0 - transmute::<i64, u64>(value))
+        } else {
+            (False, transmute::<i64, u64>(value))
+        };
+        local res = if (negative) { self.push('-') } else { self };
+        res.decimal64(magnitude)
+    }
+
+    /// Lowercase hex in `digits` places, as in `U+1F980`.
+    pub func hex_width(self: Self, value: u32, digits: u32) -> Self {
+        loop (res = self, shift: u32 = (digits - 1) * 4) {
+            local digit = (value >> shift) & 15;
+            local next = res.push(hex_digit(digit));
+            if (shift == 0) { break next };
+            (next, shift - 4)
+        }
+    }
+
+    pub func reverse_from(self: Self, start: u32) -> Self {
+        local end = if (self.len > self.bytes.len()) {
+            self.bytes.len()
+        } else {
+            self.len
+        };
+        if (start >= end) { return self };
+        loop (i = start, j = end - 1) {
+            if (i >= j) { break };
+            local tmp = self.bytes[i];
+            self.bytes[i] = self.bytes[j];
+            self.bytes[j] = tmp;
+            (i + 1, j - 1)
+        }
+        self
+    }
+
+    pub func written(self: Self) -> u32 {
+        if (self.len > self.bytes.len()) { self.bytes.len() } else { self.len }
+    }
+}
+
+func hex_digit(nibble: u32) -> u8 {
+    if (nibble < 10) {
+        transmute('0' + nibble)
+    } else {
+        transmute('a' + nibble - 10)
+    }
+}
+
+// ── randomness ───────────────────────────────────────────────────────────────
+// xorshift32. Seeded once from the host, then deterministic within the
+// process. A zero seed would be a fixed point, so it is replaced.
+global mut rng_state: u32 = 0;
+
+pub func random() -> u32 {
+    local mut s = rng_state.get();
+    if (s == 0) {
+        s = host::random_u32();
+        if (s == 0) { s = 0x9e3779b9 };
+    }
+    s = s ^ (s << 13);
+    s = s ^ (s >> 17);
+    s = s ^ (s << 5);
+    rng_state.set(s);
+    s
+}
+
+// ── text helpers ─────────────────────────────────────────────────────────────
+pub func is_space(byte: u8) -> Bool {
+    byte == ' ' || byte == '\t' || byte == '\n' || byte == '\r'
+}
+
+pub func tail(text: Input, at: u32) -> Input {
+    if (at >= text.len()) { return "" };
+    slice_from_parts(text[at].&, text.len() - at)
+}
+
+pub func prefix(text: Input, end: u32) -> Input {
+    if (end >= text.len()) { return text };
+    slice_from_parts(text.as_ref(), end)
+}
+
+pub func trim_start(text: Input) -> Input {
+    loop (at: u32 = 0) {
+        if (at == text.len()) { break "" };
+        if (!is_space(text[at])) { break tail(text, at) };
+        continue at + 1;
+    }
+}
+
+pub func trim_end(text: Input) -> Input {
+    loop (end: u32 = text.len()) {
+        if (end == 0) { break "" };
+        if (!is_space(text[end - 1])) {
+            break slice_from_parts(text.as_ref(), end)
+        }
+        continue end - 1;
+    }
+}
+
+pub func trim(text: Input) -> Input {
+    trim_end(trim_start(text))
+}
+
+pub func split_word(text: Input) -> (Input, Input) {
+    loop (at: u32 = 0) {
+        if (at == text.len()) { break (text, "") };
+        if (is_space(text[at])) {
+            break (prefix(text, at), trim_start(tail(text, at + 1)))
+        }
+        continue at + 1;
+    }
+}
+
+pub func find_char(text: Input, needle: u8) -> u32 {
+    loop (at: u32 = 0) {
+        if (at == text.len()) { break at };
+        if (text[at] == needle) { break at };
+        continue at + 1;
+    }
+}
+
+/// `/quiz@SomeBot` names the command `quiz`.
+pub func command_name(word: Input) -> Input {
+    if (word.len() <= 1) { return "" };
+    loop (end: u32 = 1) {
+        if (end == word.len()) {
+            break slice_from_parts(word[1].&, word.len() - 1)
+        }
+        if (word[end] == '@') { break slice_from_parts(word[1].&, end - 1) };
+        continue end + 1;
+    }
+}
+
+pub func eq_text(input: Input, text: Text) -> Bool {
+    if (input.len() != text.len()) { return False };
+    loop (i: u32 = 0) {
+        if (i == input.len()) { break True };
+        if (input[i] != text[i]) { break False };
+        continue i + 1;
+    }
+}
+
+pub func parse_u32(text: Input) -> (Bool, u32) {
+    if (text.len() == 0) { return (False, 0) };
+    loop (i: u32 = 0, value: u32 = 0) {
+        if (i == text.len()) { break (True, value) };
+        local byte = text[i];
+        if (byte < '0' || byte > '9') { break (False, 0) };
+        local digit = transmute::<u8, u32>(byte - '0');
+        if (value > (0xFFFFFFFF - digit) / 10) { break (False, 0) };
+        continue (i + 1, value * 10 + digit);
+    }
+}
+
+// ── routing ──────────────────────────────────────────────────────────────────
+/// The update context. Add fields here as the framework grows; handlers get a
+/// copy, so it stays allocation-free.
+pub struct Context(chat_id: i64);
+
+impl Context {
+    pub func chat_id(self: Self) -> i64 {
+        self.chat_id
+    }
+}
+
+/// One entry in an application's command table. `name` has no leading slash;
+/// `description` is the help line after the name, including usage text.
+pub struct Command<A: StackValue>(
+    pub name: Text,
+    pub description: Text,
+    pub action: A,
+);
+
+/// What an application supplies. The framework has no commands of its own:
+/// the application passes a table and handles its actions. This is the static
+/// equivalent of `bot.command("name", handler)` — no closures, no allocation.
+pub trait Bot: StackValue {
+    type Action: StackValue;
+
+    func command(
+        self: Self,
+        res: Response,
+        ctx: Context,
+        action: Self::Action,
+        args: Input,
+    ) -> Response;
+
+    /// Any message that is not a command.
+    func message(
+        self: Self,
+        res: Response,
+        ctx: Context,
+        text: Input,
+    ) -> Response;
+
+    /// A command name that is not in the table.
+    func unknown(
+        self: Self,
+        res: Response,
+        ctx: Context,
+        name: Input,
+    ) -> Response {
+        _ = ctx;
+        res.text("Unknown command: /").input(name)
+    }
+}
+
+global mut handled: u64 = 0;
+
+pub func updates() -> u64 {
+    handled.get()
+}
+
+/// The framework's share of a `/stats` reply. Applications append their own.
+pub func stats(res: Response) -> Response {
+    res
+        .text("updates handled: ")
+        .decimal64(handled.get())
+        .newline()
+        .text("text memory: ")
+        .decimal(text.size_pages())
+        .text(" page(s)")
+}
+
+/// Renders the registered command table. An application's `/help` handler
+/// calls this (after an optional greeting), so help never goes stale.
+pub func help<A: StackValue>(
+    res: Response,
+    commands: text::&[Command<A>],
+) -> Response {
+    local out = res.text("Commands:\n");
+    loop (out = out, i: u32 = 0) {
+        if (i == commands.len()) { break out };
+        local next = out
+            .text("/")
+            .text(commands[i].name)
+            .text(" ")
+            .text(commands[i].description)
+            .newline();
+        (next, i + 1)
+    }
+}
+
+func find_command<A: StackValue>(
+    commands: text::&[Command<A>],
+    name: Input,
+) -> (Bool, u32) {
+    loop (i: u32 = 0) {
+        if (i == commands.len()) { break (False, 0) };
+        if (eq_text(name, commands[i].name)) { break (True, i) };
+        continue i + 1;
+    }
+}
+
+pub func serve<B: Bot>(
+    bot: B,
+    commands: text::&[Command<B::Action>],
+    chat_id: i64,
+    input: Input,
+    output: Output,
+) -> u32 {
+    handled.set(handled.get() + 1);
+    local text = trim(input);
+    local res = Response::new(output);
+    local ctx = Context(chat_id);
+
+    if (text.len() == 0) { return bot.message(res, ctx, text).written() };
+
+    if (text[0] == '/') {
+        local (word, args) = split_word(text);
+        local name = command_name(word);
+        local (found, index) = find_command(commands, name);
+        if (found) {
+            local action = commands[index].action;
+            return bot.command(res, ctx, action, args).written()
+        }
+        return bot.unknown(res, ctx, name).written()
+    }
+
+    bot.message(res, ctx, text).written()
+}
+
+/// The raw host ABI: plain addresses, so an application can export it without
+/// naming the framework's memory types.
+pub func serve_raw<B: Bot>(
+    bot: B,
+    commands: text::&[Command<B::Action>],
+    chat_id: i64,
+    input_ptr: u32,
+    input_len: u32,
+    output_ptr: u32,
+    output_cap: u32,
+) -> u32 {
+    local input = slice_from_parts(
+        RawPtr::<host::io, u8>::from_addr(input_ptr).as_ref(),
+        input_len,
+    );
+    local output = slice_from_parts_mut(
+        RawPtr::<host::io, u8>::from_addr(output_ptr).as_ptr(),
+        output_cap,
+    );
+    serve(bot, commands, chat_id, input, output)
+}

@@ -1,0 +1,129 @@
+// wx-sha256: a SHA-256 command in the shape of `sha256sum`.
+//
+//   wx-sha256 [FILE]...
+//   printf 'abc' | wx-sha256
+//
+// With no arguments it hashes standard input and prints `<hex>  -`; otherwise
+// each argument is a path relative to the preopened directory, or `-` for
+// standard input. The hash itself is the generic `sha256` package: this file
+// only moves bytes and formats the result.
+package "wasi" as wasi;
+package "sha256" as sha256;
+use wasi::{Errno, Fd, heap};
+
+// `path_open` and `fd_close` are not part of the small `wasi` wrapper; the
+// command needs them to accept file arguments. fd 3 is the first preopened
+// directory (the working directory in run.mjs).
+import "wasi_snapshot_preview1" as sys {
+    use super::{Errno, Fd, heap};
+    func path_open(
+        dir_fd: Fd,
+        dir_flags: u32,
+        path: heap::&[u8],
+        o_flags: u32,
+        fs_rights_base: u64,
+        fs_rights_inheriting: u64,
+        fd_flags: u32,
+        opened_fd: heap::*u32,
+    ) -> Errno;
+    func fd_close(fd: Fd) -> Errno;
+}
+
+const PREOPENED_DIR: u32 = 3;
+const FD_READ_RIGHT: u64 = 0x2;
+const CHUNK: u32 = 65536;
+
+func hex_digit(nibble: u8) -> u8 {
+    if (nibble < 10) { '0' + nibble } else { 'a' + (nibble - 10) }
+}
+
+func copy_into(src: heap::&[u8], dst: heap::*[u8], at: u32) {
+    loop (i: u32 = 0) {
+        if (i == src.len()) { break };
+        dst[at + i] = src[i];
+        continue i + 1;
+    }
+}
+
+/// Streams one descriptor through the hasher and prints sha256sum's line.
+/// Memory use is constant: a 64 KiB input chunk and a 64-byte hash buffer.
+func hash_stream(fd: Fd, name: heap::&[u8]) {
+    local arena = wasi::arena();
+    local mark = arena.mark();
+
+    local chunk =
+        slice_from_parts_mut(arena.allocate(Layout::array::<u8>(CHUNK)), CHUNK);
+    // The hash stream owns its partial-chunk buffer; it is not hidden in a
+    // global, so the caller decides where this state lives.
+    local buffer =
+        sha256::buffer_from_ptr(arena.allocate(Layout::array::<u8>(64)));
+    local mut hasher = sha256::Sha256::<heap>::new(buffer);
+    loop {
+        local read = fd.read(arena, chunk);
+        if (read.len() == 0) { break };
+        hasher = hasher.update(read);
+    }
+
+    local digest = arena.allocate_slice_uninit::<u8>(32);
+    hasher.digest().write(digest);
+
+    local line = arena.allocate_slice_uninit::<u8>(64 + 2 + name.len() + 1);
+    loop (i: u32 = 0) {
+        if (i == 32) { break };
+        local byte = digest[i];
+        line[i * 2] = hex_digit(byte / 16);
+        line[i * 2 + 1] = hex_digit(byte % 16);
+        continue i + 1;
+    }
+    line[64] = ' ';
+    line[65] = ' ';
+    copy_into(name, line, 66);
+    line[66 + name.len()] = '\n';
+    Fd::STDOUT.write(arena, slice_from_parts(line[0].&, line.len()));
+    arena.release(mark);
+}
+
+func hash_path(arena: heap::*wasi::Arena, path: heap::&[u8]) {
+    local opened = arena.allocate_value::<u32>(0);
+    local error = sys::path_open(
+        Fd::from_raw(PREOPENED_DIR),
+        0,
+        path,
+        0,
+        FD_READ_RIGHT,
+        0,
+        0,
+        opened,
+    );
+    if (error != Errno::SUCCESS) {
+        Fd::STDERR.write(arena, "wx-sha256: cannot open input\n");
+        wasi::exit(1);
+    }
+    local fd = Fd::from_raw(opened.*);
+    hash_stream(fd, path);
+    _ = sys::fd_close(fd);
+}
+
+func main() {
+    local arena = wasi::arena();
+    local arguments = wasi::args(arena);
+    if (arguments.len() < 2) {
+        hash_stream(Fd::STDIN, "-");
+        return;
+    }
+    loop (i: u32 = 1) {
+        if (i == arguments.len()) { break };
+        local path = arguments[i];
+        if (path.len() == 1 && path[0] == '-') {
+            hash_stream(Fd::STDIN, path);
+        } else {
+            hash_path(arena, path);
+        }
+        continue i + 1;
+    }
+}
+
+export {
+    main as "_start",
+    heap as "memory",
+}

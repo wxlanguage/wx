@@ -1,0 +1,6 @@
+{
+  "entry": "main.wx",
+  "dependencies": {
+    "binary": { "type": "local", "path": "../binary" }
+  }
+}

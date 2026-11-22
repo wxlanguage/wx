@@ -1,0 +1,669 @@
+// SHA-256, HMAC-SHA-256 and PBKDF2-HMAC-SHA-256, written as composable
+// primitives. Every entry point reads a slice of any memory and writes its
+// 32-byte result into a slice of any (possibly different) memory.
+//
+// The one-shot entry points keep their working state (message schedule,
+// padding, HMAC key chunk) in a private scratch memory that is not exported,
+// so a host cannot observe or corrupt it. Static data (the round constants) is
+// placed first; the working area starts at `scratch::DATA_END`. A streaming
+// hasher keeps its partial block in a buffer the caller supplies.
+#[memory_limits{ min_pages: 1, max_pages: 1 }]
+memory scratch: u32;
+
+const K: scratch::&[u32; 64] = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
+
+// ── memory sizes ──────────────────────────────────────────────────────────────
+// A memory's address type is either `u32` or `u64`; the hasher is generic over
+// both. This trait is the bridge between a size and the `u64`/`u32` the
+// algorithm counts with.
+pub trait SizeExt: PointerSize {
+    func as_u64(self: Self) -> u64;
+    func from_u32(value: u32) -> Self;
+    func from_u64(value: u64) -> Self;
+    func as_u32(self: Self) -> u32;
+}
+
+impl SizeExt for u32 {
+    #[inline]
+    func as_u64(self: Self) -> u64 {
+        u64_extend_u32(self)
+    }
+
+    #[inline]
+    func from_u32(value: u32) -> Self {
+        value
+    }
+
+    #[inline]
+    func from_u64(value: u64) -> Self {
+        transmute::<i32, u32>(i32_wrap_i64(transmute::<u64, i64>(value)))
+    }
+
+    #[inline]
+    func as_u32(self: Self) -> u32 {
+        self
+    }
+}
+
+impl SizeExt for u64 {
+    #[inline]
+    func as_u64(self: Self) -> u64 {
+        self
+    }
+
+    #[inline]
+    func from_u32(value: u32) -> Self {
+        u64_extend_u32(value)
+    }
+
+    #[inline]
+    func from_u64(value: u64) -> Self {
+        value
+    }
+
+    #[inline]
+    func as_u32(self: Self) -> u32 {
+        transmute::<i32, u32>(i32_wrap_i64(transmute::<u64, i64>(self)))
+    }
+}
+
+// ── scratch layout ────────────────────────────────────────────────────────────
+const W_OFFSET: u32 = 0; // 64 words, the message schedule
+const BUFFER_OFFSET: u32 = 256; // the hasher's own 64-byte block
+const KEY_OFFSET: u32 = 320; // the 64-byte HMAC key chunk
+const DIGEST_OFFSET: u32 = 384; // the inner HMAC digest
+const U_OFFSET: u32 = 416; // PBKDF2 U
+const T_OFFSET: u32 = 448; // PBKDF2 T
+const INDEX_OFFSET: u32 = 480; // PBKDF2 chunk index, big-endian
+
+const DATA_ALIGN: u32 = 4;
+
+#[inline]
+func base() -> u32 {
+    transmute::<scratch::*u8, u32>(
+        RawPtr::<scratch, u8>::from_ptr(scratch::DATA_END)
+            .align_up(DATA_ALIGN)
+            .as_ptr(),
+    )
+}
+
+#[inline]
+func at_u8(offset: u32, len: u32) -> scratch::*[u8] {
+    local ptr = RawPtr::<scratch, u8>::from_addr(base() + offset);
+    slice_from_parts_mut(ptr.as_ptr(), len)
+}
+
+#[inline]
+func at_u32(offset: u32, len: u32) -> scratch::*[u32] {
+    local ptr = RawPtr::<scratch, u32>::from_addr(base() + offset);
+    slice_from_parts_mut(ptr.as_ptr(), len)
+}
+
+/// Views the 64 bytes at `ptr` as the block buffer `Sha256::new` expects.
+/// This is how a caller turns bytes it allocated (or reserved in a data
+/// section) into a streaming hasher's state.
+#[inline]
+pub func buffer_from_ptr<Buf: Memory>(ptr: Buf::*u8) -> Buf::*[u8; 64] {
+    transmute(ptr)
+}
+
+/// The one-shot primitives use this private 64-byte block; a streaming
+/// hasher gets its block from the caller, so several can be live at once.
+#[inline]
+func scratch_buffer() -> scratch::*[u8; 64] {
+    buffer_from_ptr(
+        RawPtr::<scratch, u8>::from_addr(base() + BUFFER_OFFSET).as_ptr(),
+    )
+}
+
+// ── byte order ────────────────────────────────────────────────────────────────
+#[inline]
+func be32<M: Memory where { Size: SizeExt }>(
+    bytes: M::&[u8],
+    at: M::Size,
+) -> u32 {
+    (transmute::<u8, u32>(bytes[at]) << 24)
+        | (transmute::<u8, u32>(bytes[at + 1]) << 16)
+        | (transmute::<u8, u32>(bytes[at + 2]) << 8)
+        | transmute::<u8, u32>(bytes[at + 3])
+}
+
+#[inline]
+func store32<M: Memory where { Size: SizeExt }>(
+    bytes: M::*[u8],
+    at: u32,
+    value: u32,
+) {
+    bytes[M::Size::from_u32(at)] = transmute::<u32, u8>(value >> 24);
+    bytes[M::Size::from_u32(at + 1)] = transmute::<u32, u8>(value >> 16);
+    bytes[M::Size::from_u32(at + 2)] = transmute::<u32, u8>(value >> 8);
+    bytes[M::Size::from_u32(at + 3)] = transmute::<u32, u8>(value);
+}
+
+#[inline]
+func store32_in_chunk<Buf: Memory where { Size: SizeExt }>(
+    chunk: Buf::*[u8; 64],
+    at: u32,
+    value: u32,
+) {
+    chunk[Buf::Size::from_u32(at)] = transmute::<u32, u8>(value >> 24);
+    chunk[Buf::Size::from_u32(at + 1)] = transmute::<u32, u8>(value >> 16);
+    chunk[Buf::Size::from_u32(at + 2)] = transmute::<u32, u8>(value >> 8);
+    chunk[Buf::Size::from_u32(at + 3)] = transmute::<u32, u8>(value);
+}
+
+#[inline]
+func store64_in_chunk<Buf: Memory where { Size: SizeExt }>(
+    chunk: Buf::*[u8; 64],
+    at: u32,
+    value: u64,
+) {
+    store32_in_chunk(
+        chunk,
+        at,
+        transmute::<i32, u32>(i32_wrap_i64(transmute::<u64, i64>(value >> 32))),
+    );
+    store32_in_chunk(
+        chunk,
+        at + 4,
+        transmute::<i32, u32>(i32_wrap_i64(transmute::<u64, i64>(value))),
+    );
+}
+
+#[inline]
+func rotr(value: u32, count: u32) -> u32 {
+    (value >> count) | (value << (32 - count))
+}
+
+// ── the hash state ────────────────────────────────────────────────────────────
+/// A SHA-256 stream. `Buf` is where the caller keeps the 64-byte partial chunk,
+/// so two hashers never share state; nothing here depends on the memory the
+/// input arrives through.
+pub struct Sha256<Buf: Memory where { Size: SizeExt }>(
+    h0: u32,
+    h1: u32,
+    h2: u32,
+    h3: u32,
+    h4: u32,
+    h5: u32,
+    h6: u32,
+    h7: u32,
+    mut total: u64,
+    mut buffered: u32,
+    buffer: Buf::*[u8; 64],
+);
+
+pub struct Digest(
+    a: u32,
+    b: u32,
+    c: u32,
+    d: u32,
+    e: u32,
+    f: u32,
+    g: u32,
+    h: u32,
+);
+
+impl Digest {
+    /// Writes the digest as 32 big-endian bytes. `out` must hold 32 bytes.
+    #[inline]
+    pub func write<M: Memory where { Size: SizeExt }>(
+        self: Self,
+        out: M::*[u8],
+    ) {
+        store32(out, 0, self.a);
+        store32(out, 4, self.b);
+        store32(out, 8, self.c);
+        store32(out, 12, self.d);
+        store32(out, 16, self.e);
+        store32(out, 20, self.f);
+        store32(out, 24, self.g);
+        store32(out, 28, self.h);
+    }
+}
+
+impl<Buf: Memory where { Size: SizeExt }> Sha256<Buf> {
+    /// A fresh stream that keeps its partial chunk in `buffer`. The buffer
+    /// need not be initialized; the first `update` or `digest` fills it.
+    pub func new(buffer: Buf::*[u8; 64]) -> Self {
+        Self{
+            h0: 0x6a09e667,
+            h1: 0xbb67ae85,
+            h2: 0x3c6ef372,
+            h3: 0xa54ff53a,
+            h4: 0x510e527f,
+            h5: 0x9b05688c,
+            h6: 0x1f83d9ab,
+            h7: 0x5be0cd19,
+            total: 0,
+            buffered: 0,
+            buffer,
+        }
+    }
+
+    pub func update<M: Memory where { Size: SizeExt }>(
+        self: Self,
+        data: M::&[u8],
+    ) -> Self {
+        local mut state = self;
+        local chunk = state.buffer;
+        local len = data.len();
+        state.total += len.as_u64();
+        local mut pos: M::Size = 0;
+
+        // Complete a partial chunk left by an earlier call first.
+        if (state.buffered > 0) {
+            local mut take = len;
+            local room = M::Size::from_u32(64 - state.buffered);
+            if (take > room) { take = room };
+            loop (i: M::Size = 0) {
+                if (i == take) { break };
+                chunk[Buf::Size::from_u32(state.buffered + i.as_u32())] =
+                    data[i];
+                continue i + 1;
+            }
+            pos += take;
+            state.buffered += take.as_u32();
+            if (state.buffered == 64) {
+                state = compress(
+                    state,
+                    slice_from_parts(chunk[0].&, Buf::Size::from_u32(64)),
+                );
+                state.buffered = 0;
+            }
+        }
+
+        // Every full chunk can be hashed in place, without a copy.
+        loop {
+            if (len - pos < M::Size::from_u32(64)) { break };
+            local next = slice_from_parts(data[pos].&, M::Size::from_u32(64));
+            state = compress(state, next);
+            pos += M::Size::from_u32(64);
+        }
+
+        // The remainder waits in the caller's buffer until the next call.
+        local rest = len - pos;
+        if (rest > 0) {
+            loop (i: M::Size = 0) {
+                if (i == rest) { break };
+                chunk[Buf::Size::from_u32(i.as_u32())] = data[pos + i];
+                continue i + 1;
+            }
+            state.buffered = rest.as_u32();
+        }
+        state
+    }
+
+    /// Finishes the stream. A single 64-byte buffer holds both possible final
+    /// chunks: when the length does not fit in the first, it is compressed
+    /// before the buffer is reused for the second.
+    pub func digest(self: Self) -> Digest {
+        local mut state = self;
+        local chunk = state.buffer;
+        local n = state.buffered;
+        chunk[Buf::Size::from_u32(n)] = 0x80;
+        if (n < 56) {
+            loop (at = n + 1) {
+                if (at == 56) { break };
+                chunk[Buf::Size::from_u32(at)] = 0;
+                continue at + 1;
+            }
+            store64_in_chunk(chunk, 56, state.total * 8);
+            state = compress(
+                state,
+                slice_from_parts(chunk[0].&, Buf::Size::from_u32(64)),
+            );
+        } else {
+            loop (at = n + 1) {
+                if (at == 64) { break };
+                chunk[Buf::Size::from_u32(at)] = 0;
+                continue at + 1;
+            }
+            state = compress(
+                state,
+                slice_from_parts(chunk[0].&, Buf::Size::from_u32(64)),
+            );
+            loop (i: u32 = 0) {
+                if (i == 56) { break };
+                chunk[Buf::Size::from_u32(i)] = 0;
+                continue i + 1;
+            }
+            store64_in_chunk(chunk, 56, state.total * 8);
+            state = compress(
+                state,
+                slice_from_parts(chunk[0].&, Buf::Size::from_u32(64)),
+            );
+        }
+        Digest(
+            state.h0,
+            state.h1,
+            state.h2,
+            state.h3,
+            state.h4,
+            state.h5,
+            state.h6,
+            state.h7,
+        )
+    }
+
+    #[inline]
+    pub func finish<Out: Memory where { Size: SizeExt }>(
+        self: Self,
+        out: Out::*[u8],
+    ) {
+        self.digest().write(out)
+    }
+}
+
+#[inline]
+func compress<
+    Buf: Memory where { Size: SizeExt },
+    M: Memory where { Size: SizeExt },
+>(state: Sha256<Buf>, chunk: M::&[u8]) -> Sha256<Buf> {
+    local w = at_u32(W_OFFSET, 64);
+    loop (i: u32 = 0) {
+        if (i == 16) { break };
+        w[i] = be32(chunk, M::Size::from_u32(i * 4));
+        continue i + 1;
+    }
+    // Extend the first 16 words to the 64-word message schedule.
+    loop (i: u32 = 16) {
+        if (i == 64) { break };
+        local s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        local s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        continue i + 1;
+    }
+
+    // The eight working words are the loop's state, so no mutable locals and
+    // no assignment sequence are needed.
+    local (a, b, c, d, e, f, g, h) = loop (
+        a = state.h0,
+        b = state.h1,
+        c = state.h2,
+        d = state.h3,
+        e = state.h4,
+        f = state.h5,
+        g = state.h6,
+        h = state.h7,
+        i: u32 = 0,
+    ) {
+        if (i == 64) { break (a, b, c, d, e, f, g, h) };
+        local s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+        local ch = (e & f) ^ (^e & g);
+        local t1 = h + s1 + ch + K[i] + w[i];
+        local s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+        local maj = (a & b) ^ (a & c) ^ (b & c);
+        local t2 = s0 + maj;
+        continue (t1 + t2, a, b, c, d + t1, e, f, g, i + 1);
+    };
+
+    Sha256{
+        h0: state.h0 + a,
+        h1: state.h1 + b,
+        h2: state.h2 + c,
+        h3: state.h3 + d,
+        h4: state.h4 + e,
+        h5: state.h5 + f,
+        h6: state.h6 + g,
+        h7: state.h7 + h,
+        total: state.total,
+        buffered: state.buffered,
+        buffer: state.buffer,
+    }
+}
+
+// ── public primitives ─────────────────────────────────────────────────────────
+/// SHA-256 of `data`, written as 32 bytes to `out`. `out` must hold 32
+/// bytes.
+pub func sha256<
+    M: Memory where { Size: SizeExt },
+    Out: Memory where { Size: SizeExt },
+>(data: M::&[u8], out: Out::*[u8]) {
+    Sha256::<scratch>::new(scratch_buffer()).update(data).finish(out)
+}
+
+/// SHA-256 of `data` as a value, without a destination buffer.
+pub func sha256_digest<M: Memory where { Size: SizeExt }>(
+    data: M::&[u8],
+) -> Digest {
+    Sha256::<scratch>::new(scratch_buffer()).update(data).digest()
+}
+
+#[inline]
+func fill(bytes: scratch::*[u8], value: u8) {
+    loop (i: u32 = 0) {
+        if (i == bytes.len()) { break };
+        bytes[i] = value;
+        continue i + 1;
+    }
+}
+
+#[inline]
+func copy<
+    M: Memory where { Size: SizeExt },
+    Out: Memory where { Size: SizeExt },
+>(src: M::&[u8], dst: Out::*[u8]) {
+    loop (i: u64 = 0) {
+        if (i == src.len().as_u64()) { break };
+        dst[Out::Size::from_u64(i)] = src[M::Size::from_u64(i)];
+        continue i + 1;
+    }
+}
+
+/// HMAC-SHA-256 over `message` with `key`, with the key and message in any
+/// two memories. `out` must hold 32 bytes.
+pub func hmac_sha256<
+    Key: Memory where { Size: SizeExt },
+    Msg: Memory where { Size: SizeExt },
+    Out: Memory where { Size: SizeExt },
+>(key: Key::&[u8], message: Msg::&[u8], out: Out::*[u8]) {
+    hmac_parts(key, message, []: scratch::&[u8], out)
+}
+
+/// HMAC-SHA-256 over the concatenation of `first` and `second`.
+///
+/// The parts are absorbed in order, so no copy of a large message is needed.
+/// `out` must hold 32 bytes. To omit a part, name the empty slice's memory:
+/// `[]: heap::&[u8]`.
+///
+/// This is the form PBKDF2 uses for `salt || INT(i)`, and a caller can use it
+/// to authenticate a header and a body that live in different buffers.
+pub func hmac_parts<
+    Key: Memory where { Size: SizeExt },
+    First: Memory where { Size: SizeExt },
+    Second: Memory where { Size: SizeExt },
+    Out: Memory where { Size: SizeExt },
+>(
+    key: Key::&[u8],
+    first: First::&[u8],
+    second: Second::&[u8],
+    out: Out::*[u8],
+) {
+    local chunk = at_u8(KEY_OFFSET, 64);
+    fill(chunk, 0);
+
+    // A key longer than the chunk size is replaced by its digest.
+    if (key.len() > Key::Size::from_u32(64)) {
+        local long = at_u8(DIGEST_OFFSET, 32);
+        Sha256::<scratch>::new(scratch_buffer()).update(key).finish(long);
+        copy(slice_from_parts(long[0].&, 32), chunk);
+    } else {
+        copy(key, chunk);
+    }
+
+    loop (i: u32 = 0) {
+        if (i == 64) { break };
+        chunk[i] = chunk[i] ^ 0x36;
+        continue i + 1;
+    }
+    local inner = Sha256::<scratch>::new(scratch_buffer())
+        .update(slice_from_parts(chunk[0].&, 64))
+        .update(first)
+        .update(second);
+
+    local inner_digest = inner.digest();
+    local digest_bytes = at_u8(DIGEST_OFFSET, 32);
+    inner_digest.write(digest_bytes);
+
+    // key ^ 0x36 ^ (0x36 ^ 0x5c) == key ^ 0x5c
+    loop (i: u32 = 0) {
+        if (i == 64) { break };
+        chunk[i] = chunk[i] ^ 0x6a;
+        continue i + 1;
+    }
+    Sha256::<scratch>::new(scratch_buffer())
+        .update(slice_from_parts(chunk[0].&, 64))
+        .update(slice_from_parts(digest_bytes[0].&, 32))
+        .finish(out)
+}
+
+/// PBKDF2-HMAC-SHA-256; writes `out.len()` bytes (typically 32 for one chunk).
+pub func pbkdf2_sha256<
+    Pass: Memory where { Size: SizeExt },
+    Salt: Memory where { Size: SizeExt },
+    Out: Memory where { Size: SizeExt },
+>(password: Pass::&[u8], salt: Salt::&[u8], iterations: u32, out: Out::*[u8]) {
+    if (iterations == 0) { trap() };
+    local index = at_u8(INDEX_OFFSET, 4);
+    local u = at_u8(U_OFFSET, 32);
+    local t = at_u8(T_OFFSET, 32);
+    loop (chunk: u32 = 1, written: u32 = 0) {
+        if (written >= out.len().as_u32()) { break };
+        store32(index, 0, chunk);
+        hmac_parts(password, salt, slice_from_parts(index[0].&, 4), u);
+        copy(slice_from_parts(u[0].&, 32), t);
+
+        loop (j: u32 = 1) {
+            if (j == iterations) { break };
+            // In place: HMAC consumes `u` before writing the next one.
+            hmac_parts(
+                password,
+                slice_from_parts(u[0].&, 32),
+                []: scratch::&[u8],
+                u,
+            );
+            loop (k: u32 = 0) {
+                if (k == 32) { break };
+                t[k] = t[k] ^ u[k];
+                continue k + 1;
+            }
+            continue j + 1;
+        }
+
+        local remaining = out.len().as_u32() - written;
+        local take = if (remaining > 32) { 32 } else { remaining };
+        loop (k: u32 = 0) {
+            if (k == take) { break };
+            out[Out::Size::from_u32(written + k)] = t[k];
+            continue k + 1;
+        }
+        continue (chunk + 1, written + take);
+    }
+}
+
+/// Compares two byte runs without an early exit on mismatched contents.
+/// Different lengths are a mismatch and return `False` immediately; lengths
+/// are public, only the bytes are secret.
+pub func constant_time_eq<
+    A: Memory where { Size: SizeExt },
+    B: Memory where { Size: SizeExt },
+>(a: A::&[u8], b: B::&[u8]) -> Bool {
+    if (a.len().as_u64() != b.len().as_u64()) {
+        // Lengths are public; only contents need the constant-time loop.
+        return False;
+    }
+    local diff = loop (diff: u8 = 0, i: u64 = 0) {
+        if (i == a.len().as_u64()) { break diff };
+        continue (
+            diff | (a[A::Size::from_u64(i)] ^ b[B::Size::from_u64(i)]),
+            i + 1,
+        );
+    };
+    diff == 0
+}
+
+// ── host facade ───────────────────────────────────────────────────────────────
+// Generic functions cannot cross a Wasm export directly: an export has one
+// concrete signature. These adapters pin every memory parameter to `heap`, so
+// a JavaScript host (or another module) can call the primitives as ordinary
+// `(pointer, length)` functions. Callers that use the package as a dependency
+// can ignore the facade and call the generic functions directly.
+#[memory_limits{ min_pages: 1 }]
+memory heap: u32;
+
+/// The same package over a 64-bit-address memory. The generic hasher does not
+/// know the difference: `SizeExt` supplies the conversions.
+#[memory_limits{ min_pages: 1 }]
+memory wide: u64;
+
+/// Writes the 32-byte SHA-256 of `heap[addr .. addr + len]` at `heap[out]`.
+func hash(addr: u32, len: u32, out: u32) {
+    sha256(
+        slice_from_parts(transmute::<u32, heap::&u8>(addr), len),
+        slice_from_parts_mut(transmute::<u32, heap::*u8>(out), 32),
+    )
+}
+
+/// Hashes a slice of the 64-bit `wide` memory; addresses are Wasm `i64`s.
+func hash_wide(addr: u64, len: u64, out: u64) {
+    sha256(
+        slice_from_parts(RawPtr::<wide, u8>::from_addr(addr).as_ref(), len),
+        slice_from_parts_mut(RawPtr::<wide, u8>::from_addr(out).as_ptr(), 32),
+    )
+}
+
+/// Reads from the 64-bit `wide` memory and writes the digest to the 32-bit
+/// `heap`, showing that source and destination need not be the same memory.
+func hash_cross(addr: u64, len: u64, out: u32) {
+    sha256(
+        slice_from_parts(RawPtr::<wide, u8>::from_addr(addr).as_ref(), len),
+        slice_from_parts_mut(transmute::<u32, heap::*u8>(out), 32),
+    )
+}
+
+/// Writes the 32-byte HMAC-SHA-256 of a key and message in `heap` at `out`.
+func hmac(key_addr: u32, key_len: u32, msg_addr: u32, msg_len: u32, out: u32) {
+    hmac_sha256(
+        slice_from_parts(transmute::<u32, heap::&u8>(key_addr), key_len),
+        slice_from_parts(transmute::<u32, heap::&u8>(msg_addr), msg_len),
+        slice_from_parts_mut(transmute::<u32, heap::*u8>(out), 32),
+    )
+}
+
+/// Writes `out_len` bytes of PBKDF2-HMAC-SHA-256 at `out`.
+func pbkdf2(
+    pass_addr: u32,
+    pass_len: u32,
+    salt_addr: u32,
+    salt_len: u32,
+    iterations: u32,
+    out: u32,
+    out_len: u32,
+) {
+    pbkdf2_sha256(
+        slice_from_parts(transmute::<u32, heap::&u8>(pass_addr), pass_len),
+        slice_from_parts(transmute::<u32, heap::&u8>(salt_addr), salt_len),
+        iterations,
+        slice_from_parts_mut(transmute::<u32, heap::*u8>(out), out_len),
+    )
+}
+
+/// Compares two byte runs in `heap` without an early exit on contents.
+func bytes_eq(a: u32, a_len: u32, b: u32, b_len: u32) -> Bool {
+    constant_time_eq(
+        slice_from_parts(transmute::<u32, heap::&u8>(a), a_len),
+        slice_from_parts(transmute::<u32, heap::&u8>(b), b_len),
+    )
+}
+
+export {
+    heap as "memory",
+    wide as "wide_memory",
+    hash,
+    hash_wide,
+    hash_cross,
+    hmac,
+    pbkdf2,
+    bytes_eq,
+}
