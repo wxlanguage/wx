@@ -6632,6 +6632,34 @@ mod tests {
 	}
 
 	#[test]
+	fn an_inherent_member_is_selected_by_name_and_its_use_proves_the_impls_bounds()
+	 {
+		let case = TestCase::new(indoc! {"
+				struct Open();
+				struct Closed();
+				struct Conn<S>(fd: i32);
+				trait CanSend {}
+				impl CanSend for Open {}
+				trait Fallback: StackValue { func send(self: Self) -> i32; }
+				impl<S> Fallback for Conn<S> { func send(self: Self) -> i32 { 0 } }
+				impl<S: CanSend> Conn<S> {
+					func send(self: Self) -> i32 { 1 }
+					const LIMIT: i32 = 4;
+				}
+				func open(c: Conn<Open>) -> i32 { c.send() + Conn::<Open>::LIMIT }
+				func method(c: Conn<Closed>) -> i32 { c.send() }
+				func constant() -> i32 { Conn::<Closed>::LIMIT }
+			"});
+		case.diagnostics().assert_codes(&[
+			DiagnosticCode::TraitBoundViolation,
+			DiagnosticCode::TraitBoundViolation,
+		]);
+		case.diagnostics().assert_error_saying(
+			"the trait bound `Closed: CanSend` is not satisfied",
+		);
+	}
+
+	#[test]
 	fn a_type_named_without_its_arguments_leaves_them_to_the_call() {
 		let case = TestCase::new(indoc! {"
 				struct W<T>(x: T);

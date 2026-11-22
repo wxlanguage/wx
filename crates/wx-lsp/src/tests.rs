@@ -4018,6 +4018,23 @@ fn completion_of_a_member_excludes_private_fields_and_methods() {
 }
 
 #[test]
+fn completion_of_a_member_excludes_methods_whose_impl_bounds_fail() {
+	let source = |state: &str| {
+		format!(
+			"struct Open();
+			struct Closed();
+			pub struct Conn<S>(pub fd: i32);
+			trait CanSend {{}}
+			impl CanSend for Open {{}}
+			impl<S: CanSend> Conn<S> {{ pub func send(self: Self) -> i32 {{ 1 }} }}
+			func f(c: Conn<{state}>) {{ local a = c.$0 }}"
+		)
+	};
+	assert_eq!(completions(&source("Open")).unwrap(), ["fd", "send"]);
+	assert_eq!(completions(&source("Closed")).unwrap(), ["fd"]);
+}
+
+#[test]
 fn completion_inside_a_members_object_still_offers_local_names() {
 	let labels = completions(&format!(
 		"{MEMBER_RECEIVERS}func f(i: Inner) {{ i$0.z; }}"

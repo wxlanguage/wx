@@ -6290,6 +6290,32 @@ mod tests {
 		);
 	}
 
+	/// An inherent method whose impl's bounds hold is called ahead of a
+	/// trait's member of the same name.
+	#[test]
+	fn an_inherent_method_with_bounds_runs_ahead_of_a_trait_member() {
+		let source = r#"
+            struct Open();
+            struct Conn<S>(fd: i32);
+            trait CanSend {}
+            impl CanSend for Open {}
+            trait Fallback: StackValue { func send(self: Self) -> i32; }
+            impl<S> Fallback for Conn<S> { func send(self: Self) -> i32 { 99 } }
+            impl<S: CanSend> Conn<S> { func send(self: Self) -> i32 { self.fd + 1 } }
+            func run() -> i32 { Conn::<Open>{ fd: 41 }.send() }
+            export { run as "run" }
+        "#;
+		let (mut store, instance) = instantiate(source);
+		assert_eq!(
+			instance
+				.get_typed_func::<(), i32>(&mut store, "run")
+				.unwrap()
+				.call(&mut store, ())
+				.unwrap(),
+			42
+		);
+	}
+
 	/// Named arguments are reordered into the callee's order; the receiver
 	/// still runs before the reordered argument evaluations.
 	#[test]

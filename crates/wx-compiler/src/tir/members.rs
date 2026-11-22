@@ -711,6 +711,9 @@ impl Semantics {
 		}
 	}
 
+	/// An inherent member is selected by its impl's target alone and takes
+	/// precedence by name: its impl's bounds are proved where it is used,
+	/// never consulted to fall through to a trait's member.
 	fn resolve_concrete_member(
 		&mut self,
 		strings: &StringInterner,
@@ -731,7 +734,7 @@ impl Semantics {
 			})
 			.collect();
 		for (index, kind) in declaring {
-			match self.match_inherent_impl_candidate_query(
+			match self.match_inherent_impl_target_query(
 				strings,
 				assumption_context,
 				index,
@@ -1092,6 +1095,39 @@ impl Semantics {
 		}
 	}
 
+	/// The member `key` of `receiver` that a use accepts: the one
+	/// `resolve_applicable_member` selects, when the bounds of an inherent
+	/// member's impl also hold, which its use would otherwise report.
+	fn usable_member(
+		&mut self,
+		strings: &StringInterner,
+		assumption_context: AssumptionEnvIdx,
+		receiver: TypeIndex,
+		key: BindingKey,
+	) -> Option<ApplicableMember> {
+		let MemberLookup::Found(member) = self.resolve_applicable_member(
+			strings,
+			assumption_context,
+			receiver,
+			key,
+		) else {
+			return None;
+		};
+		if let ApplicableMember::Inherent { impl_index, .. } = member
+			&& !matches!(
+				self.match_inherent_impl_candidate_query(
+					strings,
+					assumption_context,
+					impl_index,
+					receiver,
+				),
+				Ok(true)
+			) {
+			return None;
+		}
+		Some(member)
+	}
+
 	/// The fields and methods a name after `.` can select on a value of
 	/// type `receiver` (`Body::operand_ty`) in `owner`'s body, each with
 	/// what it would refer to, as the checker would: a struct's fields
@@ -1166,12 +1202,9 @@ impl Semantics {
 			path,
 			Tier::Value,
 		) {
-			let MemberLookup::Found(member) = self.resolve_applicable_member(
-				strings,
-				scope.assumption_env,
-				path,
-				key,
-			) else {
+			let Some(member) =
+				self.usable_member(strings, scope.assumption_env, path, key)
+			else {
 				continue;
 			};
 			let MemberKind::Method(method) = member.selected_kind(&self.decls)
@@ -1311,12 +1344,9 @@ impl Semantics {
 		for key in
 			self.member_candidates(strings, assumption_env, receiver, tier)
 		{
-			if let MemberLookup::Found(member) = self.resolve_applicable_member(
-				strings,
-				assumption_env,
-				receiver,
-				key,
-			) && self.member_accessible(member, key, namespace)
+			if let Some(member) =
+				self.usable_member(strings, assumption_env, receiver, key)
+				&& self.member_accessible(member, key, namespace)
 			{
 				let kind = member.selected_kind(&self.decls);
 				if used_as.takes_member(kind) {

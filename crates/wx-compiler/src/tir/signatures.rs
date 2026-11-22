@@ -62,7 +62,9 @@ use super::operators::OperatorTraits;
 use super::paths::PathResolver;
 use super::resolutions::{NameResolutions, Reference, Site};
 use super::satisfaction::{TypeArgsNotAllowedOn, report_type_args_not_allowed};
-use super::solver::{ImplMember, Solver, SolverError};
+use super::solver::{
+	ImplMember, NormalizationDepth, RewriteFlags, Solver, SolverError,
+};
 use super::typecheck::{BodyBuilder, BodyContext};
 use super::types::{
 	GenericArgArena, GenericEnvArena, GenericEnvIdx, ImplKind, Substitution,
@@ -922,6 +924,34 @@ impl Semantics {
 			receiver,
 		)
 		.map(|args| args.is_some())
+	}
+
+	/// Whether inherent impl `impl_index`'s target matches `receiver`, its
+	/// bounds aside: a member selected by name proves them at its use.
+	pub(super) fn match_inherent_impl_target_query(
+		&mut self,
+		strings: &StringInterner,
+		assumption_context: AssumptionEnvIdx,
+		impl_index: InherentImplIdx,
+		receiver: TypeIndex,
+	) -> Result<bool, SolverError> {
+		let Some(header) =
+			self.inherent_impls[usize::from(impl_index)].as_ref()
+		else {
+			return Err(SolverError::Pending);
+		};
+		let (impl_env, target) = (header.type_params, header.target.inner);
+		let receiver = self.normalize(
+			strings,
+			assumption_context,
+			receiver,
+			NormalizationDepth::Deep,
+			RewriteFlags::ALL,
+		)?;
+		Ok(self
+			.types
+			.match_impl_target(target, receiver, &self.generic_envs, impl_env)
+			.is_some())
 	}
 
 	/// A constant's declared type (`ERROR` when missing or unresolved), as
