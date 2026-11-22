@@ -1525,6 +1525,46 @@ impl Semantics {
 		)
 	}
 
+	/// The type of `field` on a value of type `receiver`: a struct or an
+	/// enum, or a pointer to one, as a field is reached through one pointer
+	/// at most. The field's declared type, with the struct's type arguments
+	/// in place of its parameters. `None` for a receiver with no fields.
+	pub fn field_type(
+		&mut self,
+		receiver: TypeIndex,
+		field: FieldIdx,
+	) -> Option<TypeIndex> {
+		let object = match *self.types.resolve(receiver) {
+			Type::Pointer { to, .. } => to,
+			_ => receiver,
+		};
+		match *self.types.resolve(object) {
+			Type::Struct {
+				struct_index,
+				type_args,
+			} => {
+				let signature = &self.structs[usize::from(struct_index)];
+				let declared =
+					self.types.list(signature.field_types)[usize::from(field)];
+				let env = signature.type_params;
+				let args = self.types.list(type_args).to_vec();
+				Some(self.types.substitute(
+					declared,
+					Substitution {
+						envs: &self.generic_envs,
+						env,
+						args: &args,
+					},
+				))
+			}
+			Type::Enum { enum_index } => Some(
+				self.types
+					.list(self.enums[usize::from(enum_index)].field_types)[usize::from(field)],
+			),
+			_ => None,
+		}
+	}
+
 	/// Whether `field` of `owner`, a struct or an enum, is visible from
 	/// `accessor`, by its own `pub`.
 	pub fn field_accessible(

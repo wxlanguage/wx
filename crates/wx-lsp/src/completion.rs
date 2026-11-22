@@ -9,12 +9,17 @@
 //! `type_member_names`,
 //! `Body::labels_at`), so
 //! nothing is offered that the checker would not accept written there.
+//!
+//! Each kind of site has its own provider: a name that means something
+//! there (`references`), a name a declaration lists, to be filled in
+//! (`slots`), a pattern (`patterns`), and a package instance's key. What
+//! every candidate shares is `candidate`.
 
 use string_interner::symbol::SymbolU32;
 use tower_lsp_server::ls_types::{
 	CompletionItem, CompletionItemKind, CompletionItemLabelDetails,
 	CompletionParams, CompletionResponse, CompletionTextEdit, Documentation,
-	InsertTextFormat, MarkupContent, MarkupKind, TextEdit,
+	MarkupContent, MarkupKind, TextEdit,
 };
 use wx_compiler::ast::{
 	AST, AssocBinding, AssocBindingKind, Block, BlockId, BoundExpression,
@@ -26,21 +31,20 @@ use wx_compiler::ast::{
 	TypeArgument, TypeExpression, TypeId, TypeParam, UseTree, rest_span,
 };
 use wx_compiler::diagnostics::{SourceSpan, TextOffset, TextSpan};
-use wx_compiler::symbols::Keyword;
 use wx_compiler::tir::{
-	BindingName, DeclKind, Definition, MemberKind, MemberOwner, NameUse,
-	TargetKind, Tier, TraitIdx,
+	DeclKind, Definition, MemberKind, NameUse, Scope, Tier, TraitIdx, TypeIndex,
 };
 use wx_compiler::vfs::FileId;
 
-use crate::call;
 use crate::convert::{position_to_offset, span_to_range};
 use crate::hover;
-use crate::query;
 use crate::snapshot::Snapshot;
+use crate::state::CompletionSupport;
 use crate::state::ServerState;
 
 mod patterns;
+mod references;
+mod slots;
 
 use patterns::{PatternForms, PatternSite, PatternTarget};
 
@@ -50,8 +54,7 @@ pub(crate) fn completion(
 	params: &CompletionParams,
 ) -> Option<CompletionResponse> {
 	let position = &params.text_document_position;
-	let snippets = state.client.completion_snippets;
-	let label_details = state.client.completion_label_details;
+	let options = state.client.completion;
 	let (snapshot, file) =
 		state.resolve_uri_mut(&position.text_document.uri)?;
 	let offset = position_to_offset(
@@ -64,274 +67,213 @@ pub(crate) fn completion(
 		snapshot.compilation.comments(file),
 		offset,
 	)?;
-	if let Site::PackageKey { literal } = site {
-		return package_keys(snapshot, file, literal, offset);
-	}
-	let declaration = match within {
-		Within::Signature(Anchor::Name(name)) | Within::Body(name) => {
-			Some(snapshot.declared_at(SourceSpan::new(file, name))?)
+	let items = match site {
+		Site::PackageKey { literal } => {
+			return package_keys(snapshot, file, literal, offset);
 		}
-		Within::Signature(Anchor::ImplTarget(target)) => {
-			Some(snapshot.impl_with_target(SourceSpan::new(file, target))?)
-		}
-		Within::Use(_) => None,
+		Site::Reference(site) => references::complete(
+			&mut Request::new(snapshot, file, offset, within, options)?,
+			site,
+		)?,
+		Site::Slot(site) => slots::complete(
+			&mut Request::new(snapshot, file, offset, within, options)?,
+			site,
+		)?,
+		Site::Pattern(site) => patterns::complete(
+			&mut Request::new(snapshot, file, offset, within, options)?,
+			site,
+		)?,
 	};
-	// Where a `use` is written: the file, or the module or import block
-	// named at a span.
-	let use_scope = match within {
-		Within::Use(Enclosing::File) => {
-			Some(snapshot.sema.decls.file_namespaces[file.as_usize()])
-		}
-		Within::Use(Enclosing::Name(name)) => {
-			let Definition::Item(loc) =
-				snapshot.declared_at(SourceSpan::new(file, name))?
-			else {
-				return None;
-			};
-			Some(snapshot.sema.scope_entered_by(loc)?)
-		}
-		_ => None,
-	};
-	if let Site::Pattern(site) = site {
-		return patterns::complete(
+	Some(CompletionResponse::Array(items))
+}
+
+/// A completion at the cursor: the checked snapshot, where in it the cursor
+/// is, and what the client takes.
+struct Request<'a> {
+	snapshot: &'a mut Snapshot,
+	file: FileId,
+	offset: TextOffset,
+	within: Within,
+	/// The declaration the cursor is in; `None` in a `use`.
+	declaration: Option<Definition>,
+	/// The scope the `use` the cursor is in is written in; `None` elsewhere.
+	use_scope: Option<Scope>,
+	/// What the client takes in the items.
+	options: CompletionSupport,
+}
+
+impl<'a> Request<'a> {
+	/// The request at `offset`, `within` a declaration or a `use`: `None`
+	/// when the checker kept nothing for the one it is in.
+	fn new(
+		snapshot: &'a mut Snapshot,
+		file: FileId,
+		offset: TextOffset,
+		within: Within,
+		options: CompletionSupport,
+	) -> Option<Self> {
+		let declaration = match within {
+			Within::Signature(Anchor::Name(name)) | Within::Body(name) => {
+				Some(snapshot.declared_at(SourceSpan::new(file, name))?)
+			}
+			Within::Signature(Anchor::ImplTarget(target)) => {
+				Some(snapshot.impl_with_target(SourceSpan::new(file, target))?)
+			}
+			Within::Use(_) => None,
+		};
+		// Where a `use` is written: the file, or the module or import block
+		// named at a span.
+		let use_scope = match within {
+			Within::Use(Enclosing::File) => {
+				Some(snapshot.sema.decls.file_namespaces[file.as_usize()])
+			}
+			Within::Use(Enclosing::Name(name)) => {
+				let Definition::Item(loc) =
+					snapshot.declared_at(SourceSpan::new(file, name))?
+				else {
+					return None;
+				};
+				Some(snapshot.sema.scope_entered_by(loc)?)
+			}
+			_ => None,
+		};
+		Some(Request {
 			snapshot,
 			file,
-			declaration?,
-			site,
 			offset,
-			snippets,
-			label_details,
-		);
-	}
-	let ast = snapshot.compilation.ast(file);
-	let sema = &mut snapshot.sema;
-	let references = &snapshot.references;
-	// A function, method or constructor written as a value is inserted as its
-	// call, unless the call is written already (`hel|per()`).
-	let source = &snapshot.compilation.files.get(file).ok()?.source;
-	let suffix =
-		after_name(source, snapshot.compilation.comments(file), offset);
-	let called = suffix.starts_with('(');
-	let insert = match site {
-		Site::Name(NameUse::Value)
-		| Site::Segment {
-			used_as: NameUse::Value,
-			..
-		}
-		| Site::TraitMember {
-			used_as: NameUse::Value,
-			..
-		}
-		| Site::Member { .. }
-			if snippets && !called =>
-		{
-			Insert::Call
-		}
-		_ => Insert::Name,
-	};
-	let member = matches!(site, Site::Member { .. });
-	let mut argument_types = None;
-	let names = match site {
-		Site::Name(used_as) => match within {
-			Within::Body(_) => sema.names_at(
-				query::body_of(sema, declaration?)?,
-				offset,
-				used_as,
-			),
-			Within::Signature(_) => {
-				sema.names_in_signature(declaration?, used_as)
-			}
-			Within::Use(_) => sema.names_in_scope(use_scope?, used_as),
-		},
-		// What the prefix means, as checking resolved it; a prefix that did
-		// not resolve has nothing after it.
-		Site::Segment { prefix, used_as } => {
-			let (_, reference) =
-				query::symbol_at(references, file, prefix.start)?;
-			let prefix = reference.definition();
-			let mut names = match prefix {
-				Definition::Item(loc) => {
-					let accessor = match use_scope {
-						Some(scope) => scope,
-						None => sema.declaration_scope(declaration?)?,
-					};
-					sema.names_in(accessor, loc, used_as)
-				}
-				_ => Vec::new(),
-			};
-			// After a type, its members, which a `use` cannot name. The walk
-			// finds what the type's namespace binds (an enum's variant) first.
-			if let Some(declaration) = declaration {
-				let members = sema.type_member_names(
-					&snapshot.strings,
-					declaration,
-					prefix,
-					used_as,
-				);
-				for (name, definition) in members {
-					if !names.iter().any(|&(listed, _)| listed == name) {
-						names.push((name, definition));
-					}
-				}
-			}
-			names
-		}
-		// A name a group lists already would be bound twice.
-		Site::Import { prefix, written } => {
-			let (_, reference) =
-				query::symbol_at(references, file, prefix.start)?;
-			let Definition::Item(prefix) = reference.definition() else {
-				return None;
-			};
-			sema.names_in(use_scope?, prefix, NameUse::Import)
-				.into_iter()
-				.filter(|(name, _)| !written.contains(name))
-				.collect()
-		}
-		Site::TraitMember {
-			trait_name,
-			used_as,
-		} => {
-			let (_, reference) =
-				query::symbol_at(references, file, trait_name.start)?;
-			let Definition::Item(bound) = reference.definition() else {
-				return None;
-			};
-			sema.trait_member_names(bound, used_as)
-		}
-		Site::Member { object } => {
-			let owner = query::body_of(sema, declaration?)?;
-			let body = sema.owner_body(owner)?;
-			let receiver = body.operand_ty(body.operand_of(ast, object)?);
-			sema.member_names(&snapshot.strings, owner, receiver)
-		}
-		Site::Label(jump) => {
-			let owner = query::body_of(sema, declaration?)?;
-			let body = sema.owner_body(owner)?;
-			body.labels_at(offset)
-				.into_iter()
-				.filter(|&target| match jump {
-					Jump::Break => true,
-					// A `continue` restarts only a loop.
-					Jump::Continue => {
-						body.target_kind(target) == TargetKind::Loop
-					}
-				})
-				.map(|target| {
-					let label = body.target(target).label.unwrap();
-					(label.inner, Definition::Label { owner, target })
-				})
-				.collect()
-		}
-		// A name written twice is a duplicate binding, so the ones written
-		// are not offered again.
-		Site::Binding {
-			bound,
-			entry,
-			written,
-		} => {
-			let (_, reference) =
-				query::symbol_at(references, file, bound.start)?;
-			let Definition::Item(bound) = reference.definition() else {
-				return None;
-			};
-			let items = (sema.binding_names(bound, entry.tiers()).into_iter())
-				.filter(|binding| {
-					!written.contains(&(binding.member.tier(), binding.name))
-				})
-				.enumerate()
-				.map(|(index, binding)| {
-					binding_item(snapshot, binding, entry, index, label_details)
-				})
-				.collect();
-			return Some(CompletionResponse::Array(items));
-		}
-		// A field matched twice is reported, so the ones written are not
-		// offered again.
-		Site::PatternField { owner, written } => {
-			let (_, reference) =
-				query::symbol_at(references, file, owner.start)?;
-			sema.pattern_field_names(reference.definition())
-				.into_iter()
-				.filter(|(name, _)| !written.contains(name))
-				.collect()
-		}
-		// A name written twice is reported (E2092), so the ones written are
-		// not offered again.
-		Site::PackageKey { .. } => return None,
-		Site::Pattern(_) => unreachable!("pattern provider dispatched above"),
-		Site::Argument {
-			target: ArgumentTarget::Loop { jump },
-			written,
-		} => {
-			let owner = query::body_of(sema, declaration?)?;
-			let body = sema.owner_body(owner)?;
-			let target = body.continue_target(ast, jump)?;
-			let mut names = Vec::new();
-			let mut types = Vec::new();
-			for local in body.scope_locals(body.target_scope(target)) {
-				let name = body.local(local).name.inner;
-				types.push((Some(name), body.local(local).ty));
-				// A name the parser reported missing is no name to give.
-				if name != Keyword::Error.symbol() && !written.contains(&name) {
-					names.push((name, Definition::Local { owner, local }));
-				}
-			}
-			argument_types = Some(types);
-			names
-		}
-		Site::Argument {
-			target: ArgumentTarget::Call {
-				call,
-				callee,
-				given,
-			},
-			written,
-		} => {
-			let (_, reference) =
-				query::symbol_at(references, file, callee.start)?;
-			let names = sema.argument_names(reference.definition(), given);
-			// Names and visibility still come from the checker's contract.
-			// Only their displayed types use this call's inferred arguments.
-			argument_types = query::body_of(sema, declaration?)
-				.and_then(|owner| {
-					call::signature(sema, &snapshot.strings, owner, ast, call)
-				})
-				.map(|signature| signature.parameters);
-			names
-				.into_iter()
-				.filter(|(name, _)| !written.contains(name))
-				.collect()
-		}
-	};
-	let items = names
-		.into_iter()
-		.enumerate()
-		.map(|(index, (name, definition))| {
-			let mut item = item(
-				snapshot,
-				name,
-				definition,
-				insert,
-				member.then_some(index),
-				label_details,
-			);
-			if let Some((_, ty)) =
-				argument_types.as_ref().and_then(|parameters| {
-					parameters
-						.iter()
-						.find(|(parameter, _)| *parameter == Some(name))
-				}) {
-				let ty = snapshot
-					.sema
-					.type_formatter(&snapshot.strings)
-					.display_type(*ty);
-				item.detail = Some(format!("{}: {ty}", item.label));
-			}
-			item
+			within,
+			declaration,
+			use_scope,
+			options,
 		})
-		.collect();
-	Some(CompletionResponse::Array(items))
+	}
+}
+
+/// Where a candidate sorts among the others offered with it.
+#[derive(Clone, Copy)]
+enum Order {
+	/// Locals and type parameters before items, as the lookup tries them
+	/// first; each by name.
+	ByName,
+	/// At its position in the order its declaration lists it in.
+	Listed(usize),
+}
+
+/// `item`, a name of a value of type `ty` here: shown as `name: Type` and,
+/// with `label_details`, the type beside the name.
+fn with_type(
+	snapshot: &Snapshot,
+	item: &mut CompletionItem,
+	ty: TypeIndex,
+	label_details: bool,
+) {
+	let shown = display_type(snapshot, ty);
+	item.detail = Some(format!("{}: {shown}", item.label));
+	type_beside(snapshot, item, ty, label_details);
+}
+
+/// With `label_details`, `ty` beside `item`'s name, its detail kept.
+fn type_beside(
+	snapshot: &Snapshot,
+	item: &mut CompletionItem,
+	ty: TypeIndex,
+	label_details: bool,
+) {
+	if label_details {
+		item.label_details = Some(CompletionItemLabelDetails {
+			detail: None,
+			description: Some(display_type(snapshot, ty)),
+		});
+	}
+}
+
+fn display_type(snapshot: &Snapshot, ty: TypeIndex) -> String {
+	snapshot
+		.sema
+		.type_formatter(&snapshot.strings)
+		.display_type(ty)
+}
+
+/// What every candidate has, whatever its site: its name, kind, signature
+/// and documentation, sorted by `order`.
+fn candidate(
+	snapshot: &Snapshot,
+	name: SymbolU32,
+	definition: Definition,
+	order: Order,
+) -> CompletionItem {
+	let label = snapshot
+		.strings
+		.resolve(name)
+		.unwrap_or_default()
+		.to_string();
+	let (kind, rank) = match definition {
+		Definition::Local { .. } => (CompletionItemKind::VARIABLE, 0),
+		Definition::TypeParam { .. } => (CompletionItemKind::TYPE_PARAMETER, 0),
+		Definition::InherentImplTarget(_) | Definition::TraitImplTarget(_) => {
+			(CompletionItemKind::STRUCT, 0)
+		}
+		Definition::Label { .. } => (CompletionItemKind::REFERENCE, 0),
+		Definition::JumpTarget { .. } | Definition::FunctionBody(_) => {
+			unreachable!("a jump's destination has no name to complete")
+		}
+		Definition::Parameter { .. } => (CompletionItemKind::VARIABLE, 0),
+		Definition::Field { .. } => (CompletionItemKind::FIELD, 0),
+		Definition::Member(MemberKind::Method(_)) => {
+			(CompletionItemKind::METHOD, 0)
+		}
+		Definition::Member(MemberKind::Function(_)) => {
+			(CompletionItemKind::FUNCTION, 0)
+		}
+		Definition::Member(MemberKind::AssociatedType(_)) => {
+			(CompletionItemKind::STRUCT, 0)
+		}
+		Definition::Member(MemberKind::Constant(_)) => {
+			(CompletionItemKind::CONSTANT, 0)
+		}
+		Definition::Item(loc) => {
+			let kind = match snapshot.sema.declaration_kind(loc) {
+				DeclKind::Module(_)
+				| DeclKind::Import(_)
+				| DeclKind::Package(_)
+				| DeclKind::PackageInstance(_) => CompletionItemKind::MODULE,
+				DeclKind::Enum(_) => CompletionItemKind::ENUM,
+				DeclKind::EnumVariant(_) => CompletionItemKind::ENUM_MEMBER,
+				DeclKind::Struct(_)
+				| DeclKind::Memory(_)
+				| DeclKind::AssocType(_)
+				| DeclKind::TypeAlias(_) => CompletionItemKind::STRUCT,
+				DeclKind::Trait(_) | DeclKind::TypeSet(_) => {
+					CompletionItemKind::INTERFACE
+				}
+				DeclKind::Global(_) => CompletionItemKind::VARIABLE,
+				DeclKind::Function(_) => CompletionItemKind::FUNCTION,
+				DeclKind::Const(_) => CompletionItemKind::CONSTANT,
+			};
+			(kind, 1)
+		}
+	};
+	CompletionItem {
+		sort_text: Some(match order {
+			Order::ByName => format!("{rank}{label}"),
+			Order::Listed(at) => format!("{at:04}"),
+		}),
+		detail: hover::signature(&snapshot.sema, &snapshot.strings, definition),
+		documentation: hover::documentation(
+			&snapshot.sema,
+			&snapshot.compilation.files,
+			definition,
+		)
+		.map(|value| {
+			Documentation::MarkupContent(MarkupContent {
+				kind: MarkupKind::Markdown,
+				value,
+			})
+		}),
+		kind: Some(kind),
+		label,
+		..Default::default()
+	}
 }
 
 /// The keys the manifest of `file`'s package declares its dependencies
@@ -398,6 +340,7 @@ fn package_keys(
 					range,
 					new_text,
 				})),
+
 				..CompletionItem::default()
 			}
 		})
@@ -489,11 +432,23 @@ pub(crate) enum Jump {
 	Continue,
 }
 
-/// What can be written at the cursor, as completion offers it.
+/// What can be written at the cursor, as completion offers it: one kind of
+/// site per provider.
 pub(crate) enum Site {
+	/// A name that means something at the cursor (`references`).
+	Reference(ReferenceSite),
 	/// An ordinary match-pattern name or positional insertion, whose type
 	/// comes from checked patterns or the prospective insertion layout.
 	Pattern(PatternSite),
+	/// A name a declaration lists, to be filled in.
+	Slot(SlotSite),
+	/// The manifest key of a package instance, in its string literal
+	/// written at `literal`, opening quote included.
+	PackageKey { literal: TextSpan },
+}
+
+/// A name that means something at the cursor (`references::complete`).
+pub(crate) enum ReferenceSite {
 	/// A bare name, used as its `NameUse` says.
 	Name(NameUse),
 	/// A path's segment after another, used as `used_as` in what the one
@@ -516,6 +471,11 @@ pub(crate) enum Site {
 		prefix: TextSpan,
 		written: Vec<SymbolU32>,
 	},
+}
+
+/// A name a declaration lists, to be filled in at the cursor
+/// (`slots::complete`).
+pub(crate) enum SlotSite {
 	/// The name of an entry of a bound's `where { .. }` block, the `entry`
 	/// at the cursor: a member of the trait whose name is written at `bound`,
 	/// not among the `written` ones (by tier).
@@ -524,10 +484,11 @@ pub(crate) enum Site {
 		entry: Entry,
 		written: Vec<(Tier, SymbolU32)>,
 	},
-	/// The name of a field in a struct pattern with braces: one of the
-	/// fields of the struct or enum whose last name is written at `owner`,
-	/// not among the `written` ones.
+	/// The name of a field in the struct pattern `pattern`, with braces: one
+	/// of the fields of the struct or enum whose last name is written at
+	/// `owner`, not among the `written` ones.
 	PatternField {
+		pattern: PatId,
 		owner: TextSpan,
 		written: Vec<SymbolU32>,
 	},
@@ -537,9 +498,6 @@ pub(crate) enum Site {
 		target: ArgumentTarget,
 		written: Vec<SymbolU32>,
 	},
-	/// The manifest key of a package instance, in its string literal
-	/// written at `literal`, opening quote included.
-	PackageKey { literal: TextSpan },
 }
 
 /// What has the parameters a named list's names name.
@@ -554,177 +512,6 @@ pub(crate) enum ArgumentTarget {
 	/// The loop the `continue` written as `jump` restarts, as it was
 	/// checked.
 	Loop { jump: ExprId },
-}
-
-/// One candidate. Locals and type parameters sort before items, as the
-/// lookup tries them first. Members after `.` (`member_index`) keep the
-/// order the checker lists them in, and their receiver gives a method's
-/// `self`; named through a type (`Point::flip(p)`), a method takes it as an
-/// argument.
-fn item(
-	snapshot: &Snapshot,
-	name: SymbolU32,
-	definition: Definition,
-	insert: Insert,
-	member_index: Option<usize>,
-	label_details: bool,
-) -> CompletionItem {
-	let label = snapshot
-		.strings
-		.resolve(name)
-		.unwrap_or_default()
-		.to_string();
-	let (kind, rank) = match definition {
-		Definition::Local { .. } => (CompletionItemKind::VARIABLE, 0),
-		Definition::TypeParam { .. } => (CompletionItemKind::TYPE_PARAMETER, 0),
-		Definition::InherentImplTarget(_) | Definition::TraitImplTarget(_) => {
-			(CompletionItemKind::STRUCT, 0)
-		}
-		Definition::Label { .. } => (CompletionItemKind::REFERENCE, 0),
-		Definition::JumpTarget { .. } | Definition::FunctionBody(_) => {
-			unreachable!("a jump's destination has no name to complete")
-		}
-		// An argument's name: what a call by name may give, in order.
-		Definition::Parameter { .. } => (CompletionItemKind::VARIABLE, 0),
-		Definition::Field { .. } => (CompletionItemKind::FIELD, 0),
-		Definition::Member(MemberKind::Method(_)) => {
-			(CompletionItemKind::METHOD, 0)
-		}
-		Definition::Member(MemberKind::Function(_)) => {
-			(CompletionItemKind::FUNCTION, 0)
-		}
-		Definition::Member(MemberKind::AssociatedType(_)) => {
-			(CompletionItemKind::STRUCT, 0)
-		}
-		Definition::Member(MemberKind::Constant(_)) => {
-			(CompletionItemKind::CONSTANT, 0)
-		}
-		Definition::Item(loc) => {
-			let kind = match snapshot.sema.declaration_kind(loc) {
-				DeclKind::Module(_)
-				| DeclKind::Import(_)
-				| DeclKind::Package(_)
-				| DeclKind::PackageInstance(_) => CompletionItemKind::MODULE,
-				DeclKind::Enum(_) => CompletionItemKind::ENUM,
-				DeclKind::EnumVariant(_) => CompletionItemKind::ENUM_MEMBER,
-				DeclKind::Struct(_)
-				| DeclKind::Memory(_)
-				| DeclKind::AssocType(_)
-				| DeclKind::TypeAlias(_) => CompletionItemKind::STRUCT,
-				DeclKind::Trait(_) | DeclKind::TypeSet(_) => {
-					CompletionItemKind::INTERFACE
-				}
-				DeclKind::Global(_) => CompletionItemKind::VARIABLE,
-				DeclKind::Function(_) => CompletionItemKind::FUNCTION,
-				DeclKind::Const(_) => CompletionItemKind::CONSTANT,
-			};
-			(kind, 1)
-		}
-	};
-	let params = match definition {
-		Definition::Member(MemberKind::Method(function))
-			if member_index.is_some() =>
-		{
-			Some(
-				snapshot.sema.decls.functions[usize::from(function)]
-					.params
-					.len() - 1,
-			)
-		}
-		Definition::Member(
-			MemberKind::Function(function) | MemberKind::Method(function),
-		) => Some(
-			snapshot.sema.decls.functions[usize::from(function)]
-				.params
-				.len(),
-		),
-		Definition::Item(loc) => {
-			let decls = &snapshot.sema.decls;
-			match snapshot.sema.declaration_kind(loc) {
-				DeclKind::Function(function) => {
-					Some(decls.functions[usize::from(function)].params.len())
-				}
-				DeclKind::Struct(index) => {
-					Some(decls.structs[usize::from(index)].fields.len())
-				}
-				_ => None,
-			}
-		}
-		_ => None,
-	};
-	// The call punctuation uses the primary label's color. Filtering and
-	// insertion use the original name, including when a call is already written.
-	let display_label = match params {
-		Some(0) => format!("{label}()"),
-		Some(_) => format!("{label}(…)"),
-		None => label.clone(),
-	};
-	let insert_text = match insert {
-		Insert::Call => params.map(|params| match params {
-			0 => format!("{label}()"),
-			_ => format!("{label}($1)"),
-		}),
-		Insert::Name => params.map(|_| label.clone()),
-	};
-	let label_details = if label_details {
-		params.map(|_| {
-			let mut detail = None;
-			if let Definition::Member(MemberKind::Method(function)) = definition
-			{
-				let trait_index = match snapshot.sema.decls.functions
-					[usize::from(function)]
-				.owner
-				{
-					MemberOwner::Trait(index) => Some(index),
-					MemberOwner::TraitImpl(index) => {
-						snapshot.sema.trait_impl_trait(index)
-					}
-					MemberOwner::Free | MemberOwner::InherentImpl(_) => None,
-				};
-				if let Some(index) = trait_index {
-					detail = as_trait(snapshot, index);
-				}
-			}
-			CompletionItemLabelDetails {
-				detail,
-				description: hover::callable_type(
-					&snapshot.sema,
-					&snapshot.strings,
-					definition,
-				),
-			}
-		})
-	} else {
-		None
-	};
-
-	CompletionItem {
-		insert_text_format: (matches!(insert, Insert::Call)
-			&& params.is_some())
-		.then_some(InsertTextFormat::SNIPPET),
-		insert_text,
-		sort_text: Some(match member_index {
-			Some(index) => format!("{rank}{index:04}"),
-			None => format!("{rank}{label}"),
-		}),
-		detail: hover::signature(&snapshot.sema, &snapshot.strings, definition),
-		documentation: hover::documentation(
-			&snapshot.sema,
-			&snapshot.compilation.files,
-			definition,
-		)
-		.map(|value| {
-			Documentation::MarkupContent(MarkupContent {
-				kind: MarkupKind::Markdown,
-				value,
-			})
-		}),
-		kind: Some(kind),
-		label: display_label,
-		filter_text: params.map(|_| label),
-		label_details,
-		..Default::default()
-	}
 }
 
 /// The source following the identifier at the cursor, ignoring whitespace
@@ -747,38 +534,6 @@ fn after_name<'a>(
 		suffix = source[usize::from(comment.span.end)..].trim_start();
 	}
 	suffix
-}
-
-/// A member an entry of a bound's `where { .. }` block names, at `index` in
-/// the order the checker lists them. An inherited one names its trait, as a
-/// method does; a constant in an entry not marked yet inserts its `const`.
-fn binding_item(
-	snapshot: &Snapshot,
-	binding: BindingName,
-	entry: Entry,
-	index: usize,
-	label_details: bool,
-) -> CompletionItem {
-	let mut item = item(
-		snapshot,
-		binding.name,
-		Definition::Member(binding.member),
-		Insert::Name,
-		Some(index),
-		label_details,
-	);
-	if let (Entry::Unmarked, MemberKind::Constant(_)) = (entry, binding.member)
-	{
-		item.insert_text = Some(format!("const {}", item.label));
-		item.filter_text = Some(item.label.clone());
-	}
-	if label_details && let Some(from) = binding.inherited_from {
-		item.label_details = Some(CompletionItemLabelDetails {
-			detail: as_trait(snapshot, from),
-			description: None,
-		});
-	}
-	item
 }
 
 /// The secondary label of a member a trait supplies: `(as Trait)`.
@@ -1080,19 +835,23 @@ impl Cursor<'_> {
 		// A segment with more after it, or the first one.
 		let continued = |segment: Spanned<_>| {
 			self.at(segment.span).then_some(match prefix {
-				None => Site::Name(NameUse::Namespace),
-				Some(prefix) => Site::Segment {
+				None => {
+					Site::Reference(ReferenceSite::Name(NameUse::Namespace))
+				}
+				Some(prefix) => Site::Reference(ReferenceSite::Segment {
 					prefix,
 					used_as: NameUse::Namespace,
-				},
+				}),
 			})
 		};
 		let site = match tree {
 			UseTree::Name { segment, .. } => match prefix {
 				None => continued(segment),
-				Some(prefix) => self.at(segment.span).then(|| Site::Import {
-					prefix,
-					written: Vec::new(),
+				Some(prefix) => self.at(segment.span).then(|| {
+					Site::Reference(ReferenceSite::Import {
+						prefix,
+						written: Vec::new(),
+					})
 				}),
 			},
 			UseTree::Glob { segment } => continued(segment),
@@ -1133,7 +892,7 @@ impl Cursor<'_> {
 							);
 						}
 						// A leaf being written, or one not written yet.
-						_ => Some(Site::Import {
+						_ => Some(Site::Reference(ReferenceSite::Import {
 							prefix: segment.span,
 							written: (trees.iter().enumerate())
 								.filter(|&(index, _)| Some(index) != at)
@@ -1144,7 +903,7 @@ impl Cursor<'_> {
 									_ => None,
 								})
 								.collect(),
-						}),
+						})),
 					}
 				}
 			}
@@ -1228,7 +987,9 @@ impl Cursor<'_> {
 		}
 		match ast.bound(bound) {
 			// A bound the parser expected and did not find.
-			BoundExpression::Error => Some(Site::Name(NameUse::Bound)),
+			BoundExpression::Error => {
+				Some(Site::Reference(ReferenceSite::Name(NameUse::Bound)))
+			}
 			BoundExpression::Path(segments) => {
 				self.path(ast.list(segments), NameUse::Bound)
 			}
@@ -1279,7 +1040,7 @@ impl Cursor<'_> {
 			}
 			entry = self.entry(binding);
 		}
-		Some(Site::Binding {
+		Some(Site::Slot(SlotSite::Binding {
 			bound,
 			entry,
 			written: (bindings.iter().enumerate())
@@ -1292,7 +1053,7 @@ impl Cursor<'_> {
 					(tier, binding.name.inner)
 				})
 				.collect(),
-		})
+		}))
 	}
 
 	/// What an entry of a `where` block is, by what is written around its
@@ -1341,7 +1102,9 @@ impl Cursor<'_> {
 			(None, Some(tail)) if self.at(ast.expr_span(tail)) => {
 				self.expression(tail)
 			}
-			_ => self.inside(span).then_some(Site::Name(NameUse::Value)),
+			_ => self.inside(span).then_some(Site::Reference(
+				ReferenceSite::Name(NameUse::Value),
+			)),
 		}
 	}
 
@@ -1361,7 +1124,9 @@ impl Cursor<'_> {
 		}
 		match ast.expr(expression) {
 			// A value the parser expected and did not find.
-			Expression::Error => Some(Site::Name(NameUse::Value)),
+			Expression::Error => {
+				Some(Site::Reference(ReferenceSite::Name(NameUse::Value)))
+			}
 			Expression::Path(segments) => {
 				self.path(ast.list(segments), NameUse::Value)
 			}
@@ -1377,10 +1142,18 @@ impl Cursor<'_> {
 					Expression::NamedList { arguments: named } => {
 						(named, ast.expr_span(arguments))
 					}
+					Expression::Tuple { elements } => {
+						return self.expression(callee).or_else(|| {
+							self.list(
+								ast.arguments_span(arguments),
+								ast.list(elements),
+							)
+						});
+					}
 					_ => {
 						return self
 							.expression(callee)
-							.or_else(|| self.positional(arguments));
+							.or_else(|| self.expression(arguments));
 					}
 				};
 				// A method's object gives its receiver, one argument given.
@@ -1418,7 +1191,9 @@ impl Cursor<'_> {
 				.or_else(|| {
 					(ast.expr_span(object).end < self.offset
 						&& self.offset <= ast.segment(member).ident.span.end)
-						.then_some(Site::Member { object })
+						.then_some(Site::Reference(ReferenceSite::Member {
+							object,
+						}))
 				}),
 			Expression::Deref { pointer: value }
 			| Expression::AddressOf { value } => self.expression(value),
@@ -1521,9 +1296,9 @@ impl Cursor<'_> {
 	fn list(&self, delimiters: TextSpan, elements: &[ExprId]) -> Option<Site> {
 		match self.child_by(elements, |&element| self.ast.expr_span(element)) {
 			Some(&element) => self.expression(element),
-			None => self
-				.inside(delimiters)
-				.then_some(Site::Name(NameUse::Value)),
+			None => self.inside(delimiters).then_some(Site::Reference(
+				ReferenceSite::Name(NameUse::Value),
+			)),
 		}
 	}
 
@@ -1558,19 +1333,10 @@ impl Cursor<'_> {
 			.filter(|&(index, _)| Some(index) != at)
 			.map(|(_, argument)| argument.name.inner)
 			.collect();
-		Some(Site::Argument {
+		Some(Site::Slot(SlotSite::Argument {
 			target: target?,
 			written,
-		})
-	}
-
-	/// A positional argument list, a call's or a `continue`'s.
-	fn positional(&self, arguments: ExprId) -> Option<Site> {
-		let ast = self.ast;
-		let Expression::Tuple { elements } = ast.expr(arguments) else {
-			unreachable!("a positional argument list is a tuple")
-		};
-		self.list(ast.arguments_span(arguments), ast.list(elements))
+		}))
 	}
 
 	fn ty(&self, ty: TypeId) -> Option<Site> {
@@ -1580,7 +1346,9 @@ impl Cursor<'_> {
 		}
 		match ast.ty(ty) {
 			// A type the parser expected and did not find.
-			TypeExpression::Error => Some(Site::Name(NameUse::Type)),
+			TypeExpression::Error => {
+				Some(Site::Reference(ReferenceSite::Name(NameUse::Type)))
+			}
 			TypeExpression::Path(segments) => {
 				self.path(ast.list(segments), NameUse::Type)
 			}
@@ -1661,6 +1429,7 @@ impl Cursor<'_> {
 					.map(|site| self.pattern_site(pattern, forms, site))
 					.or_else(|| {
 						self.pattern_fields(
+							pattern,
 							path,
 							ast.list(fields),
 							braces,
@@ -1675,7 +1444,7 @@ impl Cursor<'_> {
 				Some(self.pattern_site(
 					pattern,
 					forms,
-					Site::Name(NameUse::Pattern),
+					Site::Reference(ReferenceSite::Name(NameUse::Pattern)),
 				))
 			}
 			// An explicitly mutable binding, or a local's own binding name,
@@ -1694,11 +1463,11 @@ impl Cursor<'_> {
 		site: Site,
 	) -> Site {
 		let prefix = match site {
-			Site::Name(NameUse::Pattern) => None,
-			Site::Segment {
+			Site::Reference(ReferenceSite::Name(NameUse::Pattern)) => None,
+			Site::Reference(ReferenceSite::Segment {
 				prefix,
 				used_as: NameUse::Pattern,
-			} => Some(prefix),
+			}) => Some(prefix),
 			_ => return site,
 		};
 		Site::Pattern(PatternSite {
@@ -1721,6 +1490,7 @@ impl Cursor<'_> {
 	/// fields of what `path` names; after a name's `:` is its pattern.
 	fn pattern_fields(
 		&self,
+		pattern: PatId,
 		path: &[PathSegment],
 		fields: &[PatternFieldItem],
 		braces: TextSpan,
@@ -1756,10 +1526,11 @@ impl Cursor<'_> {
 				PatternFieldItem::Rest(_) => None,
 			})
 			.collect();
-		Some(Site::PatternField {
+		Some(Site::Slot(SlotSite::PatternField {
+			pattern,
 			owner: path.last()?.ident.span,
 			written,
-		})
+		}))
 	}
 
 	fn pattern_elements(
@@ -1824,11 +1595,11 @@ impl Cursor<'_> {
 			NameUse::Type
 		};
 		Some(match index.checked_sub(1) {
-			None => Site::Name(used_as),
-			Some(before) => Site::Segment {
+			None => Site::Reference(ReferenceSite::Name(used_as)),
+			Some(before) => Site::Reference(ReferenceSite::Segment {
 				prefix: segments[before].ident.span,
 				used_as,
-			},
+			}),
 		})
 	}
 
@@ -1850,13 +1621,13 @@ impl Cursor<'_> {
 				if !self.at(first.ident.span) {
 					return self.type_args(first);
 				}
-				Some(Site::TraitMember {
+				Some(Site::Reference(ReferenceSite::TraitMember {
 					trait_name: trait_path.last()?.ident.span,
 					used_as: match segments.len() {
 						1 => used_as,
 						_ => NameUse::Type,
 					},
-				})
+				}))
 			})
 	}
 
@@ -1867,7 +1638,8 @@ impl Cursor<'_> {
 		label: Option<Spanned<SymbolU32>>,
 		jump: Jump,
 	) -> Option<Site> {
-		self.at(label?.span).then_some(Site::Label(jump))
+		self.at(label?.span)
+			.then_some(Site::Reference(ReferenceSite::Label(jump)))
 	}
 
 	fn type_args(&self, segment: &PathSegment) -> Option<Site> {
@@ -1899,7 +1671,9 @@ impl Cursor<'_> {
 				),
 			ConstArgument::Grouped { inner, .. } => self.ty(inner),
 			// A length not written yet (`[u8; ]`).
-			ConstArgument::Error => Some(Site::Name(NameUse::Constant)),
+			ConstArgument::Error => {
+				Some(Site::Reference(ReferenceSite::Name(NameUse::Constant)))
+			}
 			ConstArgument::Literal(_) | ConstArgument::Infer => None,
 		}
 	}

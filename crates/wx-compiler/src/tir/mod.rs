@@ -37,8 +37,8 @@ use self::decls::Declarations;
 pub use self::decls::{
 	AssocTypeIdx, ConstIdx, DeclKind, Declared, EnumIdx, FieldIdx, FieldOwner,
 	FunctionIdx, GlobalIdx, InherentImplIdx, ItemLoc, MemberKind, MemberOwner,
-	MemoryIdx, NameUse, StructIdx, Tier, TraitIdx, TraitImplIdx, TypeAliasIdx,
-	TypeRole, TypesetIdx, UseItemIndex, Visibility,
+	MemoryIdx, NameUse, Scope, StructIdx, Tier, TraitIdx, TraitImplIdx,
+	TypeAliasIdx, TypeRole, TypesetIdx, UseItemIndex, Visibility,
 };
 pub use self::eval::{AllocIdx, ConstScalar, Val};
 pub use self::format::{BoundFormatter, TypeFormatter};

@@ -26,12 +26,18 @@ pub(crate) struct ClientConfig {
 	pub(crate) workspace_folders: Vec<PathBuf>,
 	/// Whether the client accepts `workspace/semanticTokens/refresh`.
 	pub(crate) semantic_tokens_refresh: bool,
-	/// Whether the client takes snippets in completion items.
-	pub(crate) completion_snippets: bool,
-	/// Whether completion labels can carry secondary text.
-	pub(crate) completion_label_details: bool,
+	pub(crate) completion: CompletionSupport,
 	/// Whether parameter labels may be UTF-16 offsets into the signature.
 	pub(crate) signature_label_offsets: bool,
+}
+
+/// What the client takes in completion items.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CompletionSupport {
+	/// Snippets, so a call can be inserted with its parentheses.
+	pub(crate) snippets: bool,
+	/// Secondary text on a label.
+	pub(crate) label_details: bool,
 }
 
 #[derive(Default)]

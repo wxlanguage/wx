@@ -26,7 +26,7 @@ use wx_compiler::vfs::{AbsolutePath, CoreFileSource};
 
 use crate::actor::{Command, StateHandle};
 use crate::convert::uri_to_path;
-use crate::state::ClientConfig;
+use crate::state::{ClientConfig, CompletionSupport};
 
 #[derive(serde::Deserialize)]
 struct VirtualFileContentParams {
@@ -91,22 +91,22 @@ impl LanguageServer for Backend {
 				.and_then(|signature| signature.parameter_information.as_ref())
 				.and_then(|parameter| parameter.label_offset_support)
 				.unwrap_or(false),
-			completion_label_details: params
-				.capabilities
-				.text_document
-				.as_ref()
-				.and_then(|document| document.completion.as_ref())
-				.and_then(|completion| completion.completion_item.as_ref())
-				.and_then(|item| item.label_details_support)
-				.unwrap_or(false),
-			completion_snippets: params
-				.capabilities
-				.text_document
-				.as_ref()
-				.and_then(|document| document.completion.as_ref())
-				.and_then(|completion| completion.completion_item.as_ref())
-				.and_then(|item| item.snippet_support)
-				.unwrap_or(false),
+			completion: {
+				let item = params
+					.capabilities
+					.text_document
+					.as_ref()
+					.and_then(|document| document.completion.as_ref())
+					.and_then(|completion| completion.completion_item.as_ref());
+				CompletionSupport {
+					snippets: item
+						.and_then(|item| item.snippet_support)
+						.unwrap_or(false),
+					label_details: item
+						.and_then(|item| item.label_details_support)
+						.unwrap_or(false),
+				}
+			},
 		}));
 		self.supports_dynamic_registration.store(
 			params

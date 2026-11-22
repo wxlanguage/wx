@@ -251,9 +251,38 @@ pub(crate) fn branch(
 	))
 }
 
-/// A compact callable type for a completion's right-hand description. The
-/// name is already in its label; only `self` keeps its parameter name.
-pub(crate) fn callable_type(
+/// The type of the value a name of `definition` holds, as its signature
+/// states it: a local's or a constant's. `None` for anything else: a
+/// global's name is a handle of its own type (`declaration_summary`), and a
+/// field's type depends on the value it is read from
+/// (`Semantics::field_type`).
+pub(crate) fn value_type(
+	sema: &Semantics,
+	definition: Definition,
+) -> Option<TypeIndex> {
+	match definition {
+		Definition::Local { owner, local } => {
+			Some(sema.owner_body(owner)?.local(local).ty)
+		}
+		Definition::Member(MemberKind::Constant(index)) => {
+			Some(sema.constants[usize::from(index)].ty)
+		}
+		Definition::Item(loc) => match sema.declaration_kind(loc) {
+			DeclKind::Const(index) => {
+				Some(sema.constants[usize::from(index)].ty)
+			}
+			_ => None,
+		},
+		_ => None,
+	}
+}
+
+/// A declaration's compact form, for a completion's right-hand
+/// description: what the name declares, never a type, since a function's,
+/// a constructor's or a global's type is its own. Parameters are listed by
+/// type, and only `self` keeps its name; type parameters by name. `None`
+/// for a name that is a value, whose type describes it (`value_type`).
+pub(crate) fn declaration_summary(
 	sema: &Semantics,
 	strings: &StringInterner,
 	definition: Definition,
@@ -275,11 +304,14 @@ pub(crate) fn callable_type(
 					.map(|&ty| renderer.ty(ty))
 					.collect::<Vec<_>>();
 				return Some(format!(
-					"func({}) -> {}{}",
-					fields.join(", "),
+					"struct {}{}({})",
 					renderer.name(sema.decls.item(decl.loc).name),
-					renderer.type_params(signature.type_params)
+					renderer.type_param_names(signature.type_params),
+					fields.join(", ")
 				));
+			}
+			DeclKind::Global(_) | DeclKind::Memory(_) => {
+				return signature(sema, strings, definition);
 			}
 			_ => return None,
 		},
@@ -302,7 +334,9 @@ pub(crate) fn callable_type(
 		})
 		.collect::<Vec<_>>();
 	Some(format!(
-		"func({}) -> {}",
+		"func {}{}({}) -> {}",
+		renderer.name(sema.decls.item(decl.loc).name),
+		renderer.type_param_names(renderer.own_type_params(function)),
 		params.join(", "),
 		renderer.ty(signature.return_type)
 	))
@@ -431,6 +465,20 @@ impl Renderer<'_> {
 	}
 
 	/// `<A, B>`, or nothing when the declaration has no parameters of its own.
+	/// `<T, U>`: the type parameters of `env` by name, without their
+	/// bounds; nothing when it has none.
+	fn type_param_names(&self, env: GenericEnvIdx) -> String {
+		let names = self.sema.generic_envs.param_names(env);
+		if names.is_empty() {
+			return String::new();
+		}
+		let names: Vec<_> = names
+			.iter()
+			.map(|&name| self.name(name).to_string())
+			.collect();
+		format!("<{}>", names.join(", "))
+	}
+
 	fn type_params(&self, env: GenericEnvIdx) -> String {
 		let names = self.sema.generic_envs.param_names(env);
 		if names.is_empty() {

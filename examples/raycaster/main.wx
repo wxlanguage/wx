@@ -2,6 +2,7 @@
 memory heap: u32;
 
 package "math" as math;
+
 use math::Float;
 
 import "host" as host {
@@ -64,9 +65,9 @@ func find_spawn() {
                 player_angle.set(0.0);
                 break :rows;
             }
-            continue(x + 1);
+            continue (x + 1);
         }
-        continue(y + 1);
+        continue (y + 1);
     };
 }
 
@@ -164,7 +165,7 @@ func cast_ray(ox: f64, oy: f64, angle: f64) -> RayHit {
         if (side_dist_x < side_dist_y) {
             local map_x = map_x + step_x;
             if (map_at(map_x, map_y) != 0) { break (map_x, map_y, (0: i32)) };
-            continue(map_x, map_y, side_dist_x + delta_dist_x, side_dist_y);
+            continue (map_x, map_y, side_dist_x + delta_dist_x, side_dist_y);
         }
         local map_y = map_y + step_y;
         if (map_at(map_x, map_y) != 0) { break (map_x, map_y, 1) };
@@ -214,9 +215,9 @@ pub func render() {
                     put_pixel(x, y, shade, 0, 0);
                 };
             }
-            continue(y + 1);
+            continue (y + 1);
         }
-        continue(x + 1);
+        continue (x + 1);
     };
 }
 

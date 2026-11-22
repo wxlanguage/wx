@@ -166,14 +166,13 @@ func update(dt: i64) {
 
 func draw() {
     host::clear(0xFF101010);
-
-    host::draw_rect(
-        food_x.get() * CELL_SIZE,
-        food_y.get() * CELL_SIZE,
-        CELL_SIZE,
-        CELL_SIZE,
-        0xFFFFFF00,
-    );
+    host::draw_rect{
+        x: food_x.get() * CELL_SIZE,
+        y: food_y.get() * CELL_SIZE,
+        w: CELL_SIZE,
+        h: CELL_SIZE,
+        color: 0xFFFFFF00,
+    };
 
     // The head is red, then the body green.
     loop (
@@ -182,13 +181,13 @@ func draw() {
     ) {
         if (curr.is_null()) { break };
         local n = curr.as_ref();
-        host::draw_rect(
-            n.x * CELL_SIZE,
-            n.y * CELL_SIZE,
-            CELL_SIZE,
-            CELL_SIZE,
+        host::draw_rect{
+            x: n.x * CELL_SIZE,
+            y: n.y * CELL_SIZE,
+            w: CELL_SIZE,
+            h: CELL_SIZE,
             color,
-        );
+        };
         (n.next, 0xFF00FF00)
     }
 }

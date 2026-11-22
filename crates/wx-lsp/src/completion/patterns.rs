@@ -2,20 +2,20 @@
 //! positional insertion layouts. Explicit `const` uses the constant provider.
 
 use string_interner::symbol::SymbolU32;
-use tower_lsp_server::ls_types::{
-	CompletionItem, CompletionResponse, InsertTextFormat,
-};
+use tower_lsp_server::ls_types::{CompletionItem, InsertTextFormat};
 use wx_compiler::ast::{self, AST, Destructure, Pattern, PatternElement};
-use wx_compiler::diagnostics::{SourceSpan, TextOffset, TextSpan};
+use wx_compiler::diagnostics::{SourceSpan, TextSpan};
 use wx_compiler::symbols::StringInterner;
 use wx_compiler::tir::{
 	BodyOwner, ConstIdx, DeclKind, Definition, FieldIdx, FieldListShape,
-	FieldOwner, ItemLoc, NameUse, Operand, Reference, Semantics, Site, Type,
-	TypeIndex, TypeList, positional_pattern_gap,
+	FieldOwner, NameUse, Operand, Reference, Semantics, Site, Type, TypeIndex,
+	TypeList, positional_pattern_gap,
 };
 use wx_compiler::vfs::FileId;
 
-use super::{Insert, after_name, item};
+use super::references::{arguments, reference_item};
+use super::{Insert, Order, Request, after_name};
+use crate::state::CompletionSupport;
 use crate::{query, snapshot::Snapshot};
 
 pub(crate) struct PatternSite {
@@ -43,32 +43,25 @@ pub(crate) enum PatternForms {
 fn constructor_item(
 	snapshot: &Snapshot,
 	name: SymbolU32,
-	loc: ItemLoc,
+	owner: FieldOwner,
 	suffix: &str,
-	snippets: bool,
-	label_details: bool,
+	options: CompletionSupport,
 ) -> CompletionItem {
-	let fields = match snapshot.sema.declaration_kind(loc) {
-		DeclKind::Struct(index) => {
-			snapshot.sema.decls.structs[usize::from(index)].fields
-		}
-		DeclKind::Enum(index) => {
-			snapshot.sema.decls.enums[usize::from(index)].fields
-		}
-		_ => unreachable!("only a struct or an enum is a constructor"),
-	};
+	let fields = owner.fields(&snapshot.sema.decls);
 	let (open, close) = if snapshot.sema.decls.fields.is_fully_named(fields) {
 		('{', '}')
 	} else {
 		('(', ')')
 	};
-	let mut item = item(
+	let definition = Definition::Item(owner.loc(&snapshot.sema.decls));
+	let mut item = reference_item(
 		snapshot,
 		name,
-		Definition::Item(loc),
+		definition,
+		Order::ByName,
 		Insert::Name,
-		None,
-		label_details,
+		arguments(snapshot, definition),
+		options.label_details,
 	);
 	let name = snapshot
 		.strings
@@ -78,7 +71,7 @@ fn constructor_item(
 	item.filter_text = Some(name.to_owned());
 	if suffix.starts_with(['{', '(']) || suffix.starts_with("::") {
 		item.insert_text = Some(name.to_owned());
-	} else if snippets {
+	} else if options.snippets {
 		item.insert_text = Some(format!("{name}{open} ${{1:..}} {close}"));
 		item.insert_text_format = Some(InsertTextFormat::SNIPPET);
 	} else {
@@ -87,15 +80,15 @@ fn constructor_item(
 	item
 }
 
+/// The names a pattern at `site` can take at the cursor.
 pub(super) fn complete(
-	snapshot: &mut Snapshot,
-	file: FileId,
-	declaration: Definition,
+	request: &mut Request,
 	site: PatternSite,
-	offset: TextOffset,
-	snippets: bool,
-	label_details: bool,
-) -> Option<CompletionResponse> {
+) -> Option<Vec<CompletionItem>> {
+	let (file, offset, options) =
+		(request.file, request.offset, request.options);
+	let declaration = request.declaration?;
+	let snapshot = &mut *request.snapshot;
 	let PatternSite {
 		target,
 		prefix,
@@ -121,7 +114,7 @@ pub(super) fn complete(
 	}
 	let forms = context.narrowed(forms, &ancestors);
 	let Some(expected) = context.expected_type(target) else {
-		return Some(CompletionResponse::Array(items));
+		return Some(items);
 	};
 	let scope = snapshot.sema.body_scope(owner);
 	let resolved_prefix = prefix.and_then(|prefix| {
@@ -133,7 +126,7 @@ pub(super) fn complete(
 		(Some(_), Some(Definition::Item(loc))) => {
 			snapshot.sema.names_in(scope, loc, NameUse::Pattern)
 		}
-		_ => return Some(CompletionResponse::Array(items)),
+		_ => return Some(items),
 	};
 	let source = &snapshot.compilation.files.get(file).ok()?.source;
 	let suffix =
@@ -178,13 +171,14 @@ pub(super) fn complete(
 					else {
 						continue;
 					};
-					let mut candidate = item(
+					let mut candidate = reference_item(
 						snapshot,
 						name,
 						definition,
+						Order::ByName,
 						Insert::Name,
-						None,
-						label_details,
+						arguments(snapshot, definition),
+						options.label_details,
 					);
 					let name = snapshot
 						.strings
@@ -198,29 +192,23 @@ pub(super) fn complete(
 			}
 			None
 		}
-		Type::Enum { enum_index } => {
-			Some(snapshot.sema.decls.enums[usize::from(enum_index)].loc)
-		}
+		Type::Enum { enum_index } => Some(FieldOwner::Enum(enum_index)),
 		Type::Struct { struct_index, .. } => {
-			Some(snapshot.sema.decls.structs[usize::from(struct_index)].loc)
+			Some(FieldOwner::Struct(struct_index))
 		}
 		_ => None,
 	};
-	if let Some(loc) = constructor {
+	if let Some(owner) = constructor {
+		let loc = owner.loc(&snapshot.sema.decls);
 		for (name, definition) in candidates {
 			if definition == Definition::Item(loc) {
 				items.push(constructor_item(
-					snapshot,
-					name,
-					loc,
-					suffix,
-					snippets,
-					label_details,
+					snapshot, name, owner, suffix, options,
 				));
 			}
 		}
 	}
-	Some(CompletionResponse::Array(items))
+	Some(items)
 }
 
 /// A written child to replace, or a new positional child to insert.

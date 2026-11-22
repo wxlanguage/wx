@@ -2307,8 +2307,10 @@ fn completion_items(
 	let text = source.replacen("$0", "", 1);
 	let root = PathBuf::from("/test/main.wx");
 	let (mut state, _) = analyzed(&root, &text);
-	state.client.completion_snippets = snippets;
-	state.client.completion_label_details = true;
+	state.client.completion = crate::state::CompletionSupport {
+		snippets,
+		label_details: true,
+	};
 	let uri = Uri::from_file_path(&root).unwrap();
 	let line = text[..offset].matches('\n').count();
 	let line_start = text[..offset].rfind('\n').map_or(0, |at| at + 1);
@@ -3771,6 +3773,155 @@ fn completion_of_a_named_state_offers_the_loops_parameters() {
 	}
 }
 
+/// Names a declaration lists in order are offered in that order, not by
+/// name, as the editor sorts by each item's sort text.
+#[test]
+fn completion_of_names_by_declaration_offers_them_in_declaration_order() {
+	const DECLARED: &str = "\
+		struct Rect(width: u32, height: u32, area: u32);\n\
+		func g(zeta: u32, alpha: u32, mid: u32) {}\n";
+	for (site, expected) in [
+		("g{ $0 }", &["zeta", "alpha", "mid"][..]),
+		("g{ zeta: 1, $0 }", &["alpha", "mid"]),
+		("Rect{ $0 }", &["width", "height", "area"]),
+		(
+			"local Rect{ $0 } = Rect(1, 2, 3);",
+			&["width", "height", "area"],
+		),
+		(
+			"loop (zeta: u32 = 0, alpha: u32 = 0) { continue { $0 } }",
+			&["zeta", "alpha"],
+		),
+	] {
+		let labels =
+			completions(&format!("{DECLARED}func f() {{\n    {site};\n}}\n"))
+				.unwrap_or_else(|| panic!("nothing offered in {site:?}"));
+		assert_eq!(labels, expected, "{site:?}");
+	}
+}
+
+/// A name a declaration lists shows its type beside it, as the call
+/// instantiates it.
+#[test]
+fn completion_of_names_by_declaration_shows_their_types_beside_them() {
+	let source = "\
+		struct Wrap<T>(value: T, count: u32);\n\
+		func g(flag: Bool, size: u64) {}\n\
+		func f() {\n    g{ $0 };\n    local w: Wrap<i8> = Wrap{ value: 1, count: 2 };\n}\n";
+	let descriptions = |source: &str| -> Vec<(String, Option<String>)> {
+		completion_items(source, false)
+			.unwrap()
+			.into_iter()
+			.map(|item| {
+				let description =
+					item.label_details.and_then(|details| details.description);
+				(item.label, description)
+			})
+			.collect()
+	};
+	assert_eq!(
+		descriptions(source),
+		[
+			("flag".to_owned(), Some("Bool".to_owned())),
+			("size".to_owned(), Some("u64".to_owned())),
+		]
+	);
+	let generic = source
+		.replacen("g{ $0 }", "g{ flag: True, size: 1 }", 1)
+		.replacen("Wrap{ value: 1, count: 2 }", "Wrap{ $0 }", 1);
+	assert_eq!(
+		descriptions(&generic),
+		[
+			("value".to_owned(), Some("i8".to_owned())),
+			("count".to_owned(), Some("u32".to_owned())),
+		]
+	);
+}
+
+/// A field shows its type on the receiver or on the type a pattern was
+/// checked against, the struct's type arguments in place of its
+/// parameters.
+#[test]
+fn completion_of_a_field_shows_its_type_on_the_value() {
+	const PAIR: &str = "\
+		memory heap: u32;\n\
+		struct Pair<T>(first: T, count: u32);\n";
+	let typed = |site: &str| -> Vec<(String, Option<String>, Option<String>)> {
+		let source = format!(
+			"{PAIR}func f(p: Pair<i32>, q: heap::&Pair<u8>) {{\n    {site};\n}}\n"
+		);
+		completion_items(&source, false)
+			.unwrap_or_else(|| panic!("nothing offered in {site:?}"))
+			.into_iter()
+			.map(|item| {
+				let description =
+					item.label_details.and_then(|details| details.description);
+				(item.label, item.detail, description)
+			})
+			.collect()
+	};
+	let expected = |first: &str| {
+		vec![
+			(
+				"first".to_owned(),
+				Some(format!("first: {first}")),
+				Some(first.to_owned()),
+			),
+			(
+				"count".to_owned(),
+				Some("count: u32".to_owned()),
+				Some("u32".to_owned()),
+			),
+		]
+	};
+	assert_eq!(typed("p.$0"), expected("i32"));
+	assert_eq!(typed("q.$0"), expected("u8"));
+	assert_eq!(typed("local Pair{ $0 } = p"), expected("i32"));
+}
+
+/// A name that holds a value shows its type beside it: a local, a constant,
+/// a type's constant. Its detail stays its signature.
+#[test]
+fn completion_of_a_value_shows_its_type_beside_it() {
+	let source = |site: &str| {
+		format!(
+			"const LIMIT: u32 = 10;\n\
+			 global mut bump: u64 = 4;\n\
+			 struct S();\n\
+			 impl S {{\n    pub const ZERO: i8 = 0;\n}}\n\
+			 func f() {{\n    local count: i16 = 1;\n    {site};\n}}\n"
+		)
+	};
+	let beside = |site: &str, label: &str| {
+		let items = completion_items(&source(site), false)
+			.unwrap_or_else(|| panic!("nothing offered in {site:?}"));
+		let item = items
+			.into_iter()
+			.find(|item| item.label == label)
+			.unwrap_or_else(|| panic!("`{label}` not offered in {site:?}"));
+		let description =
+			item.label_details.and_then(|details| details.description);
+		(item.detail, description)
+	};
+	assert_eq!(
+		beside("$0", "count"),
+		(Some("local count: i16".to_owned()), Some("i16".to_owned()))
+	);
+	assert_eq!(
+		beside("$0", "LIMIT"),
+		(Some("const LIMIT: u32".to_owned()), Some("u32".to_owned()))
+	);
+	// A global's name is a handle of its own type: it shows its declaration.
+	assert_eq!(
+		beside("$0", "bump").1,
+		Some("global mut bump: u64".to_owned())
+	);
+	assert_eq!(
+		beside("S::$0", "ZERO"),
+		(Some("const ZERO: i8".to_owned()), Some("i8".to_owned()))
+	);
+}
+
 #[test]
 fn completion_after_a_named_arguments_colon_offers_values() {
 	let labels = completions(&format!(
@@ -3877,6 +4028,17 @@ impl Inner {
 }
 struct Outer(inner: Inner);
 ";
+
+/// `x.` on a line of its own offers `x`'s members whatever the next line
+/// starts with: a path there is not read as part of the access.
+#[test]
+fn completion_of_a_member_before_a_path_on_the_next_line() {
+	let source = "\
+		mod host { pub func clear(v: u32) {} }\n\
+		struct Point(x: u32, y: u32);\n\
+		func f(p: Point) {\n    p.$0\n\n    host::clear(1);\n}\n";
+	assert_eq!(completions(source).unwrap(), ["x", "y"]);
+}
 
 #[test]
 fn completion_of_a_member_keeps_fields_then_methods_in_declaration_order() {
@@ -4413,9 +4575,9 @@ fn completion_labels_name_the_trait_that_supplies_a_method() {
 				.and_then(|details| details.description.as_deref()))
 			.collect::<Vec<_>>(),
 		[
-			Some("func(self: S) -> u32"),
-			Some("func(self: S) -> u32"),
-			Some("func(self: Self) -> u32"),
+			Some("func inherent(self: S) -> u32"),
+			Some("func named(self: S) -> u32"),
+			Some("func defaulted(self: Self) -> u32"),
 		]
 	);
 	let labels: Vec<_> = items
@@ -4623,14 +4785,27 @@ fn completion_displays_call_punctuation_and_compact_signatures() {
 				.collect::<Vec<_>>(),
 			["z", "a", "get()", "set(…)"]
 		);
-		assert_eq!(items[0].label_details, None);
-		assert_eq!(items[1].label_details, None);
+		// A field shows its type beside it, as a call shows its signature.
+		for field in &items[..2] {
+			assert_eq!(
+				field
+					.label_details
+					.as_ref()
+					.and_then(|details| details.description.as_deref()),
+				Some("u32")
+			);
+		}
 		for (label, punctuation, description, inserted) in [
-			("get", "()", "func(self: heap::&Inner) -> u32", get_insert),
+			(
+				"get",
+				"()",
+				"func get(self: heap::&Inner) -> u32",
+				get_insert,
+			),
 			(
 				"set",
 				"(…)",
-				"func(self: heap::*Inner, u32) -> ()",
+				"func set(self: heap::*Inner, u32) -> ()",
 				set_insert,
 			),
 		] {
@@ -4650,14 +4825,45 @@ fn completion_displays_call_punctuation_and_compact_signatures() {
 	}
 }
 
+/// A function's, a constructor's, a memory's or a global's type is its
+/// own, so beside its name is its declaration, not a type: its type
+/// parameters by name, its parameters by type.
+#[test]
+fn completion_shows_a_declaration_beside_its_name() {
+	let items = completion_items(
+		"memory heap: u32;\n\
+		 global fixed: u8 = 1;\n\
+		 struct Box<T>(value: T);\n\
+		 func id<T: StackValue>(value: T) -> T { value }\n\
+		 func f() { $0 }",
+		false,
+	)
+	.unwrap();
+	let beside = |name: &str| {
+		items
+			.iter()
+			.find(|item| {
+				item.filter_text.as_deref().unwrap_or(&item.label) == name
+			})
+			.unwrap_or_else(|| panic!("`{name}` not offered"))
+			.label_details
+			.as_ref()
+			.and_then(|details| details.description.clone())
+	};
+	assert_eq!(beside("heap").as_deref(), Some("memory heap: u32"));
+	assert_eq!(beside("fixed").as_deref(), Some("global fixed: u8"));
+	assert_eq!(beside("Box").as_deref(), Some("struct Box<T>(T)"));
+	assert_eq!(beside("id").as_deref(), Some("func id<T>(T) -> T"));
+}
+
 #[test]
 fn completion_displays_call_punctuation_for_functions_and_constructors() {
 	let items = completion_items("func zero() {} func one(value: u32) -> u32 { value } struct Empty(); struct Pair(a: u32, b: u32); func f() { $0 }", false).unwrap();
 	for (label, punctuation, description) in [
-		("zero", "()", "func() -> ()"),
-		("one", "(…)", "func(u32) -> u32"),
-		("Empty", "()", "func() -> Empty"),
-		("Pair", "(…)", "func(u32, u32) -> Pair"),
+		("zero", "()", "func zero() -> ()"),
+		("one", "(…)", "func one(u32) -> u32"),
+		("Empty", "()", "struct Empty()"),
+		("Pair", "(…)", "struct Pair(u32, u32)"),
 	] {
 		let item = items
 			.iter()
@@ -4766,7 +4972,7 @@ fn named_argument_completion_uses_the_impls_parameter_names() {
 		("s.take{ $0 }", vec![("rhs", "rhs: S")]),
 		(
 			"S::take{ $0 }",
-			vec![("rhs", "rhs: S"), ("self", "self: S")],
+			vec![("self", "self: S"), ("rhs", "rhs: S")],
 		),
 	] {
 		let items = completion_items(

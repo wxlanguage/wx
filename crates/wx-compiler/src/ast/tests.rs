@@ -2617,10 +2617,13 @@ fn test_invalid_attribute_and_namespace_diagnostics() {
         }
     "});
 
+	// The expression before `::` is kept, and the name after it read on as
+	// a statement of its own, missing its `;`.
 	case.diagnostics().assert_codes(&[
 		DiagnosticCode::InvalidAttribute,
 		DiagnosticCode::InvalidItem,
 		DiagnosticCode::InvalidNamespace,
+		DiagnosticCode::MissingSemicolon,
 	]);
 	assert_eq!(case.ast.root.len(), 2);
 	assert!(matches!(case.item(0), Item::Function { .. }));
@@ -4834,6 +4837,30 @@ fn a_keyword_after_a_dot_starts_the_next_statement() {
 	assert_eq!(block.len(), 2);
 	assert_eq!(case.shape(case.entry_expr(&block, 0)), "(. p <error>)");
 	assert_eq!(case.shape(case.local_value(&block, 1)), "1");
+	assert_eq!(case.ast.root.len(), 2, "the next item still parses");
+}
+
+/// Only type arguments follow `::` after an expression. `x.` on a line of
+/// its own, before a statement that starts with a path, reads the path's
+/// first name as the member; the access is kept rather than the statement
+/// lost, and what follows the `::` is read on as a statement of its own.
+#[test]
+fn a_path_after_a_member_keeps_the_access() {
+	let case = TestCase::new(indoc! {"
+		func f() {
+		    p.
+		    host::clear(1);
+		}
+		func g() {}
+	"});
+	case.diagnostics().assert_codes(&[
+		DiagnosticCode::InvalidNamespace,
+		DiagnosticCode::MissingSemicolon,
+	]);
+	let block = case.function_block(0);
+	assert_eq!(block.len(), 2);
+	assert_eq!(case.shape(case.entry_expr(&block, 0)), "(. p host)");
+	assert_eq!(case.shape(case.entry_expr(&block, 1)), "(call clear 1)");
 	assert_eq!(case.ast.root.len(), 2, "the next item still parses");
 }
 

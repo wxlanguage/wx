@@ -26,7 +26,7 @@ use crate::tir::decls::{FieldIdx, FieldOwner, TraitIdx};
 use crate::tir::operators::is_primitive_binary;
 use crate::tir::resolutions::{Reference, Site};
 use crate::tir::solver::SolverError;
-use crate::tir::types::{Substitution, Type, TypeIndex};
+use crate::tir::types::{Type, TypeIndex};
 
 /// A field a write would change in place without its `mut`.
 #[derive(Clone, Copy)]
@@ -484,16 +484,11 @@ impl BodyBuilder<'_, '_> {
 			return None;
 		}
 		let name = self.builder.strings.resolve(member.inner).unwrap();
-		let (owner, type_args) = match *self.sema.types.resolve(object_ty) {
-			Type::Struct {
-				struct_index,
-				type_args,
-			} => (FieldOwner::Struct(struct_index), type_args),
-			// An enum has no type parameters.
-			Type::Enum { enum_index } => (
-				FieldOwner::Enum(enum_index),
-				crate::tir::types::TypeList::EMPTY,
-			),
+		let owner = match *self.sema.types.resolve(object_ty) {
+			Type::Struct { struct_index, .. } => {
+				FieldOwner::Struct(struct_index)
+			}
+			Type::Enum { enum_index } => FieldOwner::Enum(enum_index),
 			_ => {
 				let found = self
 					.sema
@@ -565,30 +560,10 @@ impl BodyBuilder<'_, '_> {
 					),
 			);
 		}
-		let ty = match owner {
-			FieldOwner::Struct(struct_index) => {
-				let signature = &self.sema.structs[usize::from(struct_index)];
-				let (declared, env) = (
-					self.sema.types.list(signature.field_types)
-						[usize::from(field)],
-					signature.type_params,
-				);
-				let args = self.sema.types.list(type_args).to_vec();
-				self.sema.types.substitute(
-					declared,
-					Substitution {
-						envs: &self.sema.generic_envs,
-						env,
-						args: &args,
-					},
-				)
-			}
-			FieldOwner::Enum(enum_index) => self
-				.sema
-				.types
-				.list(self.sema.enums[usize::from(enum_index)].field_types)
-				[usize::from(field)],
-		};
+		let ty = self
+			.sema
+			.field_type(object_ty, field)
+			.expect("a struct's or an enum's field");
 		Some((field, self.context().normalized(ty)))
 	}
 

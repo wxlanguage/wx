@@ -3190,10 +3190,13 @@ impl<'ctx> Parser<'ctx> {
 			};
 		}
 
+		// Only type arguments follow `::` here. What parsed before it is
+		// kept, so an unfinished `x.` before a path on the next line
+		// (`x.` then `host::f()`) still reads `x`'s member.
 		let bad = self.lexer.peek();
 		self.diagnostics
 			.push(report_invalid_namespace(self.file_id, bad.span));
-		Err(())
+		Ok(left)
 	}
 
 	/// `callee(a, b)` or `callee{ x: a, y }`. A callee that names a
