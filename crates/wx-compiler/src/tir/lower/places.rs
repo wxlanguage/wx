@@ -87,7 +87,7 @@ impl Lowerer<'_> {
 					memory: self.memory_of_type(memory),
 				})
 			}
-			PlaceKind::Field { object, field } => {
+			PlaceKind::Field { object, field, .. } => {
 				let address = self.lower_place(body, state, object)?;
 				let object_ty = body.place(object).ty;
 				let object_ty =

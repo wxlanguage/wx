@@ -3536,7 +3536,7 @@ mod tests {
 						.len();
 					self.render_arguments(body, name, count, fields)
 				}
-				ExprKind::FieldAccess { object, field } => format!(
+				ExprKind::FieldAccess { object, field, .. } => format!(
 					"(. {} {})",
 					self.render(body, object),
 					self.field_name(body.ty(object), field)
@@ -3756,7 +3756,7 @@ mod tests {
 				PlaceKind::Deref { pointer, .. } => {
 					format!("(* {})", self.render(body, pointer))
 				}
-				PlaceKind::Field { object, field } => format!(
+				PlaceKind::Field { object, field, .. } => format!(
 					"(. {} {})",
 					self.render_place(body, object),
 					self.field_name(body.place(object).ty, field)
@@ -4897,6 +4897,45 @@ mod tests {
 		assert_eq!(
 			case.shape("write"),
 			"(block (local p#1 o#0) (= (. (. p#1 inner) v) 1) (+= (. p#1 n) 1))"
+		);
+	}
+
+	#[test]
+	fn a_write_reports_only_its_first_denied_step_from_the_root() {
+		// Permission flows from the root outward: an immutable root denies
+		// every field after it, so the step nearest the root is the one to
+		// fix, reported at its name.
+		let source = indoc! {"
+				memory heap: u32;
+				struct S(mut x: i32);
+				struct Y(s: S);
+				struct Z(y: Y);
+				func root(y: Y) { y.s.x = 5; }
+				func nearest(mut z: Z) { z.y.s.x = 5; }
+				func pointer(p: heap::&Y) { p.s.x = 5; }
+			"};
+		let case = TestCase::new(source);
+		let errors: Vec<_> = case
+			.diagnostics()
+			.errors()
+			.map(|error| {
+				(error.message.as_str(), error.labels[0].range.clone())
+			})
+			.collect();
+		let at = |written: &str, offset: usize| {
+			let start = source.find(written).unwrap() + offset;
+			start..start + 1
+		};
+		assert_eq!(
+			errors,
+			[
+				("cannot assign to immutable local `y`", at("y.s.x", 0)),
+				(
+					"cannot assign to immutable field `y` of struct `Z`",
+					at("z.y.s.x", 2)
+				),
+				("cannot write through a shared pointer", at("p.s.x", 0)),
+			]
 		);
 	}
 

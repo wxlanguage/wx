@@ -28,6 +28,16 @@ use crate::tir::resolutions::{Reference, Site};
 use crate::tir::solver::SolverError;
 use crate::tir::types::{Substitution, Type, TypeIndex};
 
+/// A field a write would change in place without its `mut`.
+#[derive(Clone, Copy)]
+struct DeniedField {
+	/// The type of the value the field is of: a struct or an enum.
+	object_ty: TypeIndex,
+	field: FieldIdx,
+	/// Where the field's name is written in the write's target.
+	name: TextSpan,
+}
+
 /// What defines an `op=`.
 enum CompoundMethod {
 	/// The primitive scalar's operator.
@@ -179,14 +189,22 @@ impl BodyBuilder<'_, '_> {
 			Operand::Place(object) => {
 				let memory = self.body.place(object).memory;
 				Operand::Place(self.body.push_place(Place {
-					kind: PlaceKind::Field { object, field },
+					kind: PlaceKind::Field {
+						object,
+						field,
+						name: member.span,
+					},
 					ty,
 					memory,
 					span,
 				}))
 			}
 			Operand::Value(object) => Operand::Value(self.body.push(
-				ExprKind::FieldAccess { object, field },
+				ExprKind::FieldAccess {
+					object,
+					field,
+					name: member.span,
+				},
 				ty,
 				span,
 			)),
@@ -808,22 +826,32 @@ impl BodyBuilder<'_, '_> {
 
 	/// Reports what a write to `place` lacks permission for. The write
 	/// changes every step up to the pointer the place is reached through:
-	/// each field on the way needs `mut`, and the pointer must be exclusive.
-	/// What the pointer was read from is only read.
+	/// the pointer must be exclusive and each field on the way `mut`. What
+	/// the pointer was read from is only read. Permission flows from the
+	/// pointer outward, so only the first step denied from there is
+	/// reported: the pointer, or a field at its name.
 	fn check_place_writable(&mut self, place: PlaceIdx) {
-		let Place { ty, span, .. } = *self.body.place(place);
-		if ty == TypeIndex::ERROR {
+		if self.body.place(place).ty == TypeIndex::ERROR {
 			return;
 		}
+		let mut denied = None;
 		let mut at = place;
 		loop {
-			match self.body.place(at).kind {
-				PlaceKind::Field { object, field } => {
-					self.check_field_mut(
-						self.body.place(object).ty,
-						field,
-						span,
-					);
+			let Place { kind, span, .. } = *self.body.place(at);
+			match kind {
+				PlaceKind::Field {
+					object,
+					field,
+					name,
+				} => {
+					let object_ty = self.body.place(object).ty;
+					if !self.field_is_mut(object_ty, field) {
+						denied = Some(DeniedField {
+							object_ty,
+							field,
+							name,
+						});
+					}
 					at = object;
 				}
 				PlaceKind::Element { object, .. } => at = object,
@@ -847,6 +875,8 @@ impl BodyBuilder<'_, '_> {
 									 read-only; `*T` may be written",
 								),
 						);
+					} else if let Some(denied) = denied {
+						self.report_immutable_field(denied);
 					}
 					return;
 				}
@@ -854,26 +884,28 @@ impl BodyBuilder<'_, '_> {
 		}
 	}
 
-	/// Reports a write at `span` that changes `field` of a value of type
-	/// `object_ty` in place, when the field is not `mut`.
-	fn check_field_mut(
-		&mut self,
-		object_ty: TypeIndex,
-		field: FieldIdx,
-		span: TextSpan,
-	) {
-		let owner = match *self.sema.types.resolve(object_ty) {
-			Type::Struct { struct_index, .. } => {
-				FieldOwner::Struct(struct_index)
-			}
-			Type::Enum { enum_index } => FieldOwner::Enum(enum_index),
-			_ => return,
+	/// Whether `field` of a value of type `object_ty` may be written in
+	/// place: declared `mut`. Any other object has already been reported.
+	fn field_is_mut(&self, object_ty: TypeIndex, field: FieldIdx) -> bool {
+		let Some(owner) = field_owner(self.sema.types.resolve(object_ty))
+		else {
+			return true;
 		};
 		let decls = &self.sema.decls;
+		decls.fields.mut_span(owner.fields(decls), field).is_some()
+	}
+
+	/// A write that changes a field in place, which is not `mut`.
+	fn report_immutable_field(&mut self, denied: DeniedField) {
+		let DeniedField {
+			object_ty,
+			field,
+			name: span,
+		} = denied;
+		let owner = field_owner(self.sema.types.resolve(object_ty))
+			.expect("only a struct's or an enum's field is denied");
+		let decls = &self.sema.decls;
 		let fields = owner.fields(decls);
-		if decls.fields.mut_span(fields, field).is_some() {
-			return;
-		}
 		let Some(name) = decls.fields.name(fields, field) else {
 			return;
 		};
@@ -912,21 +944,39 @@ impl BodyBuilder<'_, '_> {
 	/// field of a local. A target that is not is reported and gives
 	/// `false`; one that is but lacks `mut` is reported and gives `true`,
 	/// since its type still holds the value to it. The write changes the root
-	/// local and every field on the way, so each needs `mut`: a chain that
-	/// went through a pointer is a place, not a value, and never gets here.
+	/// local and every field on the way, so each needs `mut`. Permission
+	/// flows from the root outward, so only the first step denied from there
+	/// is reported: the local, or a field at its name. A chain that went
+	/// through a pointer is a place, not a value, and never gets here.
 	fn check_assignable(&mut self, target: ExprIdx) -> bool {
 		let span = self.body.span(target);
+		let mut denied = None;
 		let mut root = target;
-		while let ExprKind::FieldAccess { object, field } = self.body.kind(root)
+		while let ExprKind::FieldAccess {
+			object,
+			field,
+			name,
+		} = self.body.kind(root)
 		{
-			self.check_field_mut(self.body.ty(object), field, span);
+			let object_ty = self.body.ty(object);
+			if !self.field_is_mut(object_ty, field) {
+				denied = Some(DeniedField {
+					object_ty,
+					field,
+					name,
+				});
+			}
 			root = object;
 		}
 		match self.body.kind(root) {
 			ExprKind::Error => true,
 			ExprKind::Local(local) => {
 				let local = *self.body.local(local);
-				if local.mut_span.is_none() {
+				if local.mut_span.is_some() {
+					if let Some(denied) = denied {
+						self.report_immutable_field(denied);
+					}
+				} else {
 					let name =
 						self.builder.strings.resolve(local.name.inner).unwrap();
 					self.sema.diagnostics.push(
@@ -939,7 +989,7 @@ impl BodyBuilder<'_, '_> {
 							))
 							.with_label(Label::primary(
 								self.scope.file_id,
-								span,
+								self.body.span(root),
 							))
 							.with_label(
 								Label::secondary(
@@ -947,7 +997,7 @@ impl BodyBuilder<'_, '_> {
 									local.name.span,
 								)
 								.with_message(format!(
-									"declare it `local mut {name}` to assign to it"
+									"declare it `mut {name}`"
 								)),
 							),
 					);
@@ -1011,5 +1061,17 @@ fn plain_operator(op: BinaryOp) -> BinaryOp {
 		BinaryOp::LeftShiftAssign => BinaryOp::LeftShift,
 		BinaryOp::RightShiftAssign => BinaryOp::RightShift,
 		_ => unreachable!("not a compound assignment"),
+	}
+}
+
+/// The declaration whose fields a value of type `ty` has: a struct or an
+/// enum.
+fn field_owner(ty: &Type) -> Option<FieldOwner> {
+	match *ty {
+		Type::Struct { struct_index, .. } => {
+			Some(FieldOwner::Struct(struct_index))
+		}
+		Type::Enum { enum_index } => Some(FieldOwner::Enum(enum_index)),
+		_ => None,
 	}
 }

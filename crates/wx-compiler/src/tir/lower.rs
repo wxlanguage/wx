@@ -1292,7 +1292,7 @@ impl<'a> Lowerer<'a> {
 					self.build_aggregate(body, state, expr, values, ty)?;
 				Ok(self.sequence(state, prefix, value))
 			}
-			ExprKind::FieldAccess { object, field } => {
+			ExprKind::FieldAccess { object, field, .. } => {
 				self.lower_field_access(body, state, expr, object, field, ty)
 			}
 			ExprKind::Block {
@@ -2003,7 +2003,7 @@ impl<'a> Lowerer<'a> {
 	) -> Result<LocalRun, ()> {
 		match body.kind(target) {
 			ExprKind::Local(local) => Ok(state.bindings[usize::from(local)]),
-			ExprKind::FieldAccess { object, field } => {
+			ExprKind::FieldAccess { object, field, .. } => {
 				let parent = self.local_projection(body, state, object)?;
 				let object_ty = self.expr_ty(body, state, object);
 				let child = self.field_range(

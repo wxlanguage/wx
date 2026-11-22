@@ -134,7 +134,9 @@ impl<'a> Written<'a> {
 
 	/// Every field of the chain `target` is, down to its root.
 	fn value_target(&mut self, body: &Body, mut target: ExprIdx) {
-		while let ExprKind::FieldAccess { object, field } = body.kind(target) {
+		while let ExprKind::FieldAccess { object, field, .. } =
+			body.kind(target)
+		{
 			self.mark(body.ty(object), field);
 			target = object;
 		}
@@ -144,7 +146,7 @@ impl<'a> Written<'a> {
 	fn place_target(&mut self, body: &Body, mut place: PlaceIdx) {
 		loop {
 			match body.place(place).kind {
-				PlaceKind::Field { object, field } => {
+				PlaceKind::Field { object, field, .. } => {
 					self.mark(body.place(object).ty, field);
 					place = object;
 				}

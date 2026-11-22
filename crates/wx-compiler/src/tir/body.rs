@@ -386,10 +386,12 @@ pub enum ExprKind {
 		fields: ExprIdx,
 	},
 	/// `value.field` on a value that is not in linear memory (a local, a
-	/// global, a call's result). The field is its declared index.
+	/// global, a call's result). The field is its declared index, `name`
+	/// where it is written.
 	FieldAccess {
 		object: ExprIdx,
 		field: FieldIdx,
+		name: TextSpan,
 	},
 	/// Reads the value stored at a place in linear memory: `p.*`, `p.*.x`.
 	Load(PlaceIdx),
@@ -611,8 +613,12 @@ pub enum PlaceKind {
 		ownership: Ownership,
 	},
 	/// `place.field`; in the same memory as `object`. The field is its
-	/// declared index.
-	Field { object: PlaceIdx, field: FieldIdx },
+	/// declared index, `name` where it is written.
+	Field {
+		object: PlaceIdx,
+		field: FieldIdx,
+		name: TextSpan,
+	},
 	/// `place[index]`, an element of the slice or array `object`; in its
 	/// memory. The index is the memory's `Size`, checked against the length
 	/// when it is read.
