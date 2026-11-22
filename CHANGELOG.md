@@ -8,6 +8,148 @@ CLI, and LSP are released in lockstep) rather than per-crate. Editor
 integrations (e.g. [wxlanguage/vscode](https://github.com/wxlanguage/vscode))
 live in their own repos with independent versioning.
 
+## [0.10.0] - 2026-11-22
+
+This release rebuilds the compiler: the checker, the intermediate
+representation, the optimizer, and Wasm emission are all new, and the
+language moved with them. The syntax now leans toward WebAssembly's own
+vocabulary (`func`, typed memories, loop parameters), `std` gives way to a
+small implicit `core`, and the language server is back with far more than
+diagnostics. Nearly every existing program needs edits. The table covers the
+mechanical ones; the Changed section explains each.
+
+| 0.5.0 | 0.10.0 |
+|---|---|
+| `fn f(x: i32) -> i32` | `func f(x: i32) -> i32` |
+| `if n <= 1 { .. }`, `match x { .. }` | `if (n <= 1) { .. }`, `match (x) { .. }` |
+| `x as u32` | `transmute::<i32, u32>(x)`, or a conversion such as `i64_extend_i32(x)` |
+| `true`, `false` | `True`, `False` |
+| `struct Point { x: i32, y: i32 }` | `struct Point(x: i32, y: i32);` |
+| `Point { x: 1, y: 2 }` | `Point(1, 2)` or `Point{ x: 1, y: 2 }` |
+| `enum Advice: u8 { .. }` | `enum Advice(value: u8) { .. }` |
+| `memory heap: Memory where { Size = u32 };` | `memory heap: u32;` |
+| `#[memory_limits(min_pages = 1)]` | `#[memory_limits{ min_pages: 1 }]` |
+| `&[u8]`, `*Node` | `heap::&[u8]`, `heap::*Node` |
+| `bump = value;`, `bump` | `bump.set(value);`, `bump.get()` |
+| `result: loop { .. }` | `loop :result { .. }` |
+| `use std::*;` | *(remove; `core` is implicit)* |
+| `use crate::a::b;` | `use package::a::b;` |
+| dependency key used as a name | `package "math" as math;` |
+| `"type": "bin"` in `wx.json` | *(remove)* |
+
+### Changed
+
+- **Breaking:** functions are declared with `func`, and function types are
+  written `func(T) -> U`, following WAT.
+- **Breaking:** `if` and `match` take their subject in parentheses:
+  `if (i == n) { break }`, `match (n & 3) { .. }`.
+- **Breaking:** `as` casts are removed. `transmute::<A, B>(x)` reinterprets
+  a value as a type with the same Wasm representation (`i32` and `u32`, or
+  `u8` and `i32`). Changing representation is an explicit conversion, such
+  as `i64_extend_i32`, `i32_wrap_i64`, or `f64_convert_i32`. Type
+  ascription `(value: Type)` states a type where inference needs one.
+- **Breaking:** `std` is replaced by `core`, which every package sees
+  without a `use`. `Bool` and `Char` are ordinary core types
+  (`enum Bool(pub value: u8) { False, True }`), so the `true` and `false`
+  keywords are gone in favor of `True` and `False`. The `ptr::` free
+  functions are replaced by `RawPtr` methods.
+- **Breaking:** a pointer always names its memory: `heap::*T` is exclusive,
+  `heap::&T` shared. `[T]` and `[T; N]` are types of their own that only a
+  pointer can hold (`heap::&[u8]`, `heap::*[u8; 4]`). Indexing is built in,
+  and slice range syntax is removed.
+- **Breaking:** a memory is declared by its address type,
+  `memory heap: u32;`. Attribute arguments use braces,
+  `#[memory_limits{ min_pages: 1 }]`.
+- **Breaking:** an `import` block is its own scope. Bring outer items into it
+  with `use`:
+
+  ```
+  memory heap: u32;
+
+  import "console" as console {
+      use super::heap;
+      func log(message: heap::&[u8]);
+  }
+  ```
+
+- **Breaking:** a struct is declared like a function's parameters,
+  `struct Point(x: i32, mut y: i32);`, and built either positionally,
+  `Point(1, 2)`, or by name, `Point{ x: 1, y: 2 }`. Calls by name use the
+  same braces.
+- **Breaking:** a field's `mut` is the permission to write that field in
+  place. A write needs `mut` on the local and on every field along the way,
+  and a pointer it goes through must be exclusive. A struct with no `mut`
+  fields can only be replaced whole.
+- **Breaking:** every parameter and field is named; `_` is only a pattern.
+- **Breaking:** an enum's repr is written as a field,
+  `enum Ordering(pub value: i8)`, replacing `enum Ordering: i8`. Enums are
+  closed: `..` in an enum body is an error, and an open set of values is a
+  struct with constants in its `impl`.
+- **Breaking:** a global is a handle. Read it with `.get()` and write it
+  with `.set(value)`; it is never assigned directly.
+- **Breaking:** labels follow the keyword, `block :done { .. }` and
+  `loop :outer { .. }`, and only a block or a loop takes one. An unlabeled
+  `break` leaves the nearest written `block` or loop.
+- **Breaking:** a dependency is instantiated explicitly with
+  `package "key" as alias;`. A key in `wx.json` only makes the package
+  available; `pub package` re-exports it. Paths from the package root start
+  with `package::` instead of `crate::`.
+- **Breaking:** `wx.json` no longer has a `"type"` field for ordinary
+  packages. Any package can be imported or compiled to Wasm, with or without
+  exports.
+- **Breaking:** diagnostic codes are renumbered. A missing `,` and misplaced
+  visibility are now errors.
+
+### Added
+
+- Loop parameters, compiled to Wasm loop parameters: a loop carries its
+  state as values instead of mutable locals, and its body's result or
+  `continue` gives the next state.
+
+  ```
+  func sum(n: u32) -> u32 {
+      loop (total: u32 = 0, i: u32 = 0) {
+          if (i == n) { break total };
+          (total + i, i + 1)
+      }
+  }
+  ```
+
+- `!`, the never type. `()` is the empty tuple.
+- Comparison and operator traits in core (`PartialEq`, `Eq`, `PartialOrd`,
+  `Ord`, `Ordering`, `Add`, `Not`, ...), supertraits, default methods, and
+  checking that an impl conforms to its trait.
+- `typeset` declarations are closed traits, take a bound clause, and may
+  list any concrete type.
+- Functions are values: they implement the core `Call` and `Function`
+  traits.
+- Constant evaluation: untyped constants, constant array lengths, struct and
+  array constants, and static data for string and array literals.
+- `pub` on `memory` items.
+- Match exhaustiveness checking, with warnings for unreachable arms and
+  unreachable `|` alternatives.
+- Implicit coercion where a value is handed to its context, such as an
+  exclusive pointer passed where a shared one is expected.
+- `wx-lint`, run by the CLI and the language server after a clean check:
+  `unused_variable`, `unnecessary_mutability`, and `unused_label`, each set
+  to `off`, `warn`, or `error` in `wx.json`'s `lint` section. `wx build` and
+  `wx check` take `--cap-lints <off|warn|error>` to lower them for one run.
+- Language server: hover, go to definition, find references, rename,
+  semantic tokens, signature help, and completion that knows the context
+  (members, `use` trees, patterns, field names, package keys, and loop
+  parameters).
+- Formatter: better layout of blocks and tail expressions, wrapped bound
+  lists, comments kept in calls by name and around attributes, and an
+  assignment's value moved below `=` only when it fits there whole.
+- `wx-compiler-wasm` works again with the current compiler, and the browser
+  playground runs the compiler and the language server in the page.
+
+### Fixed
+
+- Empty sections are no longer emitted in the Wasm output.
+- A language server panic on code recovered from parse errors.
+- A stack overflow on cyclic glob imports.
+
 ## [0.5.0] - 2026-09-05
 
 This release reshapes how a wx program is organized: every compilation is
