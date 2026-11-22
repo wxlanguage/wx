@@ -56,7 +56,8 @@ pub(crate) fn references(
 	let files = &snapshot.compilation.files;
 	let offset = position_to_offset(files, file, position.position)?;
 	let (_, definition) = snapshot.definition_at(file, offset)?;
-	let mut spans = query::references_to(&snapshot.sema, definition);
+	let mut spans =
+		query::references_to(&snapshot.sema, &snapshot.references, definition);
 	if params.context.include_declaration
 		&& let Some(span) = snapshot.sema.definition_span(definition)
 		&& span.span.start != span.span.end
@@ -89,7 +90,7 @@ pub(crate) fn hover(
 	let offset = position_to_offset(files, file, position.position)?;
 	// A jump is a use of what it leaves with a signature of its own, and a
 	// branch has one without referring to anything.
-	let construct = query::symbol_at(&snapshot.sema, file, offset)
+	let construct = query::symbol_at(&snapshot.references, file, offset)
 		.and_then(|(name, reference)| {
 			hover::jump(&snapshot.sema, &snapshot.strings, reference)
 				.map(|signature| (name, signature))

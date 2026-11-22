@@ -35,7 +35,7 @@ use crate::tir::decls::{
 };
 use crate::tir::imports::report_private_identifier;
 use crate::tir::literals::{CharLiteralError, parse_char_literal};
-use crate::tir::resolutions::{AccessKind, Definition, Reference, Site};
+use crate::tir::resolutions::{Definition, Reference, Site};
 use crate::tir::signatures::Semantics;
 use crate::tir::solver::SolverError;
 use crate::tir::types::{GenericArgs, GenericEnvOwner, Type, TypeIndex};
@@ -974,7 +974,6 @@ impl BodyBuilder<'_, '_> {
 			self.sema.resolutions.record(
 				Site::Value(SourceSpan::new(self.scope.file_id, name.span)),
 				Reference::Field {
-					access: AccessKind::Read,
 					owner,
 					field: index,
 				},

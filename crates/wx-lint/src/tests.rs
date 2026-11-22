@@ -127,6 +127,50 @@ fn mut_on_a_local_never_assigned_is_reported() {
 }
 
 #[test]
+fn only_a_write_into_its_own_storage_needs_mut() {
+	// A field chain from a local writes the local; a write through a pointer
+	// it holds, by a field step or an index, writes memory and reads it.
+	let source = indoc! {"
+		memory heap: u32;
+		struct Inner(value: u32);
+		struct Outer(inner: Inner, pointer: heap::*Inner);
+		func f(
+			mut owned: Outer,
+			mut holder: Outer,
+			mut pointer: heap::*Outer,
+			mut slice: heap::*[u32; 4],
+			n: u32,
+		) {
+			owned.inner.value = n;
+			holder.pointer.value = n;
+			pointer.inner.value += n;
+			slice[0] = n;
+			_ = owned;
+		}
+	"};
+	assert_eq!(
+		lints(source),
+		[
+			(Lint::UnnecessaryMutability, "mut"),
+			(Lint::UnnecessaryMutability, "mut"),
+			(Lint::UnnecessaryMutability, "mut"),
+		]
+	);
+	let starts: Vec<_> = lint_with(source, LintConfig::default())
+		.iter()
+		.map(|diagnostic| diagnostic.labels[0].range.start)
+		.collect();
+	assert_eq!(
+		starts,
+		[
+			source.find("mut holder").unwrap(),
+			source.find("mut pointer").unwrap(),
+			source.find("mut slice").unwrap(),
+		]
+	);
+}
+
+#[test]
 fn a_label_no_jump_names_is_reported() {
 	let source = indoc! {"
 		func f() {

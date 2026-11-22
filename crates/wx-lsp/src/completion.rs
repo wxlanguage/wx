@@ -105,6 +105,7 @@ pub(crate) fn completion(
 	}
 	let ast = snapshot.compilation.ast(file);
 	let sema = &mut snapshot.sema;
+	let references = &snapshot.references;
 	// A function, method or constructor written as a value is inserted as its
 	// call, unless the call is written already (`hel|per()`).
 	let source = &snapshot.compilation.files.get(file).ok()?.source;
@@ -145,7 +146,8 @@ pub(crate) fn completion(
 		// What the prefix means, as checking resolved it; a prefix that did
 		// not resolve has nothing after it.
 		Site::Segment { prefix, used_as } => {
-			let (_, reference) = query::symbol_at(sema, file, prefix.start)?;
+			let (_, reference) =
+				query::symbol_at(references, file, prefix.start)?;
 			let prefix = reference.definition();
 			let mut names = match prefix {
 				Definition::Item(loc) => {
@@ -176,7 +178,8 @@ pub(crate) fn completion(
 		}
 		// A name a group lists already would be bound twice.
 		Site::Import { prefix, written } => {
-			let (_, reference) = query::symbol_at(sema, file, prefix.start)?;
+			let (_, reference) =
+				query::symbol_at(references, file, prefix.start)?;
 			let Definition::Item(prefix) = reference.definition() else {
 				return None;
 			};
@@ -190,7 +193,7 @@ pub(crate) fn completion(
 			used_as,
 		} => {
 			let (_, reference) =
-				query::symbol_at(sema, file, trait_name.start)?;
+				query::symbol_at(references, file, trait_name.start)?;
 			let Definition::Item(bound) = reference.definition() else {
 				return None;
 			};
@@ -227,7 +230,8 @@ pub(crate) fn completion(
 			entry,
 			written,
 		} => {
-			let (_, reference) = query::symbol_at(sema, file, bound.start)?;
+			let (_, reference) =
+				query::symbol_at(references, file, bound.start)?;
 			let Definition::Item(bound) = reference.definition() else {
 				return None;
 			};
@@ -245,7 +249,8 @@ pub(crate) fn completion(
 		// A field matched twice is reported, so the ones written are not
 		// offered again.
 		Site::PatternField { owner, written } => {
-			let (_, reference) = query::symbol_at(sema, file, owner.start)?;
+			let (_, reference) =
+				query::symbol_at(references, file, owner.start)?;
 			sema.pattern_field_names(reference.definition())
 				.into_iter()
 				.filter(|(name, _)| !written.contains(name))
@@ -283,7 +288,8 @@ pub(crate) fn completion(
 			},
 			written,
 		} => {
-			let (_, reference) = query::symbol_at(sema, file, callee.start)?;
+			let (_, reference) =
+				query::symbol_at(references, file, callee.start)?;
 			let names = sema.argument_names(reference.definition(), given);
 			// Names and visibility still come from the checker's contract.
 			// Only their displayed types use this call's inferred arguments.

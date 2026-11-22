@@ -64,7 +64,7 @@ use super::operators::{
 	OperatorMethod, is_comparison, is_primitive_binary, is_primitive_unary,
 };
 use super::paths::{PathResolver, PathWalk};
-use super::resolutions::{AccessKind, Reference, Site};
+use super::resolutions::{Reference, Site};
 use super::signatures::{
 	InferPolicy, LexicalScope, Semantics, SemanticsBuilder,
 };
@@ -694,12 +694,9 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				};
 				self.build_binary(operator, left, right, expected, span)
 			}
-			ast::Expression::Path(segments) => self.build_path(
-				ast.list(segments),
-				expected,
-				span,
-				AccessKind::Read,
-			),
+			ast::Expression::Path(segments) => {
+				self.build_path(ast.list(segments), expected, span)
+			}
 			ast::Expression::Call { callee, arguments } => self.build_call(
 				callee,
 				Arguments::of(ast, arguments),
@@ -981,7 +978,6 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				ast.list(segments),
 				TypeIndex::INFER,
 				span,
-				AccessKind::Read,
 			)),
 			ast::ConstArgument::QualifiedPath { .. }
 			| ast::ConstArgument::Grouped { .. } => {
@@ -1104,7 +1100,6 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		segments: &[ast::PathSegment],
 		expected: TypeIndex,
 		span: TextSpan,
-		access: AccessKind,
 	) -> ExprIdx {
 		if let [segment] = segments
 			&& segment.type_args.is_empty()
@@ -1118,7 +1113,6 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				Reference::Local {
 					owner: self.owner,
 					local,
-					access,
 				},
 			);
 			if reach == LocalReach::BehindStatic {
@@ -1398,12 +1392,8 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			&& segment.type_args.is_empty()
 			&& self.lookup_local(segment.ident.inner).is_some()
 		{
-			let callee = self.build_path(
-				segments,
-				TypeIndex::INFER,
-				callee_span,
-				AccessKind::Read,
-			);
+			let callee =
+				self.build_path(segments, TypeIndex::INFER, callee_span);
 			return self.build_value_call(callee, arguments, span);
 		}
 		// `Self(..)` constructs the struct the impl around it is for, with
@@ -1480,12 +1470,8 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		}
 		// Any other item is called as the value it names.
 		if !matches!(kind, DeclKind::Struct(_) | DeclKind::Function(_)) {
-			let callee = self.build_path(
-				segments,
-				TypeIndex::INFER,
-				callee_span,
-				AccessKind::Read,
-			);
+			let callee =
+				self.build_path(segments, TypeIndex::INFER, callee_span);
 			return self.build_value_call(callee, arguments, span);
 		}
 		let DeclKind::Struct(struct_index) = kind else {

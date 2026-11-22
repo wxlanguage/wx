@@ -7,12 +7,16 @@
 //! members. Only code that has committed to a meaning records it, so a
 //! lookup that is tried and discarded leaves no trace.
 //!
-//! Entries are keyed by where the name is written, so resolving the same
-//! site again overwrites it instead of adding a second entry. The order is
-//! by file and then position, which turns "what does the name under the
-//! cursor mean" into a range lookup. Who refers to a definition, or which
-//! `use` items are never used, is the inverse of this table and is computed
-//! from it when needed.
+//! Entries are appended in the order checking records them, which follows
+//! demand rather than source position. A name resolved twice is recorded
+//! twice, with the same meaning. Nothing in checking reads the table, so it
+//! keeps no order: a consumer that looks names up by position (the language
+//! server) builds its own index from it. Who refers to a definition, or
+//! which `use` items are never used, is computed from it the same way.
+//!
+//! An entry says what a name means, not how it is used: whether a local is
+//! read or assigned is a question about the body it is in, which the lints
+//! ask of it.
 //!
 //! This is a reference table, not a token index: declaration names live in
 //! their owning definition/body tables, and unresolved names have no entry.
@@ -25,8 +29,6 @@
 //! so each meaning has an entry of its own: `Type` and `Value` are the
 //! namespace tiers a name is looked up in, `Label` is a name that is not
 //! looked up at all.
-
-use std::collections::BTreeMap;
 
 use super::body::{BodyOwner, LocalIdx, ParamIdx, TargetIdx};
 use super::decls::Declared;
@@ -98,42 +100,31 @@ impl PartialOrd for Site {
 
 #[derive(Default)]
 pub struct NameResolutions {
-	pub by_site: BTreeMap<Site, Reference>,
+	entries: Vec<(Site, Reference)>,
 }
 
 impl NameResolutions {
 	pub(super) fn record(&mut self, site: Site, reference: Reference) {
-		self.by_site.insert(site, reference);
+		self.entries.push((site, reference));
 	}
 
+	/// Every entry, in the order it was recorded; see the module doc.
+	pub fn iter(&self) -> impl Iterator<Item = (Site, Reference)> + '_ {
+		self.entries.iter().copied()
+	}
+
+	/// What `site` was resolved to. A scan: for a report, which is rare,
+	/// and for tests.
 	pub(super) fn get(&self, site: Site) -> Option<Reference> {
-		self.by_site.get(&site).copied()
+		self.entries
+			.iter()
+			.find(|(recorded, _)| *recorded == site)
+			.map(|&(_, reference)| reference)
 	}
 
 	#[cfg(test)]
 	pub(super) fn references(&self) -> impl Iterator<Item = Reference> + '_ {
-		self.by_site.values().copied()
-	}
-
-	/// Sets the access of the local recorded at `site`.
-	pub(super) fn set_local_access(&mut self, site: Site, access: AccessKind) {
-		if let Some(Reference::Local {
-			access: recorded, ..
-		}) = self.by_site.get_mut(&site)
-		{
-			*recorded = access;
-		}
-	}
-
-	/// Makes the local or field recorded at `site` a plain read, for a name
-	/// first recorded as written that turned out to be only read through.
-	pub(super) fn downgrade_to_read(&mut self, site: Site) {
-		if let Some(
-			Reference::Local { access, .. } | Reference::Field { access, .. },
-		) = self.by_site.get_mut(&site)
-		{
-			*access = AccessKind::Read;
-		}
+		self.entries.iter().map(|&(_, reference)| reference)
 	}
 }
 
@@ -147,17 +138,9 @@ pub enum Reference {
 	/// module, a package or an import block.
 	Item { item: ItemLoc, route: Route },
 	/// A local, a parameter included, of the body `owner`.
-	Local {
-		owner: BodyOwner,
-		local: LocalIdx,
-		access: AccessKind,
-	},
+	Local { owner: BodyOwner, local: LocalIdx },
 	/// A field selected, matched or named by an argument.
-	Field {
-		owner: FieldOwner,
-		field: FieldIdx,
-		access: AccessKind,
-	},
+	Field { owner: FieldOwner, field: FieldIdx },
 	/// A named argument's parameter, of the function the call selected (a
 	/// trait's declaration, for a call through an abstract type). This does
 	/// not require the callee to have a body or a corresponding local.
@@ -199,17 +182,6 @@ pub enum Route {
 	/// leads through in another namespace can be found again by looking the
 	/// name up from it.
 	Import(UseItemIndex),
-}
-
-/// How a use reaches a local or a field.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub enum AccessKind {
-	Read,
-	Write,
-	ReadWrite,
-	/// A constructor's field label gives the field its value.
-	Initialize,
 }
 
 /// A declared name: what a written name can be declared as. A reference
@@ -1141,30 +1113,11 @@ mod tests {
 		assert!(matches!(y, Reference::Local { .. }));
 		assert_ne!(x, y);
 		assert_eq!(x, a.value("= x +", "x"));
-		let Reference::Local {
-			owner,
-			local,
-			access: AccessKind::Write,
-		} = y
-		else {
+		let Reference::Local { owner, local } = y else {
 			panic!()
 		};
-		assert_eq!(
-			a.value("y +=", "y"),
-			Reference::Local {
-				owner,
-				local,
-				access: AccessKind::ReadWrite
-			}
-		);
-		assert_eq!(
-			a.value("\n\ty\n", "y"),
-			Reference::Local {
-				owner,
-				local,
-				access: AccessKind::Read
-			}
-		);
+		assert_eq!(a.value("y +=", "y"), Reference::Local { owner, local });
+		assert_eq!(a.value("\n\ty\n", "y"), Reference::Local { owner, local });
 		assert_ne!(y, a.value("\n\t\ty\n", "y"));
 		// Bindings are declarations, not references.
 		assert_eq!(a.at("mut y =", "y", Tier::Value), None);
@@ -1176,19 +1129,11 @@ mod tests {
 			func f(x: u32) -> u32 { x }
 			func g(x: u32) -> u32 { x + 1 }
 		"});
-		let Reference::Local {
-			owner: f,
-			local: x,
-			access: AccessKind::Read,
-		} = a.value("{ x }", "x")
+		let Reference::Local { owner: f, local: x } = a.value("{ x }", "x")
 		else {
 			panic!()
 		};
-		let Reference::Local {
-			owner: g,
-			local: y,
-			access: AccessKind::Read,
-		} = a.value("{ x +", "x")
+		let Reference::Local { owner: g, local: y } = a.value("{ x +", "x")
 		else {
 			panic!()
 		};
@@ -1289,7 +1234,6 @@ mod tests {
 			Reference::Field {
 				owner: FieldOwner::Struct(a.struct_index("A")),
 				field: FieldIdx::new(0),
-				access: AccessKind::Write,
 			}
 		);
 		assert_eq!(
@@ -1297,13 +1241,11 @@ mod tests {
 			Reference::Field {
 				owner: FieldOwner::Struct(a.struct_index("A")),
 				field: FieldIdx::new(0),
-				access: AccessKind::Read
 			}
 		);
 		let Reference::Field {
 			owner: a_owner,
 			field: a_field,
-			access: AccessKind::Write,
 		} = first
 		else {
 			panic!()
@@ -1311,7 +1253,6 @@ mod tests {
 		let Reference::Field {
 			owner: b_owner,
 			field: b_field,
-			access: AccessKind::Read,
 		} = a.reference("b.value;", "value")
 		else {
 			panic!()
@@ -1321,7 +1262,6 @@ mod tests {
 			Reference::Field {
 				owner: FieldOwner::Struct(a.struct_index("B")),
 				field: FieldIdx::new(0),
-				access: AccessKind::Read,
 			}
 		);
 		assert_eq!(a_field, b_field);
@@ -1379,7 +1319,6 @@ mod tests {
 		let field = Reference::Field {
 			owner: FieldOwner::Struct(a.struct_index("S")),
 			field: FieldIdx::new(1),
-			access: AccessKind::Initialize,
 		};
 		assert_eq!(a.label("value: 1", "value"), field);
 		assert_eq!(
@@ -1512,7 +1451,6 @@ mod tests {
 					value: Reference::Local {
 						owner: BodyOwner::Function(a.function_index(caller)),
 						local: LocalIdx::new(0),
-						access: AccessKind::Read,
 					},
 				})
 			);
@@ -1534,7 +1472,6 @@ mod tests {
 			Reference::Field {
 				owner: FieldOwner::Struct(a.struct_index("S")),
 				field: FieldIdx::new(0),
-				access: AccessKind::Read,
 			}
 		);
 		assert_eq!(
@@ -1559,17 +1496,15 @@ mod tests {
 			Reference::Field {
 				owner: FieldOwner::Struct(a.struct_index("S")),
 				field: FieldIdx::new(0),
-				access: AccessKind::Write,
 			}
 		);
-		assert_eq!(
-			a.reference("\n\tp.value\n", "value"),
-			a.reference("s.value;", "value")
-		);
-		assert_ne!(
-			a.reference("p.value =", "value"),
-			a.reference("\n\tp.value\n", "value")
-		);
+		// A write and reads, through a pointer or of a value, name one field.
+		for read in ["\n\tp.value\n", "s.value;"] {
+			assert_eq!(
+				a.reference(read, "value"),
+				a.reference("p.value =", "value")
+			);
+		}
 	}
 
 	#[test]
@@ -1623,7 +1558,6 @@ mod tests {
 			Reference::Field {
 				owner: FieldOwner::Struct(a.struct_index("m::S")),
 				field: FieldIdx::new(1),
-				access: AccessKind::Read,
 			}
 		);
 	}
@@ -1643,7 +1577,6 @@ mod tests {
 			Reference::Field {
 				owner: FieldOwner::Struct(a.struct_index("S")),
 				field: FieldIdx::new(0),
-				access: AccessKind::Read,
 			}
 		);
 		assert_eq!(
@@ -1651,7 +1584,6 @@ mod tests {
 			Reference::Local {
 				owner: BodyOwner::Function(function),
 				local: LocalIdx::new(1),
-				access: AccessKind::Read,
 			}
 		);
 		let declaration = a.local(function, 1);
@@ -1774,7 +1706,6 @@ mod tests {
 			Reference::Local {
 				owner: BodyOwner::Function(function),
 				local: LocalIdx::new(0),
-				access: AccessKind::Read,
 			}
 		);
 	}
@@ -1868,12 +1799,10 @@ mod tests {
 		let receiver = Reference::Local {
 			owner: BodyOwner::Function(function),
 			local: LocalIdx::new(0),
-			access: AccessKind::Read,
 		};
 		let argument = Reference::Local {
 			owner: BodyOwner::Function(function),
 			local: LocalIdx::new(1),
-			access: AccessKind::Read,
 		};
 		assert_eq!(a.value("s.missing", "s"), receiver);
 		assert_eq!(a.value("s.absent", "s"), receiver);
@@ -1905,7 +1834,6 @@ mod tests {
 				value: Reference::Local {
 					owner: BodyOwner::Function(a.function_index("f")),
 					local: LocalIdx::new(0),
-					access: AccessKind::Read,
 				},
 			})
 		);
@@ -1922,7 +1850,6 @@ mod tests {
 			Reference::Local {
 				owner: BodyOwner::Function(a.function_index("f")),
 				local: LocalIdx::new(0),
-				access: AccessKind::Read,
 			}
 		);
 	}
@@ -1942,7 +1869,6 @@ mod tests {
 		let expected = Reference::Local {
 			owner: BodyOwner::Function(a.function_index("f")),
 			local: LocalIdx::new(0),
-			access: AccessKind::Read,
 		};
 		for context in ["missing(x)", "{ x }", "value: x", "\n\tx\n"] {
 			assert_eq!(a.value(context, "x"), expected);
@@ -1997,7 +1923,6 @@ mod tests {
 			Reference::Local {
 				owner: BodyOwner::Function(a.function_index("f")),
 				local: LocalIdx::new(0),
-				access: AccessKind::Read,
 			}
 		);
 	}
@@ -2049,206 +1974,6 @@ mod tests {
 			Reference::Local {
 				owner: BodyOwner::Function(a.function_index("f")),
 				local: LocalIdx::new(0),
-				access: AccessKind::Read,
-			}
-		);
-	}
-
-	#[test]
-	fn only_the_named_target_of_a_write_is_written() {
-		let a = Analysis::clean(indoc! {"
-			memory heap: u32;
-			struct Inner(value: u32);
-			struct Outer(inner: Inner, pointer: heap::*Inner);
-			func f(mut s: Outer, p: heap::*Outer, n: u32) {
-				s.inner.value = n;
-				(s.inner.value) += n;
-				p.inner.value = n;
-				s.pointer.value += n;
-				p.pointer.value += n;
-				p.* = s;
-				local _ = p.inner.value.&;
-			}
-		"});
-		let local = |index, access| Reference::Local {
-			owner: BodyOwner::Function(a.function_index("f")),
-			local: LocalIdx::new(index),
-			access,
-		};
-		assert_eq!(
-			a.value("s.inner.value =", "s"),
-			local(0, AccessKind::Write)
-		);
-		assert_eq!(
-			a.value("(s.inner.value)", "s"),
-			local(0, AccessKind::ReadWrite)
-		);
-		assert_eq!(a.value("p.inner.value =", "p"), local(1, AccessKind::Read));
-		assert_eq!(
-			a.value("s.pointer.value +=", "s"),
-			local(0, AccessKind::Read)
-		);
-		assert_eq!(a.value("p.* =", "p"), local(1, AccessKind::Read));
-		for (context, field, owner, access) in [
-			("s.inner.value =", "inner", "Outer", AccessKind::Read),
-			("s.inner.value =", "value", "Inner", AccessKind::Write),
-			("(s.inner.value)", "inner", "Outer", AccessKind::Read),
-			("(s.inner.value)", "value", "Inner", AccessKind::ReadWrite),
-			("p.inner.value =", "inner", "Outer", AccessKind::Read),
-			("p.inner.value =", "value", "Inner", AccessKind::Write),
-			("s.pointer.value +=", "pointer", "Outer", AccessKind::Read),
-			(
-				"s.pointer.value +=",
-				"value",
-				"Inner",
-				AccessKind::ReadWrite,
-			),
-			("p.pointer.value +=", "pointer", "Outer", AccessKind::Read),
-			(
-				"p.pointer.value +=",
-				"value",
-				"Inner",
-				AccessKind::ReadWrite,
-			),
-			("p.inner.value.&", "inner", "Outer", AccessKind::Read),
-			("p.inner.value.&", "value", "Inner", AccessKind::Read),
-		] {
-			let index = if field == "pointer" { 1 } else { 0 };
-			assert_eq!(
-				a.reference(context, field),
-				Reference::Field {
-					owner: FieldOwner::Struct(a.struct_index(owner)),
-					field: FieldIdx::new(index),
-					access,
-				}
-			);
-		}
-		assert_eq!(a.value("= n;", "n"), local(2, AccessKind::Read));
-	}
-
-	#[test]
-	fn an_indexed_pointer_element_is_read_not_written() {
-		let a = Analysis::clean(indoc! {"
-			memory heap: u32;
-			struct Rows(data: [heap::*[u32; 4]; 4]);
-			func f(p: heap::*Rows, i: u32, j: u32) {
-				p.data[i][j] = 1;
-			}
-		"});
-		assert_eq!(
-			a.reference("p.data[i][j] =", "data"),
-			Reference::Field {
-				owner: FieldOwner::Struct(a.struct_index("Rows")),
-				field: FieldIdx::new(0),
-				access: AccessKind::Read,
-			}
-		);
-	}
-
-	#[test]
-	fn only_a_value_chain_makes_its_root_local_written() {
-		let a = Analysis::clean(indoc! {"
-			memory heap: u32;
-			struct Inner(value: u32);
-			struct Outer(inner: Inner, pointer: heap::*Inner);
-			func through_value(mut s: Outer, n: u32) { s.inner.value = n; }
-			func through_pointer(s: Outer, n: u32) { s.pointer.value = n; }
-		"});
-		assert!(matches!(
-			a.value("s.inner.value = n", "s"),
-			Reference::Local {
-				access: AccessKind::Write,
-				..
-			}
-		));
-		assert!(matches!(
-			a.value("s.pointer.value = n", "s"),
-			Reference::Local {
-				access: AccessKind::Read,
-				..
-			}
-		));
-	}
-
-	#[test]
-	fn an_indexed_pointer_local_is_read_not_written() {
-		let a = Analysis::clean(indoc! {"
-			memory heap: u32;
-			func f(a: heap::*[u32; 4], i: u32) {
-				a[i] = 1;
-			}
-		"});
-		assert!(matches!(
-			a.value("a[i] =", "a"),
-			Reference::Local {
-				access: AccessKind::Read,
-				..
-			}
-		));
-	}
-
-	#[test]
-	fn indexed_writes_read_the_pointer_and_index() {
-		let a = Analysis::clean(indoc! {"
-			memory heap: u32;
-			struct Buffer(data: [u32; 4], pointer: heap::*[u32; 4]);
-			func f(p: heap::*Buffer, i: u32) {
-				p.data[i] = 1;
-				p.data[i] += 1;
-				p.pointer[i] = 1;
-				p.data[block { p.pointer[i] += 1; i }] = 2;
-			}
-		"});
-		for (context, access) in [
-			("p.data[i] =", AccessKind::Write),
-			("p.data[i] +=", AccessKind::ReadWrite),
-		] {
-			assert!(matches!(
-				a.value(context, "p"),
-				Reference::Local {
-					access: AccessKind::Read,
-					..
-				}
-			));
-			assert!(matches!(
-				a.value(context, "i"),
-				Reference::Local {
-					access: AccessKind::Read,
-					..
-				}
-			));
-			assert_eq!(
-				a.reference(context, "data"),
-				Reference::Field {
-					owner: FieldOwner::Struct(a.struct_index("Buffer")),
-					field: FieldIdx::new(0),
-					access
-				}
-			);
-		}
-		for context in ["p.pointer[i] =", "p.pointer[i] +="] {
-			assert_eq!(
-				a.reference(context, "pointer"),
-				Reference::Field {
-					owner: FieldOwner::Struct(a.struct_index("Buffer")),
-					field: FieldIdx::new(1),
-					access: AccessKind::Read
-				}
-			);
-			assert!(matches!(
-				a.value(context, "p"),
-				Reference::Local {
-					access: AccessKind::Read,
-					..
-				}
-			));
-		}
-		assert_eq!(
-			a.reference("p.data[block", "data"),
-			Reference::Field {
-				owner: FieldOwner::Struct(a.struct_index("Buffer")),
-				field: FieldIdx::new(0),
-				access: AccessKind::Write
 			}
 		);
 	}
@@ -2265,12 +1990,7 @@ mod tests {
 		let mut resolutions = NameResolutions::default();
 		resolutions.record(Site::Value(span), value);
 		resolutions.record(Site::Label(span), label);
-		let updated = Reference::Item {
-			item: a.declaration("f", Tier::Value),
-			route: Route::Direct,
-		};
-		resolutions.record(Site::Value(span), updated);
-		assert_eq!(resolutions.get(Site::Value(span)), Some(updated));
+		assert_eq!(resolutions.get(Site::Value(span)), Some(value));
 		assert_eq!(resolutions.get(Site::Label(span)), Some(label));
 		assert_eq!(resolutions.get(Site::Type(span)), None);
 	}

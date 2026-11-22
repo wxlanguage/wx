@@ -29,8 +29,8 @@ use crate::symbols::StringInterner;
 use crate::vfs::CompilationUnit;
 
 pub use self::body::{
-	Body, BodyOwner, Call, ExprIdx, JumpTarget, Local, LocalIdx, Operand,
-	ParamIdx, PlaceIdx, ScopeIdx, TargetIdx, TargetKind,
+	Body, BodyOwner, Call, ExprIdx, ExprKind, JumpTarget, Local, LocalIdx,
+	Operand, ParamIdx, PlaceIdx, ScopeIdx, TargetIdx, TargetKind,
 };
 use self::decls::Declarations;
 pub use self::decls::{
@@ -46,8 +46,7 @@ pub use self::literals::{
 	StringLiteralError, StringLiteralErrorKind, unescape_string_literal,
 };
 pub use self::resolutions::{
-	AccessKind, BindingName, Definition, NameResolutions, Reference, Route,
-	Site,
+	BindingName, Definition, NameResolutions, Reference, Route, Site,
 };
 pub use self::signatures::Semantics;
 use self::signatures::SemanticsBuilder;

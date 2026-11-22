@@ -1939,7 +1939,7 @@ fn semantic_tokens_colour_resolved_and_declared_names() {
 			"func:keyword",
 			"main:function.declaration",
 			"i32:type.defaultLibrary",
-			"total:variable.declaration",
+			"total:variable.declaration.modification",
 			"i32:type.defaultLibrary",
 			"p:variable.declaration",
 			"Point:struct",
@@ -1951,7 +1951,7 @@ fn semantic_tokens_colour_resolved_and_declared_names() {
 			"i32:type.defaultLibrary",
 			"block:keyword",
 			"break:keyword",
-			"total:variable",
+			"total:variable.modification",
 			"main:function",
 			"COUNT:variable.readonly.static",
 		]

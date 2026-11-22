@@ -23,8 +23,7 @@ use tower_lsp_server::ls_types::{
 use wx_compiler::diagnostics::TextSpan;
 use wx_compiler::symbols::Keyword;
 use wx_compiler::tir::{
-	AccessKind, BodyOwner, DeclKind, Definition, FunctionIdx, MemberKind,
-	Reference,
+	BodyOwner, DeclKind, Definition, FunctionIdx, MemberKind, Reference,
 };
 use wx_compiler::vfs::{FileId, Files};
 
@@ -78,7 +77,8 @@ const TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[
 const DECLARATION: u32 = 1 << 0;
 const READONLY: u32 = 1 << 1;
 const STATIC: u32 = 1 << 2;
-/// A local or a field written to: assigned, or the target of `+=`.
+/// A local declared `mut`, where it is declared and wherever it is named, as
+/// rust-analyzer marks a mutable binding.
 const MODIFICATION: u32 = 1 << 3;
 /// Provided by the compiler rather than defined in wx: an intrinsic (a
 /// function core leaves to the compiler), a primitive type or a literal kind
@@ -123,7 +123,7 @@ pub(crate) fn tokens(
 
 	// The uses and the declarations, each in source order, merged into one
 	// stream; a declaration wins at a name that is both.
-	let mut uses = query::resolutions_in(&snapshot.sema, file)
+	let mut uses = query::resolutions_in(&snapshot.references, file)
 		.map(|(span, reference)| (span.span, reference))
 		.peekable();
 	let mut declarations = snapshot
@@ -152,23 +152,7 @@ pub(crate) fn tokens(
 		}
 		let token = match name {
 			Name::Use(reference) => {
-				let modification = match reference {
-					Reference::Local {
-						access: AccessKind::Write | AccessKind::ReadWrite,
-						..
-					}
-					| Reference::Field {
-						access: AccessKind::Write | AccessKind::ReadWrite,
-						..
-					} => MODIFICATION,
-					_ => 0,
-				};
-				token(
-					snapshot,
-					reference.definition(),
-					written(span),
-					modification,
-				)
+				token(snapshot, reference.definition(), written(span), 0)
 			}
 			Name::Declaration(definition) => {
 				token(snapshot, definition, written(span), DECLARATION)
@@ -318,9 +302,13 @@ fn classify(
 			let body = sema.owner_body(owner)?;
 			let parameter = matches!(owner, BodyOwner::Function(_))
 				&& body.params().contains(&Some(local));
+			let mutable = match body.local(local).mut_span {
+				Some(_) => MODIFICATION,
+				None => 0,
+			};
 			match parameter {
-				true => (TokenType::Parameter, 0),
-				false => (TokenType::Variable, 0),
+				true => (TokenType::Parameter, mutable),
+				false => (TokenType::Variable, mutable),
 			}
 		}
 		Definition::Field { .. } => (TokenType::Property, 0),

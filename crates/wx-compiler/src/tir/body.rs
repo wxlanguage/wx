@@ -145,7 +145,7 @@ impl Obligations {
 /// statements of a block.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) struct ExprRange {
+pub struct ExprRange {
 	start: u32,
 	len: u32,
 }
@@ -176,7 +176,7 @@ pub(super) struct LocalRange {
 /// A run of `Body::arms`: a match's arms, in written order.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) struct ArmRange {
+pub struct ArmRange {
 	start: u32,
 	len: u32,
 }
@@ -239,7 +239,7 @@ pub(super) enum PatternKind {
 /// give.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) enum ElementOrder {
+pub enum ElementOrder {
 	/// The n-th element gives the n-th position.
 	InOrder,
 	/// A run of `Body::arg_order` starting at `start` gives the position of
@@ -249,7 +249,7 @@ pub(super) enum ElementOrder {
 
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) enum ExprKind {
+pub enum ExprKind {
 	/// Already reported; whatever reads it stays silent.
 	Error,
 	/// A literal's magnitude, as written; `-1` is `PrimitiveUnary` over
@@ -298,25 +298,9 @@ pub(super) enum ExprKind {
 	Global(GlobalIdx),
 	/// A memory's handle, of its own nominal type (`Type::Memory`): the
 	/// receiver of `Memory`'s methods (`heap.grow(1)`).
-	Memory(
-		#[cfg_attr(
-			not(test),
-			expect(
-				dead_code,
-				reason = "the type carries it for lowering; the test printer reads it"
-			)
-		)]
-		MemoryIdx,
-	),
+	Memory(MemoryIdx),
 	/// A function as a value, of its own zero-sized type (`Type::Function`),
 	/// with its type arguments, flat as a call's.
-	#[cfg_attr(
-		not(test),
-		expect(
-			dead_code,
-			reason = "the type carries it for lowering; the test printer reads it"
-		)
-	)]
 	Function {
 		function: FunctionIdx,
 		type_args: GenericArgs,
@@ -748,8 +732,14 @@ impl Body {
 		ExprIdx::new(u32::try_from(self.kinds.len() - 1).unwrap())
 	}
 
-	pub(super) fn kind(&self, expr: ExprIdx) -> ExprKind {
+	pub fn kind(&self, expr: ExprIdx) -> ExprKind {
 		self.kinds[usize::from(expr)]
+	}
+
+	/// Every expression's kind, in arena order: each child before the node
+	/// it belongs to.
+	pub fn kinds(&self) -> &[ExprKind] {
+		&self.kinds
 	}
 
 	pub(super) fn ty(&self, expr: ExprIdx) -> TypeIndex {
@@ -1383,7 +1373,7 @@ mod tests {
 			);
 		});
 		let mut checked = 0;
-		for (site, &reference) in &case.sema.resolutions.by_site {
+		for (site, reference) in case.sema.resolutions.iter() {
 			let span = site.span();
 			let Reference::Local { owner, local, .. } = reference else {
 				continue;
@@ -1768,10 +1758,9 @@ mod tests {
 			body.local_named_at(at, body.local(LocalIdx::new(0)).name.inner);
 		assert_eq!(found, Some(LocalIdx::new(0)));
 		// The checker's lookup recorded the same local for that use.
-		let (_, &reference) = case
+		let (_, reference) = case
 			.sema
 			.resolutions
-			.by_site
 			.iter()
 			.find(|(site, _)| {
 				let span = site.span();
@@ -2086,16 +2075,16 @@ mod tests {
 			TextSpan::from(start..start + 1),
 		));
 		let Some(Reference::Item { item, .. }) =
-			case.sema.resolutions.by_site.get(&site)
+			case.sema.resolutions.get(site)
 		else {
 			panic!("a rejected constant test must still resolve its name")
 		};
 		assert!(matches!(
-			case.sema.declaration_kind(*item),
+			case.sema.declaration_kind(item),
 			crate::tir::DeclKind::Const(_)
 		));
 		assert_eq!(
-			case.strings.resolve(case.sema.decls.item(*item).name.inner),
+			case.strings.resolve(case.sema.decls.item(item).name.inner),
 			Some("N")
 		);
 	}

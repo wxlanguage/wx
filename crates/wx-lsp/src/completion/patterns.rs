@@ -105,6 +105,7 @@ pub(super) fn complete(
 	let owner = query::body_of(&snapshot.sema, declaration)?;
 	let mut context = PatternContext {
 		sema: &mut snapshot.sema,
+		references: &snapshot.references,
 		file,
 		strings: &snapshot.strings,
 		owner,
@@ -124,7 +125,7 @@ pub(super) fn complete(
 	};
 	let scope = snapshot.sema.body_scope(owner);
 	let resolved_prefix = prefix.and_then(|prefix| {
-		query::symbol_at(&snapshot.sema, file, prefix.start)
+		query::symbol_at(&snapshot.references, file, prefix.start)
 			.map(|(_, reference)| reference.definition())
 	});
 	let candidates = match (prefix, resolved_prefix) {
@@ -263,6 +264,7 @@ impl PositionalInsertion {
 
 struct PatternContext<'a> {
 	sema: &'a mut Semantics,
+	references: &'a query::References,
 	file: FileId,
 	strings: &'a StringInterner,
 	ast: &'a AST,
@@ -300,7 +302,7 @@ impl PatternContext<'_> {
 			let site =
 				Site::Value(SourceSpan::new(self.file, segment.ident.span));
 			if let Some(Reference::Item { item, .. }) =
-				self.sema.resolutions.by_site.get(&site)
+				self.references.get(&site)
 				&& self.sema.declaration_kind(*item)
 					== DeclKind::Enum(enum_index)
 			{
@@ -428,7 +430,7 @@ impl PatternContext<'_> {
 		let site =
 			Site::Value(SourceSpan::new(self.file, path.last()?.ident.span));
 		let Reference::Item { item, .. } =
-			self.sema.resolutions.by_site.get(&site).copied()?
+			self.references.get(&site).copied()?
 		else {
 			return None;
 		};
@@ -545,6 +547,7 @@ mod tests {
 		strings: StringInterner,
 		graph: CompilationUnit,
 		sema: Semantics,
+		references: query::References,
 		file: FileId,
 		owner: BodyOwner,
 		expression: ast::ExprId,
@@ -593,6 +596,7 @@ mod tests {
 				source: source.into(),
 				strings,
 				graph,
+				references: query::references(&sema),
 				sema,
 				file,
 				owner: BodyOwner::Function(function),
@@ -657,9 +661,10 @@ mod tests {
 
 		fn query(&mut self, target: PatternTarget) -> Option<TypeIndex> {
 			let diagnostics = self.sema.diagnostics().len();
-			let resolutions = self.sema.resolutions.by_site.len();
+			let resolutions = self.sema.resolutions.iter().count();
 			let answer = PatternContext {
 				sema: &mut self.sema,
+				references: &self.references,
 				file: self.file,
 				strings: &self.strings,
 				owner: self.owner,
@@ -667,7 +672,7 @@ mod tests {
 			}
 			.expected_type(target);
 			assert_eq!(self.sema.diagnostics().len(), diagnostics);
-			assert_eq!(self.sema.resolutions.by_site.len(), resolutions);
+			assert_eq!(self.sema.resolutions.iter().count(), resolutions);
 			answer
 		}
 
@@ -825,6 +830,7 @@ mod tests {
 		let parent = case.pattern("Flag((target))");
 		let context = PatternContext {
 			sema: &mut case.sema,
+			references: &case.references,
 			file: case.file,
 			strings: &case.strings,
 			owner: case.owner,

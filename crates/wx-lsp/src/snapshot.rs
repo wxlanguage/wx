@@ -28,6 +28,8 @@ pub(crate) struct Snapshot {
 	/// What the root package's lints report; none when its `lint` section
 	/// is invalid.
 	pub(crate) lints: Vec<Diagnostic<FileId>>,
+	/// Every resolved name, by where it is written.
+	pub(crate) references: query::References,
 	/// Every declared name, by where it is written.
 	definitions: BTreeMap<SourceSpan, Definition>,
 	/// Every impl, by its target's path (`query::impls`), the one span
@@ -66,6 +68,7 @@ impl Snapshot {
 			}),
 			None => Vec::new(),
 		};
+		let references = query::references(&sema);
 		let definitions = query::definitions(&sema);
 		let impls = query::impls(&sema).collect();
 		Ok(Self {
@@ -73,6 +76,7 @@ impl Snapshot {
 			strings,
 			sema,
 			lints,
+			references,
 			definitions,
 			impls,
 		})
@@ -87,7 +91,7 @@ impl Snapshot {
 		offset: TextOffset,
 	) -> Option<(SourceSpan, Definition)> {
 		if let Some((span, reference)) =
-			query::symbol_at(&self.sema, file, offset)
+			query::symbol_at(&self.references, file, offset)
 		{
 			return Some((span, reference.definition()));
 		}

@@ -1,11 +1,10 @@
 //! What a body declares and never uses: a local never read
 //! (`unused_variable`), `mut` on a local never assigned
 //! (`unnecessary_mutability`), and a label no jump names (`unused_label`).
-//! Each is the inverse of the compiler's name resolutions: the pass reads
-//! every recorded reference once, marks the local or label it names, and
-//! reports what is left unmarked.
+//! A local's uses are read from its body ([`local_uses`]); a label's from the
+//! compiler's name resolutions, read once to mark each label a jump names.
 //!
-//! Only a `Read` uses a local; one only assigned or compound-assigned is
+//! Only a read uses a local; one only assigned or compound-assigned is
 //! still reported, as rustc does. `_ = x;` reads `x`, and is how to keep a
 //! local that is not otherwise read.
 
@@ -13,7 +12,7 @@ use codespan_reporting::diagnostic::Diagnostic;
 use wx_compiler::diagnostics::SourceSpan;
 use wx_compiler::symbols::{Keyword, StringInterner};
 use wx_compiler::tir::{
-	AccessKind, BodyOwner, ConstIdx, Declared as _, FunctionIdx, GlobalIdx,
+	Body, BodyOwner, ConstIdx, Declared as _, ExprKind, FunctionIdx, GlobalIdx,
 	Reference, Semantics,
 };
 use wx_compiler::vfs::{FileId, PackageId};
@@ -33,14 +32,13 @@ pub(crate) fn report_unused(
 	for (owner, columns) in uses.owners() {
 		let body = sema.owner_body(owner).expect("a selected owner has a body");
 		let file = sema.decls.file_id(owner.loc(&sema.decls));
-		for (at, local) in body.locals().iter().enumerate() {
-			let used = uses.locals[columns.locals as usize + at];
+		for (local, used) in body.locals().iter().zip(local_uses(body)) {
 			let name = strings.resolve(local.name.inner).expect("interned");
 			if let Some(severity) = config.severity(Lint::UnusedVariable)
-				&& !used.read
+				&& !used.is_read()
 				&& local.name.inner != Keyword::SelfLower.symbol()
 			{
-				let message = if used.written {
+				let message = if used.is_assigned() {
 					format!("`{name}` is assigned but never read")
 				} else {
 					format!("unused variable `{name}`")
@@ -60,7 +58,7 @@ pub(crate) fn report_unused(
 			}
 			if let Some(severity) = config.severity(Lint::UnnecessaryMutability)
 				&& let Some(mut_span) = local.mut_span
-				&& !used.written
+				&& !used.is_assigned()
 			{
 				diagnostics.push(
 					Diagnostic::new(severity)
@@ -93,44 +91,81 @@ pub(crate) fn report_unused(
 	}
 }
 
-/// What the references say of each selected body's locals and labels, in
-/// flat columns: an owner's locals are a run of `locals` starting at its
-/// `Columns::locals`, in `LocalIdx` order, and its labels likewise by
-/// `TargetIdx`.
+#[derive(Clone, Copy, Default)]
+struct LocalUse {
+	/// Every expression that names it, an assignment's target included.
+	named: u32,
+	/// Every assignment to its own storage (`=`, `op=`): one whose target's
+	/// field chain starts at it. A write through a pointer it holds changes
+	/// memory, not the local, and only names it.
+	assigned: u32,
+}
+
+/// How `body` uses each of its locals, index-aligned with `Body::locals`.
+fn local_uses(body: &Body) -> Vec<LocalUse> {
+	let mut locals = vec![LocalUse::default(); body.locals().len()];
+	for &kind in body.kinds() {
+		let target = match kind {
+			ExprKind::Local(local) => {
+				locals[usize::from(local)].named += 1;
+				continue;
+			}
+			ExprKind::Assign { target, .. }
+			| ExprKind::PrimitiveCompoundAssign { target, .. }
+			| ExprKind::ConcreteCompoundAssign { target, .. }
+			| ExprKind::AbstractCompoundAssign { target, .. } => target,
+			_ => continue,
+		};
+		let mut root = target;
+		while let ExprKind::FieldAccess { object, .. } = body.kind(root) {
+			root = object;
+		}
+		if let ExprKind::Local(local) = body.kind(root) {
+			locals[usize::from(local)].assigned += 1;
+		}
+	}
+	locals
+}
+
+impl LocalUse {
+	/// Whether something reads its value: it is named other than as the
+	/// root of an assignment's target, so `x += 1` alone does not read `x`.
+	fn is_read(self) -> bool {
+		self.named > self.assigned
+	}
+
+	/// Whether an assignment changes it, which is what it needs `mut` for.
+	fn is_assigned(self) -> bool {
+		self.assigned > 0
+	}
+}
+
+/// Which labels of each selected body a jump names, in one flat column: an
+/// owner's labels are a run of `labels` starting at its `Columns::labels`,
+/// in `TargetIdx` order.
 struct Uses {
 	/// By owner arena; `None` for an owner not reported on, or without a
 	/// body.
 	functions: Vec<Option<Columns>>,
 	constants: Vec<Option<Columns>>,
 	globals: Vec<Option<Columns>>,
-	locals: Vec<LocalUse>,
 	labels: Vec<bool>,
 }
 
 #[derive(Clone, Copy)]
 struct Columns {
-	locals: u32,
 	labels: u32,
-}
-
-#[derive(Clone, Copy, Default)]
-struct LocalUse {
-	read: bool,
-	/// Assigned or compound-assigned, which needs `mut`.
-	written: bool,
 }
 
 impl Uses {
 	fn collect(sema: &Semantics, package: PackageId) -> Self {
-		let mut locals = 0;
 		let mut labels = 0;
 		let mut columns = |owner: BodyOwner| {
 			if sema.decls.package_id(owner.loc(&sema.decls)) != package {
 				return None;
 			}
 			let body = sema.owner_body(owner)?;
-			let at = Columns { locals, labels };
-			locals += body.locals().len() as u32;
+			let at = Columns { labels };
 			labels += body.targets().len() as u32;
 			Some(at)
 		};
@@ -147,38 +182,14 @@ impl Uses {
 			functions,
 			constants,
 			globals,
-			locals: vec![LocalUse::default(); locals as usize],
 			labels: vec![false; labels as usize],
 		};
-		for reference in sema.resolutions.by_site.values() {
-			match *reference {
-				Reference::Local {
-					owner,
-					local,
-					access,
-				} => {
-					let Some(columns) = uses.columns(owner) else {
-						continue;
-					};
-					let used = &mut uses.locals
-						[columns.locals as usize + usize::from(local)];
-					match access {
-						AccessKind::Read => used.read = true,
-						AccessKind::Write | AccessKind::ReadWrite => {
-							used.written = true
-						}
-						AccessKind::Initialize => {
-							unreachable!("only a field is initialized")
-						}
-					}
-				}
-				Reference::Label { owner, target } => {
-					if let Some(columns) = uses.columns(owner) {
-						uses.labels
-							[columns.labels as usize + usize::from(target)] = true;
-					}
-				}
-				_ => {}
+		for (_, reference) in sema.resolutions.iter() {
+			if let Reference::Label { owner, target } = reference
+				&& let Some(columns) = uses.columns(owner)
+			{
+				uses.labels[columns.labels as usize + usize::from(target)] =
+					true;
 			}
 		}
 		uses

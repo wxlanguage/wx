@@ -6282,9 +6282,8 @@ pub(super) mod tests {
 			!case
 				.sema
 				.resolutions
-				.by_site
-				.keys()
-				.any(|site| site.span().file_id == file_id)
+				.iter()
+				.any(|(site, _)| site.span().file_id == file_id)
 		);
 	}
 
@@ -11230,13 +11229,14 @@ pub(super) mod tests {
 						_ => None,
 					})
 					.unwrap();
-				let reference = SourceSpan::new(
-					sema.decls.file_id(sema.decls.traits[0].loc),
-					TextSpan::from(0..1),
-				);
-				for (name, overridden) in
-					[("overridden", true), ("inherited", false)]
+				let file = sema.decls.file_id(sema.decls.traits[0].loc);
+				let reference = SourceSpan::new(file, TextSpan::from(0..1));
+				// Each name is written at a site of its own.
+				for (at, name, overridden) in
+					[(0, "overridden", true), (1, "inherited", false)]
 				{
+					let reference =
+						SourceSpan::new(file, TextSpan::from(at..at + 1));
 					let name = builder.strings.get(name).unwrap();
 					let key = BindingKey::new(Tier::Value, name);
 					let MemberLookup::Found(member) = sema
@@ -19142,12 +19142,11 @@ pub(super) mod tests {
 				let span = TextSpan::from(start..start + 4);
 				case.sema
 					.resolutions
-					.by_site
 					.iter()
 					.find(
 						|(site, _)| matches!(site, Site::Type(site) if site.span == span),
 					)
-					.map(|(_, reference)| *reference)
+					.map(|(_, reference)| reference)
 			})
 			.collect();
 		assert!(matches!(referents[0], Some(Reference::TypeParam { .. })));

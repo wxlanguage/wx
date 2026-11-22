@@ -21,7 +21,7 @@ use crate::tir::body::{
 	TargetIdx, TargetKind,
 };
 use crate::tir::decls::{FunctionIdx, report_duplicate_parameter};
-use crate::tir::resolutions::{AccessKind, Reference, Site};
+use crate::tir::resolutions::{Reference, Site};
 use crate::tir::signatures::InferPolicy;
 use crate::tir::types::TypeIndex;
 
@@ -797,7 +797,6 @@ impl BodyBuilder<'_, '_> {
 				Reference::Local {
 					owner: self.owner,
 					local,
-					access: AccessKind::Write,
 				},
 			);
 			let ty = self.body.local(local).ty;

@@ -1,7 +1,8 @@
 //! Questions requests ask of a checked package, answered from what checking
-//! left behind: the name resolution table (`Semantics::resolutions`), the
-//! declarations and the bodies. None of them is the checker's own: each
-//! reads what it decided and never decides anything again.
+//! left behind: the name resolution table (`Semantics::resolutions`, ordered
+//! here as [`References`]), the declarations and the bodies. None of them is
+//! the checker's own: each reads what it decided and never decides anything
+//! again.
 
 use std::collections::BTreeMap;
 
@@ -13,6 +14,17 @@ use wx_compiler::tir::{
 	Reference, Semantics, Site, StructIdx, TargetIdx, TraitImplIdx,
 };
 use wx_compiler::vfs::FileId;
+
+/// Every resolved name, by where it is written: by file, then position, then
+/// role, so that the entries of one written name are adjacent and "the name
+/// at this offset" is a range lookup.
+pub(crate) type References = BTreeMap<Site, Reference>;
+
+/// The checker's resolution table, ordered. A name it resolved twice has the
+/// same meaning both times, so either entry is the one kept.
+pub(crate) fn references(sema: &Semantics) -> References {
+	sema.resolutions.iter().collect()
+}
 
 /// Which of the entries at one name is the one it means where it is used:
 /// the value, then the type, then the label.
@@ -32,7 +44,7 @@ fn priority(site: Site) -> u8 {
 /// site: a `use` leaf is a type and a value, a shorthand argument is a label
 /// and a value); `priority` picks the one the name means where it is used.
 pub(crate) fn symbol_at(
-	sema: &Semantics,
+	references: &References,
 	file: FileId,
 	offset: TextOffset,
 ) -> Option<(SourceSpan, Reference)> {
@@ -44,7 +56,7 @@ pub(crate) fn symbol_at(
 		},
 	));
 	let mut found: Option<(SourceSpan, Site, Reference)> = None;
-	for (&site, &reference) in sema.resolutions.by_site.range(..=probe).rev() {
+	for (&site, &reference) in references.range(..=probe).rev() {
 		let span = site.span();
 		if span.file_id != file || span.span.end < offset {
 			break;
@@ -67,15 +79,13 @@ pub(crate) fn symbol_at(
 /// where a name holds several entries, the one `symbol_at` would answer.
 /// Zero-width synthetic spans are skipped, since nothing is written there.
 pub(crate) fn resolutions_in(
-	sema: &Semantics,
+	references: &References,
 	file: FileId,
 ) -> impl Iterator<Item = (SourceSpan, Reference)> + '_ {
 	// The least site of `file`: the empty span at its start, first role.
 	let start =
 		Site::Type(SourceSpan::new(file, TextSpan::empty_at(TextOffset::ZERO)));
-	let mut entries = sema
-		.resolutions
-		.by_site
+	let mut entries = references
 		.range(start..)
 		.take_while(move |(site, _)| site.span().file_id == file)
 		.filter(|(site, _)| {
@@ -100,11 +110,10 @@ pub(crate) fn resolutions_in(
 /// Every resolved meaning of the name written at exactly `span`: one per
 /// role it plays there (a shorthand argument is a label and a value).
 pub(crate) fn references_at(
-	sema: &Semantics,
+	references: &References,
 	span: SourceSpan,
 ) -> impl Iterator<Item = Reference> + '_ {
-	sema.resolutions
-		.by_site
+	references
 		.range(Site::Type(span)..=Site::Label(span))
 		.map(|(_, &reference)| reference)
 }
@@ -116,11 +125,12 @@ pub(crate) fn references_at(
 /// supplied value.
 pub(crate) fn references_to(
 	sema: &Semantics,
+	references: &References,
 	definition: Definition,
 ) -> Vec<SourceSpan> {
 	let definition = reference_identity(sema, definition);
 	let mut found = Vec::new();
-	for (site, reference) in &sema.resolutions.by_site {
+	for (site, reference) in references {
 		let span = site.span();
 		if span.span.start != span.span.end
 			&& reference_identity(sema, reference.definition()) == definition
@@ -382,7 +392,7 @@ mod tests {
 	use indoc::indoc;
 	use wx_compiler::diagnostics::Diagnostics as _;
 	use wx_compiler::symbols::{Keyword, StringInterner};
-	use wx_compiler::tir::{self, AccessKind, ItemLoc, Route};
+	use wx_compiler::tir::{self, ItemLoc, Route};
 	use wx_compiler::vfs::{self, AbsolutePath, VirtualFileSource};
 
 	use super::*;
@@ -392,6 +402,7 @@ mod tests {
 		file: FileId,
 		strings: StringInterner,
 		sema: Semantics,
+		references: References,
 	}
 
 	impl<'s> Analysis<'s> {
@@ -430,6 +441,7 @@ mod tests {
 				source,
 				file,
 				strings,
+				references: references(&sema),
 				sema,
 			}
 		}
@@ -454,7 +466,7 @@ mod tests {
 		}
 
 		fn get(&self, site: Site) -> Option<Reference> {
-			self.sema.resolutions.by_site.get(&site).copied()
+			self.references.get(&site).copied()
 		}
 
 		fn ty(&self, context: &str, name: &str) -> Reference {
@@ -503,7 +515,8 @@ mod tests {
 
 		/// What go-to-definition from `offset` reaches.
 		fn definition_at(&self, offset: TextOffset) -> Option<SourceSpan> {
-			let (_, reference) = symbol_at(&self.sema, self.file, offset)?;
+			let (_, reference) =
+				symbol_at(&self.references, self.file, offset)?;
 			definition_target(&self.sema, reference.definition())
 		}
 	}
@@ -526,8 +539,8 @@ mod tests {
 			a.span("\n\tvalue\n", "value"),
 		];
 		assert_ne!(local, parameter);
-		assert_eq!(references_to(&a.sema, local), expected);
-		assert_eq!(references_to(&a.sema, parameter), expected);
+		assert_eq!(references_to(&a.sema, &a.references, local), expected);
+		assert_eq!(references_to(&a.sema, &a.references, parameter), expected);
 	}
 
 	#[test]
@@ -545,12 +558,12 @@ mod tests {
 			a.span("-> m::S", "S"),
 			a.span("{ Alias()", "Alias"),
 		];
-		assert_eq!(references_to(&a.sema, ty), expected);
-		assert_eq!(references_to(&a.sema, value), expected);
+		assert_eq!(references_to(&a.sema, &a.references, ty), expected);
+		assert_eq!(references_to(&a.sema, &a.references, value), expected);
 	}
 
 	#[test]
-	fn references_preserve_owner_identity_and_ignore_access_kind() {
+	fn references_preserve_owner_identity_across_reads_and_writes() {
 		let a = Analysis::clean(indoc! {"
 			func f() -> u32 {
 				local mut x: u32 = 0;
@@ -563,7 +576,7 @@ mod tests {
 		"});
 		let definition = a.value("x = 1", "x").definition();
 		assert_eq!(
-			references_to(&a.sema, definition),
+			references_to(&a.sema, &a.references, definition),
 			[
 				a.span("x = 1", "x"),
 				a.span("x += 2", "x"),
@@ -581,8 +594,11 @@ mod tests {
 		let tr = a.ty("T: Tr", "Tr").definition();
 		let self_ty = a.ty("self: Self", "Self").definition();
 		assert_eq!(a.sema.definition_span(tr), a.sema.definition_span(self_ty));
-		assert_eq!(references_to(&a.sema, tr), [a.span("T: Tr", "Tr")]);
-		assert_eq!(references_to(&a.sema, self_ty).len(), 2);
+		assert_eq!(
+			references_to(&a.sema, &a.references, tr),
+			[a.span("T: Tr", "Tr")]
+		);
+		assert_eq!(references_to(&a.sema, &a.references, self_ty).len(), 2);
 	}
 
 	#[test]
@@ -596,13 +612,13 @@ mod tests {
 		"});
 		let definition = a.value("S::id", "id").definition();
 		assert_eq!(
-			references_to(&a.sema, definition),
+			references_to(&a.sema, &a.references, definition),
 			[a.span("S::id", "id"), a.span(".id()", "id")]
 		);
 		let declared = definitions(&a.sema)[&a.span("func id", "id")];
 		assert_eq!(
-			references_to(&a.sema, declared),
-			references_to(&a.sema, definition)
+			references_to(&a.sema, &a.references, declared),
+			references_to(&a.sema, &a.references, definition)
 		);
 	}
 
@@ -629,8 +645,14 @@ mod tests {
 				.into_iter()
 				.map(|context| a.span(context, name))
 				.collect();
-			assert_eq!(references_to(&a.sema, definition), expected);
-			assert_eq!(references_to(&a.sema, declared), expected);
+			assert_eq!(
+				references_to(&a.sema, &a.references, definition),
+				expected
+			);
+			assert_eq!(
+				references_to(&a.sema, &a.references, declared),
+				expected
+			);
 		}
 	}
 
@@ -763,7 +785,7 @@ mod tests {
 			}
 		"});
 		let found: Vec<_> =
-			references_at(&a.sema, a.span("{ x }", "x")).collect();
+			references_at(&a.references, a.span("{ x }", "x")).collect();
 		// The parameter it labels, and the local it supplies.
 		assert_eq!(found.len(), 2, "{found:?}");
 		assert!(found.contains(&a.label("{ x }", "x")));
@@ -775,7 +797,6 @@ mod tests {
 			Reference::Local {
 				owner: BodyOwner::Function(a.function("take")),
 				local: LocalIdx::new(0),
-				access: AccessKind::Read,
 			}
 			.definition(),
 		));
@@ -846,7 +867,7 @@ mod tests {
 				take{ x };
 			}
 		"});
-		let found: Vec<_> = resolutions_in(&a.sema, a.file).collect();
+		let found: Vec<_> = resolutions_in(&a.references, a.file).collect();
 		let spans: Vec<_> = found.iter().map(|(span, _)| span.span).collect();
 		let mut sorted = spans.clone();
 		sorted.sort();
@@ -876,7 +897,7 @@ mod tests {
 		let at = |label: &str| {
 			let span = marked.name(label);
 			let (found, reference) =
-				symbol_at(&analysis.sema, analysis.file, span.start + 1)
+				symbol_at(&analysis.references, analysis.file, span.start + 1)
 					.unwrap_or_else(|| panic!("nothing at `{label}`"));
 			assert_eq!(found, SourceSpan::new(analysis.file, span));
 			reference

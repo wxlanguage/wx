@@ -28,7 +28,7 @@ use crate::tir::decls::{
 	MemberOwner, StructIdx,
 };
 use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
-use crate::tir::resolutions::{AccessKind, Definition, Reference, Site};
+use crate::tir::resolutions::{Definition, Reference, Site};
 use crate::tir::signatures::Semantics;
 use crate::tir::solver::SolverError;
 use crate::tir::types::{
@@ -164,7 +164,6 @@ impl CallTarget {
 			CallTargetKind::StructConstructor(owner) => Reference::Field {
 				owner: crate::tir::decls::FieldOwner::Struct(owner),
 				field: FieldIdx::new(u32::from(param)),
-				access: AccessKind::Initialize,
 			},
 		}
 	}
@@ -992,12 +991,7 @@ impl BodyBuilder<'_, '_> {
 			Some(value) => self.build(value, hint),
 			None => {
 				let path = [ast::PathSegment::new(argument.name)];
-				self.build_path(
-					&path,
-					hint,
-					argument.name.span,
-					AccessKind::Read,
-				)
+				self.build_path(&path, hint, argument.name.span)
 			}
 		}
 	}

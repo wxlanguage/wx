@@ -75,7 +75,8 @@ pub(crate) fn rename(
 	let files = &snapshot.compilation.files;
 	let old = target.old.as_str();
 	let old_symbol = snapshot.strings.get(old);
-	let mut spans = query::references_to(sema, target.definition);
+	let mut spans =
+		query::references_to(sema, &snapshot.references, target.definition);
 	spans.push(target.declaration);
 	spans.sort_unstable();
 	spans.dedup();
@@ -217,7 +218,7 @@ fn shorthand_side(
 ) -> Option<Side> {
 	let sema = &snapshot.sema;
 	let (mut ours_label, mut other, mut other_label) = (false, false, false);
-	for reference in query::references_at(sema, span) {
+	for reference in query::references_at(&snapshot.references, span) {
 		let label = matches!(
 			reference,
 			Reference::Field { .. } | Reference::Parameter { .. }

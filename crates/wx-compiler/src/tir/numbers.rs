@@ -14,7 +14,7 @@ pub(super) struct LimbRange {
 /// storage identity, not numeric equality. Negation preserves negative zero.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) struct DecimalFloat {
+pub struct DecimalFloat {
 	significand: LimbRange,
 	exponent: LimbRange,
 	pub(super) negative: bool,
