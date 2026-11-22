@@ -293,21 +293,20 @@ pub(crate) fn definitions(
 			});
 		}
 	}
-	for index in 0..decls.functions.len() {
+	for (index, decl) in decls.functions.iter().enumerate() {
 		let function = FunctionIdx::new(index as u32);
 		let owner = BodyOwner::Function(function);
 		// A parameter of a function with a body is a local of it; the others
 		// are known by the declaration alone.
-		if sema.owner_body(owner).is_none() {
-			for parameter in 0..decls.functions[index].params.len() {
+		if sema.owner_body(owner).is_some() {
+			add(Definition::FunctionBody(function));
+		} else {
+			for parameter in 0..decl.params.len() {
 				add(Definition::Parameter {
 					function,
 					parameter: ParamIdx::new(parameter as u32),
 				});
 			}
-		}
-		if sema.owner_body(owner).is_some() {
-			add(Definition::FunctionBody(function));
 		}
 		add_body_definitions(sema, owner, &mut add);
 	}
