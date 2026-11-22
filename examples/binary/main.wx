@@ -1,0 +1,285 @@
+// Bounded binary I/O over caller-owned memory. Cursors are stack values:
+// keep the returned `next` cursor to advance, or keep the old one to retry.
+pub enum Status(pub value: u32) {
+    Ok = 0,
+    Insufficient = 1,
+}
+
+pub struct Reader<M: Memory>(bytes: M::&[u8], at: M::Size);
+pub struct Writer<M: Memory>(bytes: M::*[u8], at: M::Size);
+
+// `value` is meaningful only on Ok. On failure it is zero (integers) or an
+// empty slice; `next` is the original cursor. No sticky error state.
+pub struct Read<M: Memory, T: StackValue>(
+    pub status: Status,
+    pub next: Reader<M>,
+    pub value: T,
+);
+
+pub struct Write<M: Memory>(pub status: Status, pub next: Writer<M>);
+
+impl<M: Memory> Reader<M> {
+    #[inline]
+    pub func new(bytes: M::&[u8]) -> Self {
+        Self{ bytes, at: 0 }
+    }
+
+    #[inline]
+    pub func position(self: Self) -> M::Size {
+        self.at
+    }
+
+    #[inline]
+    pub func remaining(self: Self) -> M::Size {
+        self.bytes.len() - self.at
+    }
+
+    /// Takes a bounded view without copying. Zero-length takes also succeed
+    /// at EOF. Failure does not advance or read any bytes.
+    #[inline]
+    pub func take(self: Self, length: M::Size) -> Read<M, M::&[u8]> {
+        if (length > self.remaining()) {
+            return Read{
+                status: Status::Insufficient,
+                next: self,
+                value: slice_from_parts(self.bytes.as_ref(), 0),
+            }
+        }
+        local ptr = RawPtr::from_ref(self.bytes.as_ref()).add(self.at);
+        Read{
+            status: Status::Ok,
+            next: Self{ bytes: self.bytes, at: self.at + length },
+            value: slice_from_parts(ptr.as_ref(), length),
+        }
+    }
+
+    // Each fixed-width read first checks the entire field, then assembles it
+    // from bytes. No alignment requirements, native-endian assumptions or
+    // partial advancement on failure.
+    #[inline]
+    pub func read_u8(self: Self) -> Read<M, u8> {
+        if (self.remaining() < 1) {
+            return Read{ status: Status::Insufficient, next: self, value: 0 }
+        }
+        Read{
+            status: Status::Ok,
+            next: Self{ bytes: self.bytes, at: self.at + 1 },
+            value: self.bytes[self.at],
+        }
+    }
+
+    #[inline]
+    pub func read_u16_le(self: Self) -> Read<M, u16> {
+        if (self.remaining() < 2) {
+            return Read{ status: Status::Insufficient, next: self, value: 0 }
+        }
+        Read{
+            status: Status::Ok,
+            next: Self{ bytes: self.bytes, at: self.at + 2 },
+            value: transmute::<u32, u16>(
+                byte(self.bytes, self.at)
+                    | (byte(self.bytes, self.at + 1) << 8),
+            ),
+        }
+    }
+
+    #[inline]
+    pub func read_u16_be(self: Self) -> Read<M, u16> {
+        if (self.remaining() < 2) {
+            return Read{ status: Status::Insufficient, next: self, value: 0 }
+        }
+        Read{
+            status: Status::Ok,
+            next: Self{ bytes: self.bytes, at: self.at + 2 },
+            value: transmute::<u32, u16>(
+                (byte(self.bytes, self.at) << 8)
+                    | byte(self.bytes, self.at + 1),
+            ),
+        }
+    }
+
+    #[inline]
+    pub func read_u32_le(self: Self) -> Read<M, u32> {
+        if (self.remaining() < 4) {
+            return Read{ status: Status::Insufficient, next: self, value: 0 }
+        }
+        Read{
+            status: Status::Ok,
+            next: Self{ bytes: self.bytes, at: self.at + 4 },
+            value: le32(self.bytes, self.at),
+        }
+    }
+
+    #[inline]
+    pub func read_u32_be(self: Self) -> Read<M, u32> {
+        if (self.remaining() < 4) {
+            return Read{ status: Status::Insufficient, next: self, value: 0 }
+        }
+        Read{
+            status: Status::Ok,
+            next: Self{ bytes: self.bytes, at: self.at + 4 },
+            value: be32(self.bytes, self.at),
+        }
+    }
+
+    #[inline]
+    pub func read_u64_le(self: Self) -> Read<M, u64> {
+        if (self.remaining() < 8) {
+            return Read{ status: Status::Insufficient, next: self, value: 0 }
+        }
+        Read{
+            status: Status::Ok,
+            next: Self{ bytes: self.bytes, at: self.at + 8 },
+            value: u64_extend_u32(le32(self.bytes, self.at))
+                | (u64_extend_u32(le32(self.bytes, self.at + 4)) << 32),
+        }
+    }
+
+    #[inline]
+    pub func read_u64_be(self: Self) -> Read<M, u64> {
+        if (self.remaining() < 8) {
+            return Read{ status: Status::Insufficient, next: self, value: 0 }
+        }
+        Read{
+            status: Status::Ok,
+            next: Self{ bytes: self.bytes, at: self.at + 8 },
+            value: (u64_extend_u32(be32(self.bytes, self.at)) << 32)
+                | u64_extend_u32(be32(self.bytes, self.at + 4)),
+        }
+    }
+}
+
+#[inline]
+func byte<M: Memory>(bytes: M::&[u8], at: M::Size) -> u32 {
+    transmute::<u8, u32>(bytes[at])
+}
+
+#[inline]
+func le32<M: Memory>(bytes: M::&[u8], at: M::Size) -> u32 {
+    byte(bytes, at)
+        | (byte(bytes, at + 1) << 8)
+        | (byte(bytes, at + 2) << 16)
+        | (byte(bytes, at + 3) << 24)
+}
+
+#[inline]
+func be32<M: Memory>(bytes: M::&[u8], at: M::Size) -> u32 {
+    (byte(bytes, at) << 24)
+        | (byte(bytes, at + 1) << 16)
+        | (byte(bytes, at + 2) << 8)
+        | byte(bytes, at + 3)
+}
+
+enum Endian(value: u32) {
+    Little = 0,
+    Big = 1,
+}
+
+#[inline]
+func low_byte(value: u64) -> u8 {
+    transmute::<i32, u8>(i32_wrap_i64(transmute::<u64, i64>(value & 255)))
+}
+
+impl<M: Memory> Writer<M> {
+    #[inline]
+    pub func new(bytes: M::*[u8]) -> Self {
+        Self{ bytes, at: 0 }
+    }
+
+    #[inline]
+    pub func position(self: Self) -> M::Size {
+        self.at
+    }
+
+    #[inline]
+    pub func remaining(self: Self) -> M::Size {
+        self.bytes.len() - self.at
+    }
+
+    /// Copies a whole byte slice, or writes nothing. Source and destination
+    /// may be different memories with the same address size. Overlap has
+    /// memory.copy's memmove semantics.
+    #[inline]
+    pub func write_bytes<S: Memory where { Size = M::Size }>(
+        self: Self,
+        bytes: S::&[u8],
+    ) -> Write<M> {
+        if (bytes.len() > self.remaining()) {
+            return Write{ status: Status::Insufficient, next: self }
+        }
+        local ptr = RawPtr::from_ref(self.bytes.as_ref()).add(self.at);
+        memory_copy{ dst: ptr.as_ptr(), src: bytes.as_ref(), len: bytes.len() };
+        Write{
+            status: Status::Ok,
+            next: Self{ bytes: self.bytes, at: self.at + bytes.len() },
+        }
+    }
+
+    #[inline]
+    func word(
+        self: Self,
+        value: u64,
+        length: M::Size,
+        endian: Endian,
+    ) -> Write<M> {
+        if (length > self.remaining()) {
+            return Write{ status: Status::Insufficient, next: self }
+        }
+        loop (i: M::Size = 0, rest = value) {
+            if (i == length) { break };
+            local at = match (endian) {
+                Endian::Little => i,
+                Endian::Big => length - i - 1,
+            };
+            self.bytes[self.at + at] = low_byte(rest);
+            (i + 1, rest >> 8)
+        }
+        Write{
+            status: Status::Ok,
+            next: Self{ bytes: self.bytes, at: self.at + length },
+        }
+    }
+
+    #[inline]
+    pub func write_u8(self: Self, value: u8) -> Write<M> {
+        self.word(
+            u64_extend_u32(transmute::<u8, u32>(value)),
+            1,
+            Endian::Little,
+        )
+    }
+
+    #[inline]
+    pub func write_u16_le(self: Self, value: u16) -> Write<M> {
+        self.word(
+            u64_extend_u32(transmute::<u16, u32>(value)),
+            2,
+            Endian::Little,
+        )
+    }
+
+    #[inline]
+    pub func write_u16_be(self: Self, value: u16) -> Write<M> {
+        self.word(u64_extend_u32(transmute::<u16, u32>(value)), 2, Endian::Big)
+    }
+
+    #[inline]
+    pub func write_u32_le(self: Self, value: u32) -> Write<M> {
+        self.word(u64_extend_u32(value), 4, Endian::Little)
+    }
+
+    #[inline]
+    pub func write_u32_be(self: Self, value: u32) -> Write<M> {
+        self.word(u64_extend_u32(value), 4, Endian::Big)
+    }
+
+    #[inline]
+    pub func write_u64_le(self: Self, value: u64) -> Write<M> {
+        self.word(value, 8, Endian::Little)
+    }
+
+    #[inline]
+    pub func write_u64_be(self: Self, value: u64) -> Write<M> {
+        self.word(value, 8, Endian::Big)
+    }
+}

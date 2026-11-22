@@ -1,0 +1,184 @@
+// QOI (Quite OK Image) decoding without an allocator.
+// The host must supply distinct input and output memories so they cannot alias.
+// WX keeps their pointer types separate; the host owns the import contract.
+package "binary" as binary;
+
+use binary::Reader;
+
+import "host" as host {
+    memory encoded: u32;
+    memory pixels: u32;
+}
+
+// Only the first 256 bytes are used. Wasm allocates memories in 64 KiB pages.
+// No callbacks or suspended calls: this scratch table is private to an instance.
+#[memory_limits{ min_pages: 1, max_pages: 1 }]
+memory scratch: u32;
+
+enum Status(value: u32) {
+    Ok = 0,
+    Invalid = 1,
+    OutputTooSmall = 2,
+}
+
+// On error, only `written` output pixels may have changed.
+// Header errors return zero dimensions; other errors retain the dimensions.
+struct Decoded(status: Status, width: u32, height: u32, written: u32);
+
+const INVALID_HEADER: Decoded = Decoded{
+    status: Status::Invalid,
+    width: 0,
+    height: 0,
+    written: 0,
+};
+
+// A pixel is a stack value, not an allocation. State transitions return a new
+// pixel; only the output buffer and the index table need memory writes.
+struct Pixel(r: u32, g: u32, b: u32, a: u32);
+
+impl Pixel {
+    func unpack(word: u32) -> Self {
+        Self{
+            r: word & 255,
+            g: (word >> 8) & 255,
+            b: (word >> 16) & 255,
+            a: word >> 24,
+        }
+    }
+
+    func packed(self: Self) -> u32 {
+        self.r | (self.g << 8) | (self.b << 16) | (self.a << 24)
+    }
+
+    func hash(self: Self) -> u32 {
+        (self.r * 3 + self.g * 5 + self.b * 7 + self.a * 11) & 63
+    }
+
+    func shifted(self: Self, dr: u32, dg: u32, db: u32) -> Self {
+        Self{
+            r: (self.r + dr) & 255,
+            g: (self.g + dg) & 255,
+            b: (self.b + db) & 255,
+            a: self.a,
+        }
+    }
+}
+
+func byte(bytes: host::encoded::&[u8], at: u32) -> u32 {
+    transmute::<u8, u32>(bytes[at])
+}
+
+// Slices become (address, length) pairs; Decoded becomes four Wasm results.
+// The host must supply real, in-bounds memory regions. Invalid file contents
+// return a status rather than trapping. Output is always RGBA, even for RGB QOI.
+func decode(src: host::encoded::&[u8], dst: host::pixels::*[u32]) -> Decoded {
+    if (src.len() < 22) { return INVALID_HEADER };
+    // The length check guarantees these fixed-width header reads succeed.
+    local magic = Reader::new(src).read_u32_be();
+    local width = magic.next.read_u32_be();
+    local height = width.next.read_u32_be();
+    local channels = height.next.read_u8();
+    local colorspace = channels.next.read_u8();
+    match (magic.value, channels.value, colorspace.value) {
+        (0x716f6966, 3 | 4, 0 | 1) => {},
+        _ => return INVALID_HEADER,
+    }
+    local width = width.value;
+    local height = height.value;
+    if (width == 0 || height == 0) { return INVALID_HEADER };
+    // Divide before multiplying: hostile dimensions must not wrap the count.
+    if (width > dst.len() / height) {
+        return Decoded{
+            status: Status::OutputTooSmall,
+            width,
+            height,
+            written: 0,
+        }
+    }
+    local count = width * height;
+    local end = src.len() - 8;
+    local marker = Reader::new(src).take(end).next.read_u64_be();
+    if (marker.value != 1) {
+        return Decoded{ status: Status::Invalid, width, height, written: 0 }
+    }
+
+    local index = RawPtr::<scratch, u32>::from_addr(0);
+    memory_fill{ dst: index.cast::<u8>().as_ptr(), val: 0, len: 256 };
+    local table = slice_from_parts_mut(index.as_ptr(), 64);
+
+    local (status, written) = loop (
+        pixel = Pixel{ r: 0, g: 0, b: 0, a: 255 },
+        input = Reader::new(colorspace.next.take(end - 14).value),
+        written: u32 = 0,
+    ) {
+        if (written == count) {
+            break (
+                if (input.remaining() == 0) {
+                    Status::Ok
+                } else {
+                    Status::Invalid
+                },
+                written,
+            );
+        }
+        local code = input.read_u8();
+        match (code.status) {
+            binary::Status::Insufficient => break (Status::Invalid, written),
+            binary::Status::Ok => {},
+        }
+        local op = transmute::<u8, u32>(code.value);
+        // Check the entire chunk before decoding it. RGB/RGBA override RUN.
+        local (extra, run): (u32, u32) = match (op, op >> 6) {
+            (0xfe, _) => (3, 1),
+            (0xff, _) => (4, 1),
+            (_, 2) => (1, 1),
+            (_, 3) => (0, (op & 63) + 1),
+            _ => (0, 1),
+        };
+        local chunk = code.next.take(extra);
+        match (chunk.status) {
+            binary::Status::Insufficient => break (Status::Invalid, written),
+            binary::Status::Ok => {},
+        }
+        if (run > count - written) {
+            break (Status::Invalid, written);
+        }
+        local next = match (op, op >> 6) {
+            (0xfe, _) | (0xff, _) => Pixel{
+                r: byte(chunk.value, 0),
+                g: byte(chunk.value, 1),
+                b: byte(chunk.value, 2),
+                a: if (op == 0xff) { byte(chunk.value, 3) } else { pixel.a },
+            },
+            (_, 0) => Pixel::unpack(table[op]),
+            (_, 1) => pixel.shifted{
+                dr: ((op >> 4) & 3) - 2,
+                dg: ((op >> 2) & 3) - 2,
+                db: (op & 3) - 2,
+            },
+            (_, 2) => {
+                local deltas = byte(chunk.value, 0);
+                local dg = (op & 63) - 32;
+                pixel.shifted{
+                    dr: dg + (deltas >> 4) - 8,
+                    dg,
+                    db: dg + (deltas & 15) - 8,
+                }
+            },
+            _ => pixel,
+        };
+        local packed = next.packed();
+        table[next.hash()] = packed;
+        loop (i: u32 = 0) {
+            if (i == run) { break };
+            dst[written + i] = packed;
+            continue i + 1;
+        }
+        continue { pixel: next, input: chunk.next, written: written + run };
+    };
+    Decoded{ status, width, height, written }
+}
+
+export {
+    decode,
+}

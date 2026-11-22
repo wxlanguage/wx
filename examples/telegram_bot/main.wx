@@ -1,0 +1,667 @@
+// A quiz-and-text-tools Telegram bot built on the `telegram` framework.
+//
+// The framework owns the host ABI, command parsing, reply formatting and
+// routing. This file is the application: one declarative command table, its
+// handlers, six text tools, a dice/choice/oracle set, and a per-chat quiz
+// state machine.
+//
+// Application state lives in `quiz`, a memory this module declares and does
+// not export. Its slots sit after any static data (there is none), and Wasm
+// zero-initialises a fresh memory, so slot 0 means "empty" without a
+// bootstrap step.
+
+package "telegram" as telegram;
+package "utf8" as utf8;
+
+use telegram::{Command, Input, Response, Text};
+
+// Private: the chat table. String literals live in the framework's `text`.
+#[memory_limits{ min_pages: 1 }]
+memory quiz: u32;
+
+const MAX_CHATS: u32 = 32;
+const NO_SLOT: u32 = MAX_CHATS;
+const QUESTION_COUNT: u32 = 8;
+
+/// Per-chat quiz state. `chat_id == 0` means the slot is unused, and
+/// `active == 0` means no quiz is running.
+struct ChatSlot(
+    mut chat_id: i64,
+    mut active: u8,
+    mut question: u32,
+    mut score: u32,
+    mut answered: u32,
+);
+
+struct Roll(count: u32, sides: u32);
+
+struct Question(prompt: Text, one: Text, two: Text, three: Text, answer: u8);
+
+/// A non-zero-sized application value; the framework takes it by value.
+struct App(version: u8);
+
+/// Every command this bot handles. The table below names them; the handler
+/// matches on these actions. Adding a command is one table row plus one arm.
+enum Action(value: u32) {
+    Start = 0,
+    Help,
+    Ping,
+    Echo,
+    Upper,
+    Lower,
+    Reverse,
+    Len,
+    Codepoints,
+    Roll,
+    Choose,
+    Oracle,
+    Id,
+    Stats,
+    Quiz,
+    Answer,
+    Skip,
+    Score,
+    Reset,
+    Quit,
+}
+
+/// The declarative route table. The framework uses it for lookup and generated
+/// help; it never hardcodes a command name.
+const COMMANDS: telegram::text::&[Command<Action>] = [Command(
+    "start",
+    "greet and show this help",
+    Action::Start,
+), Command("help", "show this help", Action::Help), Command(
+    "ping",
+    "health check",
+    Action::Ping,
+), Command("echo", "<text> repeat text", Action::Echo), Command(
+    "upper",
+    "<text> ASCII uppercase",
+    Action::Upper,
+), Command("lower", "<text> ASCII lowercase", Action::Lower), Command(
+    "reverse",
+    "<text> reverse UTF-8 scalar values",
+    Action::Reverse,
+), Command("len", "<text> bytes, characters, validity", Action::Len), Command(
+    "codepoints",
+    "<text> U+ values, first 32",
+    Action::Codepoints,
+), Command("roll", "[NdM] dice, default 1d6", Action::Roll), Command(
+    "choose",
+    "a | b pick one option",
+    Action::Choose,
+), Command("8ball", "<question> the classic oracle", Action::Oracle), Command(
+    "id",
+    "this chat's id",
+    Action::Id,
+), Command("stats", "process and state stats", Action::Stats), Command(
+    "quiz",
+    "start a quiz",
+    Action::Quiz,
+), Command(
+    "answer",
+    "<1|2|3> answer the current question",
+    Action::Answer,
+), Command("skip", "next question, no score", Action::Skip), Command(
+    "score",
+    "current score",
+    Action::Score,
+), Command("reset", "clear this chat's score", Action::Reset), Command(
+    "quit",
+    "stop the quiz",
+    Action::Quit,
+)];
+
+// ── state table ──────────────────────────────────────────────────────────────
+func chats() -> quiz::*[ChatSlot] {
+    local base = RawPtr::<quiz, u8>::from_ptr(quiz::DATA_END)
+        .align_up(align_of::<ChatSlot, quiz>());
+    slice_from_parts_mut(
+        transmute::<_, quiz::*ChatSlot>(base.as_ptr()),
+        MAX_CHATS,
+    )
+}
+
+func find_slot(chat_id: i64) -> u32 {
+    local slots = chats();
+    loop (i: u32 = 0) {
+        if (i == MAX_CHATS) { break NO_SLOT };
+        if (slots[i].chat_id == chat_id) { break i };
+        continue i + 1;
+    }
+}
+
+func free_slot() -> u32 {
+    local slots = chats();
+    loop (i: u32 = 0) {
+        if (i == MAX_CHATS) { break NO_SLOT };
+        if (slots[i].chat_id == 0) { break i };
+        continue i + 1;
+    }
+}
+
+func used_slots() -> u32 {
+    local slots = chats();
+    loop (i: u32 = 0, count: u32 = 0) {
+        if (i == MAX_CHATS) { break count };
+        local next = if (slots[i].chat_id == 0) { count } else { count + 1 };
+        continue (i + 1, next);
+    }
+}
+
+func active_quizzes() -> u32 {
+    local slots = chats();
+    loop (i: u32 = 0, count: u32 = 0) {
+        if (i == MAX_CHATS) { break count };
+        local next = if (slots[i].active == 0) { count } else { count + 1 };
+        continue (i + 1, next);
+    }
+}
+
+// ── text tools ───────────────────────────────────────────────────────────────
+func start_message(res: Response) -> Response {
+    telegram::help(
+        res.text("Hi! I run entirely in a WebAssembly module.\n\n"),
+        COMMANDS,
+    )
+}
+
+func ascii_upper(res: Response, text: Input) -> Response {
+    loop (o = res, i: u32 = 0) {
+        if (i == text.len()) { break o };
+        local b = text[i];
+        local next = if (b >= 'a' && b <= 'z') {
+            o.push(b - 32)
+        } else {
+            o.push(b)
+        };
+        (next, i + 1)
+    }
+}
+
+func ascii_lower(res: Response, text: Input) -> Response {
+    loop (o = res, i: u32 = 0) {
+        if (i == text.len()) { break o };
+        local b = text[i];
+        local next = if (b >= 'A' && b <= 'Z') {
+            o.push(b + 32)
+        } else {
+            o.push(b)
+        };
+        (next, i + 1)
+    }
+}
+
+/// `U+0048`, `U+1F980`: the shortest conventional width, at least four.
+func codepoint_width(value: u32) -> u32 {
+    if (value <= 0xFFFF) { 4 } else if (value <= 0xFFFFF) { 5 } else { 6 }
+}
+
+func reverse_utf8(res: Response, text: Input) -> Response {
+    local (valid, message) = utf8::Str::from_bytes(text);
+    if (!valid) { return res.text("That is not valid UTF-8.") };
+    local bytes = message.as_bytes();
+    loop (o = res, at = bytes.len()) {
+        if (at == 0) { break o };
+        local start = utf8::previous_start(bytes, at);
+        local next = o.input(slice_from_parts(bytes[start].&, at - start));
+        (next, start)
+    }
+}
+
+func show_utf8(res: Response, text: Input) -> Response {
+    local (valid, message) = utf8::Str::from_bytes(text);
+    local o = res
+        .text("bytes: ")
+        .decimal(message.byte_len())
+        .newline()
+        .text("scalar values: ");
+    local o = if (valid) {
+        o.decimal(message.char_count())
+    } else {
+        o.text("?")
+    };
+    local o = o.newline().text("utf-8: ");
+    if (valid) { o.text("valid") } else { o.text("invalid") }
+}
+
+func show_codepoints(res: Response, text: Input) -> Response {
+    local (valid, message) = utf8::Str::from_bytes(text);
+    if (!valid) { return res.text("That is not valid UTF-8.") };
+    local bytes = message.as_bytes();
+    local total = message.char_count();
+    local limit = if (total > 32) { 32 } else { total };
+    local o = res;
+    local o = loop (o = o, at: u32 = 0, shown: u32 = 0) {
+        if (shown == limit) { break o };
+        local (value, size) = utf8::decode_at(bytes, at);
+        local next = o.text("U+").hex_width(value, codepoint_width(value));
+        local spaced = if (shown + 1 == limit) { next } else { next.space() };
+        (spaced, at + size, shown + 1)
+    };
+    if (total > limit) { o.text(" ...") } else { o }
+}
+
+func parse_roll(args: Input) -> (Bool, Roll) {
+    local text = telegram::trim(args);
+    if (text.len() == 0) { return (True, Roll{ count: 1, sides: 6 }) };
+    local at = telegram::find_char(text, 'd');
+    if (at == text.len()) {
+        local (ok, sides) = telegram::parse_u32(text);
+        if (!ok || sides < 2 || sides > 1000000) {
+            return (False, Roll{ count: 0, sides: 0 })
+        }
+        return (True, Roll{ count: 1, sides })
+    }
+    local (ok_count, count) = telegram::parse_u32(telegram::prefix(text, at));
+    local (ok_sides, sides) = telegram::parse_u32(telegram::tail(text, at + 1));
+    if (!ok_count || !ok_sides) { return (False, Roll{ count: 0, sides: 0 }) };
+    if (count < 1 || count > 100 || sides < 2 || sides > 1000000) {
+        return (False, Roll{ count: 0, sides: 0 })
+    }
+    (True, Roll{ count, sides })
+}
+
+func show_roll(res: Response, args: Input) -> Response {
+    local (ok, roll) = parse_roll(args);
+    if (!ok) {
+        return res.text("Usage: /roll [NdM], with 1<=N<=100 and 2<=M<=1000000.")
+    }
+    local o = res.decimal(roll.count).text("d").decimal(roll.sides).text(": ");
+    local (o, total) = loop (o = o, i: u32 = 0, total: u64 = 0) {
+        if (i == roll.count) { break (o, total) };
+        local value = telegram::random() % roll.sides + 1;
+        local next_o = if (i == 0) {
+            o.decimal(value)
+        } else {
+            o.text(" + ").decimal(value)
+        };
+        (next_o, i + 1, total + u64_extend_u32(value))
+    };
+    if (roll.count > 1) { o.text(" = ").decimal64(total) } else { o }
+}
+
+func choice_count(text: Input) -> u32 {
+    loop (rest = text, count: u32 = 0) {
+        if (rest.len() == 0) { break count };
+        local at = telegram::find_char(rest, '|');
+        local piece = telegram::trim(telegram::prefix(rest, at));
+        local next = if (piece.len() == 0) { count } else { count + 1 };
+        if (at == rest.len()) { break next };
+        (telegram::tail(rest, at + 1), next)
+    }
+}
+
+func choice_at(text: Input, wanted: u32) -> Input {
+    loop (rest = text, index: u32 = 0) {
+        if (rest.len() == 0) { break "" };
+        local at = telegram::find_char(rest, '|');
+        local piece = telegram::trim(telegram::prefix(rest, at));
+        if (piece.len() != 0) {
+            if (index == wanted) { break piece };
+            if (at == rest.len()) { break "" };
+            (telegram::tail(rest, at + 1), index + 1)
+        } else {
+            if (at == rest.len()) { break "" };
+            (telegram::tail(rest, at + 1), index)
+        }
+    }
+}
+
+func show_choose(res: Response, args: Input) -> Response {
+    local count = choice_count(args);
+    if (count < 2) { return res.text("Usage: /choose first | second | third") };
+    local picked = choice_at(args, telegram::random() % count);
+    res.text("I choose: ").input(picked)
+}
+
+func oracle(index: u32) -> Text {
+    match (index) {
+        0 => "It is certain.",
+        1 => "Without a doubt.",
+        2 => "Yes — definitely.",
+        3 => "Reply hazy, try again.",
+        4 => "Cannot predict now.",
+        5 => "Don't count on it.",
+        6 => "My sources say no.",
+        _ => "Outlook not so good.",
+    }
+}
+
+func show_oracle(res: Response, args: Input) -> Response {
+    if (telegram::trim(args).len() == 0) {
+        return res.text("Ask a question: /8ball will it compile?")
+    }
+    res.text("🎱 ").text(oracle(telegram::random() % 8))
+}
+
+// ── quiz ─────────────────────────────────────────────────────────────────────
+// A match keeps the question bank as ordinary static data, without needing an
+// array of structs. `index` is already reduced modulo QUESTION_COUNT.
+func question_at(index: u32) -> Question {
+    match (index) {
+        0 => Question{
+            prompt: "What does Wasm call its linear address space?",
+            one: "A stack",
+            two: "A memory",
+            three: "A table",
+            answer: 2,
+        },
+        1 => Question{
+            prompt: "Which WX type names a pointer into a specific memory?",
+            one: "Addr<T>",
+            two: "Mem::&T",
+            three: "Box<T>",
+            answer: 2,
+        },
+        2 => Question{
+            prompt: "How many memories can one Wasm module use?",
+            one: "Exactly one",
+            two: "At most two",
+            three: "More than one",
+            answer: 3,
+        },
+        3 => Question{
+            prompt: "What runs WX code after it is compiled?",
+            one: "A WebAssembly host",
+            two: "A JVM",
+            three: "A browser only",
+            answer: 1,
+        },
+        4 => Question{
+            prompt: "Which WASI Preview 1 call reads a file descriptor?",
+            one: "fd_read",
+            two: "socket_read",
+            three: "fs_open",
+            answer: 1,
+        },
+        5 => Question{
+            prompt: "What does a WX `funcref` refer to?",
+            one: "A memory page",
+            two: "A Wasm function",
+            three: "A global",
+            answer: 2,
+        },
+        6 => Question{
+            prompt: "What is WX's baseline runtime policy?",
+            one: "A garbage collector",
+            two: "A mandatory allocator",
+            three: "No built-in allocator",
+            answer: 3,
+        },
+        _ => Question{
+            prompt: "What is one WX memory page worth?",
+            one: "4 KiB",
+            two: "64 KiB",
+            three: "1 MiB",
+            answer: 2,
+        },
+    }
+}
+
+func next_question(current: u32) -> u32 {
+    local offset = telegram::random() % (QUESTION_COUNT - 1);
+    if (offset >= current) { offset + 1 } else { offset }
+}
+
+func ask(res: Response, index: u32) -> Response {
+    local slot = chats()[index];
+    local q = question_at(slot.question);
+    res
+        .text("Question: ")
+        .text(q.prompt)
+        .text("\n1) ")
+        .text(q.one)
+        .text("\n2) ")
+        .text(q.two)
+        .text("\n3) ")
+        .text(q.three)
+        .text("\n\nReply 1, 2 or 3. /quit to stop.")
+}
+
+func start_quiz(res: Response, chat_id: i64) -> Response {
+    local mut index = find_slot(chat_id);
+    local slots = chats();
+    if (index == NO_SLOT) {
+        index = free_slot();
+        if (index == NO_SLOT) {
+            return res.text(
+                "State table is full; I am tracking too many chats.",
+            )
+        }
+        slots[index].chat_id = chat_id;
+        slots[index].active = 0;
+        slots[index].question = 0;
+        slots[index].score = 0;
+        slots[index].answered = 0;
+    }
+    if (slots[index].active != 0) {
+        return ask(res.text("A quiz is running.\n\n"), index)
+    }
+    slots[index].active = 1;
+    slots[index].question = telegram::random() % QUESTION_COUNT;
+    ask(res.text("New quiz! "), index)
+}
+
+func answer_quiz(res: Response, chat_id: i64, answer: Input) -> Response {
+    local index = find_slot(chat_id);
+    if (index == NO_SLOT) {
+        return res.text("No quiz is running. Send /quiz to start one.")
+    }
+    local slots = chats();
+    if (slots[index].active == 0) {
+        return res.text("No quiz is running. Send /quiz to start one.")
+    }
+    local (ok, choice) = telegram::parse_u32(telegram::trim(answer));
+    if (!ok || choice < 1 || choice > 3) {
+        return res.text("Reply with 1, 2 or 3.")
+    }
+    local q = question_at(slots[index].question);
+    local correct = choice == transmute::<u8, u32>(q.answer);
+    if (correct) { slots[index].score = slots[index].score + 1 };
+    slots[index].answered = slots[index].answered + 1;
+    local o = if (correct) {
+        res.text("Correct!")
+    } else {
+        res
+            .text("Nope. The answer was ")
+            .decimal(transmute::<u8, u32>(q.answer))
+            .text(".")
+    };
+    local o = o
+        .text(" Score: ")
+        .decimal(slots[index].score)
+        .text("/")
+        .decimal(slots[index].answered)
+        .text(".\n\n");
+    slots[index].question = next_question(slots[index].question);
+    ask(o, index)
+}
+
+func skip_question(res: Response, chat_id: i64) -> Response {
+    local index = find_slot(chat_id);
+    if (index == NO_SLOT) {
+        return res.text("No quiz is running. Send /quiz to start one.")
+    }
+    local slots = chats();
+    if (slots[index].active == 0) {
+        return res.text("No quiz is running. Send /quiz to start one.")
+    }
+    local q = question_at(slots[index].question);
+    local o = res
+        .text("Skipped. The answer was ")
+        .decimal(transmute::<u8, u32>(q.answer))
+        .text(".\n\n");
+    slots[index].question = next_question(slots[index].question);
+    ask(o, index)
+}
+
+func quit_quiz(res: Response, chat_id: i64) -> Response {
+    local index = find_slot(chat_id);
+    if (index == NO_SLOT) { return res.text("No quiz is running.") };
+    local slots = chats();
+    if (slots[index].active == 0) { return res.text("No quiz is running.") };
+    slots[index].active = 0;
+    res
+        .text("Quiz stopped. Final score: ")
+        .decimal(slots[index].score)
+        .text("/")
+        .decimal(slots[index].answered)
+        .text(".")
+}
+
+func reset_quiz(res: Response, chat_id: i64) -> Response {
+    local index = find_slot(chat_id);
+    if (index == NO_SLOT) { return res.text("Nothing to reset.") };
+    local slots = chats();
+    slots[index].score = 0;
+    slots[index].answered = 0;
+    res.text("Score cleared.")
+}
+
+func show_score(res: Response, chat_id: i64) -> Response {
+    local index = find_slot(chat_id);
+    if (index == NO_SLOT) {
+        return res.text("No quiz yet. Send /quiz to start one.")
+    }
+    local slot = chats()[index];
+    local o = res
+        .text("Score: ")
+        .decimal(slot.score)
+        .text(" correct out of ")
+        .decimal(slot.answered)
+        .text(" answered.");
+    if (slot.active == 0) {
+        o.text(" No quiz is running.")
+    } else {
+        o.text(" Quiz running.")
+    }
+}
+
+// ── application ──────────────────────────────────────────────────────────────
+impl telegram::Bot for App {
+    type Action = Action;
+
+    func command(
+        self: Self,
+        res: Response,
+        ctx: telegram::Context,
+        action: Action,
+        args: Input,
+    ) -> Response {
+        local text = telegram::trim(args);
+        match (action) {
+            Action::Start => start_message(res),
+            Action::Help => telegram::help(res, COMMANDS),
+            Action::Ping => res.text("pong"),
+            Action::Echo => {
+                if (text.len() == 0) {
+                    res.text("Usage: /echo <text>")
+                } else {
+                    res.input(text)
+                }
+            },
+            Action::Upper => {
+                if (text.len() == 0) {
+                    res.text("Usage: /upper <text>")
+                } else {
+                    ascii_upper(res, text)
+                }
+            },
+            Action::Lower => {
+                if (text.len() == 0) {
+                    res.text("Usage: /lower <text>")
+                } else {
+                    ascii_lower(res, text)
+                }
+            },
+            Action::Reverse => {
+                if (text.len() == 0) {
+                    res.text("Usage: /reverse <text>")
+                } else {
+                    reverse_utf8(res, text)
+                }
+            },
+            Action::Len => {
+                if (text.len() == 0) {
+                    res.text("Usage: /len <text>")
+                } else {
+                    show_utf8(res, text)
+                }
+            },
+            Action::Codepoints => {
+                if (text.len() == 0) {
+                    res.text("Usage: /codepoints <text>")
+                } else {
+                    show_codepoints(res, text)
+                }
+            },
+            Action::Roll => show_roll(res, text),
+            Action::Choose => show_choose(res, text),
+            Action::Oracle => show_oracle(res, text),
+            Action::Id => res.text("chat id: ").signed64(ctx.chat_id()),
+            Action::Stats => telegram::stats(res)
+                .newline()
+                .text("chat slots used: ")
+                .decimal(used_slots())
+                .text("/")
+                .decimal(MAX_CHATS)
+                .newline()
+                .text("active quizzes: ")
+                .decimal(active_quizzes())
+                .newline()
+                .text("quiz memory: ")
+                .decimal(quiz.size_pages())
+                .text(" page(s)"),
+            Action::Quiz => start_quiz(res, ctx.chat_id()),
+            Action::Answer => answer_quiz(res, ctx.chat_id(), text),
+            Action::Skip => skip_question(res, ctx.chat_id()),
+            Action::Score => show_score(res, ctx.chat_id()),
+            Action::Reset => reset_quiz(res, ctx.chat_id()),
+            Action::Quit => quit_quiz(res, ctx.chat_id()),
+        }
+    }
+
+    func message(
+        self: Self,
+        res: Response,
+        ctx: telegram::Context,
+        text: Input,
+    ) -> Response {
+        local chat_id = ctx.chat_id();
+        if (text.len() == 0) {
+            return res.text("Send /help to see what I can do.")
+        }
+        local index = find_slot(chat_id);
+        if (index != NO_SLOT && chats()[index].active != 0) {
+            return answer_quiz(res, chat_id, text)
+        }
+        res.text("Hi! Send /help to see what I can do.")
+    }
+
+    func unknown(
+        self: Self,
+        res: Response,
+
+        ctx: telegram::Context,
+        name: Input,
+    ) -> Response {
+        _ = ctx;
+        _ = name;
+        res.text("Unknown command. Send /help.")
+    }
+}
+
+// The whole host ABI: plain addresses, no framework types in the export.
+func handle(
+    chat_id: i64,
+    input: telegram::Input,
+    output: telegram::Output,
+) -> u32 {
+    telegram::serve(App(1), COMMANDS, chat_id, input, output)
+}
+
+export {
+    handle,
+}

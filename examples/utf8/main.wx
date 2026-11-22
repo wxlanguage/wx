@@ -1,0 +1,319 @@
+// UTF-8, as a primitive rather than a bot detail.
+//
+// Two layers:
+//
+//   * free functions over any memory: validate, count, decode, previous
+//     boundary, encode;
+//   * `Str<M>`, the borrowed `&str` analogue: a byte slice that has been
+//     validated once, whose methods may therefore assume well-formed UTF-8.
+//
+// `Str` owns nothing. It is a fat pointer (address + length) tagged with its
+// memory, so it costs nothing and works in a 32-bit or 64-bit memory. An
+// owned, growable string is a different type and needs an allocator policy;
+// WX's baseline deliberately leaves that to libraries.
+//
+// All functions are generic over `M: Memory`, like `binary` and `sha256`.
+// Encoding is the one operation that needs to turn a `u32` byte count into
+// `M::Size`, so it carries the small `SizeExt` bridge trait.
+
+pub trait SizeExt: PointerSize {
+    func from_u32(value: u32) -> Self;
+}
+
+impl SizeExt for u32 {
+    func from_u32(value: u32) -> Self {
+        value
+    }
+}
+
+impl SizeExt for u64 {
+    func from_u32(value: u32) -> Self {
+        u64_extend_u32(value)
+    }
+}
+
+/// The result of validation: `valid`, or the byte offset of the first
+/// ill-formed sequence (`text.len()` when valid).
+pub struct Verdict<M: Memory>(pub valid: Bool, pub invalid_at: M::Size);
+
+pub func is_continuation(byte: u8) -> Bool {
+    (byte & 0xC0) == 0x80
+}
+
+pub func continuation_at<M: Memory>(text: M::&[u8], at: M::Size) -> Bool {
+    if (at >= text.len()) { return False };
+    is_continuation(text[at])
+}
+
+/// Strict UTF-8: overlong forms, surrogates and values above U+10FFFF are
+/// rejected. Stops at the first invalid byte.
+pub func validate<M: Memory>(text: M::&[u8]) -> Verdict<M> {
+    loop (at: M::Size = 0) {
+        if (at == text.len()) { break Verdict{ valid: True, invalid_at: at } };
+        local b = text[at];
+        if (b < 0x80) { continue at + 1 };
+
+        if (b >= 0xC2 && b <= 0xDF) {
+            if (!continuation_at(text, at + 1)) {
+                break Verdict{ valid: False, invalid_at: at }
+            }
+            continue at + 2;
+        }
+
+        if (b >= 0xE0 && b <= 0xEF) {
+            if (at + 2 >= text.len()) {
+                break Verdict{ valid: False, invalid_at: at }
+            }
+            local c1 = text[at + 1];
+            local c2 = text[at + 2];
+            if (b == 0xE0) {
+                if (c1 < 0xA0 || c1 > 0xBF) {
+                    break Verdict{ valid: False, invalid_at: at }
+                };
+            } else if (b == 0xED) {
+                if (c1 < 0x80 || c1 > 0x9F) {
+                    break Verdict{ valid: False, invalid_at: at }
+                };
+            } else if (!is_continuation(c1)) {
+                break Verdict{ valid: False, invalid_at: at };
+            }
+            if (!is_continuation(c2)) {
+                break Verdict{ valid: False, invalid_at: at }
+            }
+            continue at + 3;
+        }
+
+        if (b >= 0xF0 && b <= 0xF4) {
+            if (at + 3 >= text.len()) {
+                break Verdict{ valid: False, invalid_at: at }
+            }
+            local c1 = text[at + 1];
+            local c2 = text[at + 2];
+            local c3 = text[at + 3];
+            if (b == 0xF0) {
+                if (c1 < 0x90 || c1 > 0xBF) {
+                    break Verdict{ valid: False, invalid_at: at }
+                };
+            } else if (b == 0xF4) {
+                if (c1 < 0x80 || c1 > 0x8F) {
+                    break Verdict{ valid: False, invalid_at: at }
+                };
+            } else if (!is_continuation(c1)) {
+                break Verdict{ valid: False, invalid_at: at };
+            }
+            if (!is_continuation(c2) || !is_continuation(c3)) {
+                break Verdict{ valid: False, invalid_at: at }
+            }
+            continue at + 4;
+        }
+
+        break Verdict{ valid: False, invalid_at: at };
+    }
+}
+
+pub func valid<M: Memory>(text: M::&[u8]) -> Bool {
+    validate(text).valid
+}
+
+/// The number of scalar values. This is the count of non-continuation bytes,
+/// which is exact for valid UTF-8; validate first if that is not known.
+pub func count<M: Memory>(text: M::&[u8]) -> M::Size {
+    loop (i: M::Size = 0, total: M::Size = 0) {
+        if (i == text.len()) { break total };
+        local next = if (is_continuation(text[i])) { total } else { total + 1 };
+        continue (i + 1, next);
+    }
+}
+
+func byte_at<M: Memory>(text: M::&[u8], at: M::Size) -> u32 {
+    transmute::<u8, u32>(text[at])
+}
+
+/// Decodes one scalar value. The caller has validated the text and stays on a
+/// scalar boundary.
+pub func decode_at<M: Memory>(text: M::&[u8], at: M::Size) -> (u32, M::Size) {
+    local b = byte_at(text, at);
+    if (b < 0x80) { return (b, 1) };
+    if (b < 0xE0) {
+        return (((b & 0x1F) << 6) | (byte_at(text, at + 1) & 0x3F), 2)
+    }
+    if (b < 0xF0) {
+        return (
+            ((b & 0x0F) << 12)
+                | ((byte_at(text, at + 1) & 0x3F) << 6)
+                | (byte_at(text, at + 2) & 0x3F),
+            3,
+        )
+    }
+    (
+        ((b & 0x07) << 18)
+            | ((byte_at(text, at + 1) & 0x3F) << 12)
+            | ((byte_at(text, at + 2) & 0x3F) << 6)
+            | (byte_at(text, at + 3) & 0x3F),
+        4,
+    )
+}
+
+/// The first byte of the scalar value that ends at `at`. `at` must be a
+/// boundary in valid UTF-8.
+pub func previous_start<M: Memory>(text: M::&[u8], at: M::Size) -> M::Size {
+    local mut i = at - 1;
+    loop {
+        if (i == 0) { break };
+        if (!is_continuation(text[i])) { break };
+        i -= 1;
+    }
+    i
+}
+
+/// One past the end of the scalar value that starts at `at`.
+pub func next_start<M: Memory>(text: M::&[u8], at: M::Size) -> M::Size {
+    local (_, size) = decode_at(text, at);
+    at + size
+}
+
+/// The bytes a scalar value needs: 0 if it is a surrogate or above U+10FFFF.
+pub func encoded_len(value: u32) -> u32 {
+    if (value <= 0x7F) {
+        1
+    } else if (value <= 0x7FF) {
+        2
+    } else if (value >= 0xD800 && value <= 0xDFFF) {
+        0
+    } else if (value <= 0xFFFF) {
+        3
+    } else if (value <= 0x10FFFF) {
+        4
+    } else {
+        0
+    }
+}
+
+/// Writes one scalar value and returns `(True, bytes written)`. Rejects
+/// surrogates, values above U+10FFFF, and a destination that is too small.
+pub func encode<M: Memory where { Size: SizeExt }>(
+    value: u32,
+    dst: M::*[u8],
+) -> (Bool, M::Size) {
+    local length = encoded_len(value);
+    if (length == 0) { return (False, 0) };
+    local needed = M::Size::from_u32(length);
+    if (dst.len() < needed) { return (False, 0) };
+
+    local zero = M::Size::from_u32(0);
+    match (length) {
+        1 => {
+            dst[zero] = transmute(value);
+        },
+        2 => {
+            dst[zero] = transmute(0xC0 | (value >> 6));
+            dst[M::Size::from_u32(1)] = transmute(0x80 | (value & 0x3F));
+        },
+        3 => {
+            dst[zero] = transmute(0xE0 | (value >> 12));
+            dst[M::Size::from_u32(1)] = transmute(0x80 | ((value >> 6) & 0x3F));
+            dst[M::Size::from_u32(2)] = transmute(0x80 | (value & 0x3F));
+        },
+        _ => {
+            dst[zero] = transmute(0xF0 | (value >> 18));
+            dst[M::Size::from_u32(1)] =
+                transmute(0x80 | ((value >> 12) & 0x3F));
+            dst[M::Size::from_u32(2)] = transmute(0x80 | ((value >> 6) & 0x3F));
+            dst[M::Size::from_u32(3)] = transmute(0x80 | (value & 0x3F));
+        },
+    }
+    (True, needed)
+}
+
+// ── the borrowed string ──────────────────────────────────────────────────────
+/// A validated UTF-8 view into one memory: WX's `&str`. It owns nothing, so it
+/// is two Wasm values (address + length), just like the slice it wraps.
+pub struct Str<M: Memory>(bytes: M::&[u8]);
+
+/// A familiar name for `Str<M>`. It is still a borrowed view; an owned,
+/// growable string needs an allocator policy and is a separate type.
+pub type String<M: Memory> = Str<M>;
+
+/// Constructs the `String` alias with its memory inferred from `bytes`, the
+/// way `Str::from_bytes` does. Type aliases cannot carry inherent methods.
+pub func string<M: Memory>(bytes: M::&[u8]) -> (Bool, String<M>) {
+    Str::from_bytes(bytes)
+}
+
+impl<M: Memory> Str<M> {
+    /// The only validating constructor. On failure the value is empty; check
+    /// the `Bool` before using it.
+    pub func from_bytes(bytes: M::&[u8]) -> (Bool, Self) {
+        if (!valid(bytes)) { return (False, Self{ bytes: "" }) };
+        (True, Self{ bytes })
+    }
+
+    /// For a literal, a constant, or bytes that some other layer has already
+    /// validated. This mirrors `str::from_utf8_unchecked`, without `unsafe`.
+    pub func from_utf8_unchecked(bytes: M::&[u8]) -> Self {
+        Self{ bytes }
+    }
+
+    pub func empty() -> Self {
+        Self{ bytes: "" }
+    }
+
+    pub func as_bytes(self: Self) -> M::&[u8] {
+        self.bytes
+    }
+
+    /// Bytes, as `str::len` counts. For scalar values use `char_count`.
+    pub func byte_len(self: Self) -> M::Size {
+        self.bytes.len()
+    }
+
+    pub func char_count(self: Self) -> M::Size {
+        count(self.bytes)
+    }
+
+    pub func is_empty(self: Self) -> Bool {
+        self.bytes.len() == 0
+    }
+
+    /// The `index`-th scalar value, counting from zero.
+    pub func nth(self: Self, index: M::Size) -> (Bool, u32) {
+        loop (at: M::Size = 0, i: M::Size = 0) {
+            if (at == self.bytes.len()) { break (False, 0) };
+            local (value, width) = decode_at(self.bytes, at);
+            if (i == index) { break (True, value) };
+            continue (at + width, i + 1);
+        }
+    }
+
+    /// Whether `at` is a position between scalar values (or either end).
+    pub func is_char_boundary(self: Self, at: M::Size) -> Bool {
+        if (at > self.bytes.len()) { return False };
+        if (at == 0 || at == self.bytes.len()) { return True };
+        !is_continuation(self.bytes[at])
+    }
+
+    /// A sub-view by byte offsets. Fails on reversed/out-of-range offsets or
+    /// offsets inside a scalar value; a sub-view of valid UTF-8 is valid.
+    pub func slice(self: Self, start: M::Size, end: M::Size) -> (Bool, Self) {
+        if (start > end || end > self.bytes.len()) {
+            return (False, Self{ bytes: "" })
+        }
+        if (!self.is_char_boundary(start) || !self.is_char_boundary(end)) {
+            return (False, Self{ bytes: "" })
+        }
+        if (start == end) { return (True, Self{ bytes: "" }) };
+        (
+            True,
+            Self{ bytes: slice_from_parts(self.bytes[start].&, end - start) },
+        )
+    }
+
+    pub func eq(self: Self, other: Self) -> Bool {
+        if (self.bytes.len() != other.bytes.len()) { return False };
+        loop (i: M::Size = 0) {
+            if (i == self.bytes.len()) { break True };
+            if (self.bytes[i] != other.bytes[i]) { break False };
+            continue i + 1;
+        }
+    }
+}

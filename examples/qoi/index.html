@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quite OK pixels · WX</title>
+<style>
+    :root { color-scheme: dark; font: 16px/1.6 system-ui, sans-serif; background: #10141d; color: #e5eafa; }
+    body { max-width: 880px; margin: 5vh auto; padding: 24px; }
+    small { color: #8bdfbb; letter-spacing: .16em; }
+    h1 { font-size: clamp(2rem, 6vw, 4rem); line-height: 1.1; margin: 16px 0; }
+    p { color: #adb8d1; }
+    .controls { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; margin: 24px 0; }
+    button, input::file-selector-button { background: #8bdfbb; color: #10141d; border: 0; border-radius: 6px; padding: 10px 16px; cursor: pointer; font: inherit; }
+    canvas { display: block; width: 100%; height: auto; border-radius: 12px; background: repeating-conic-gradient(#252d40 0% 25%, #1b2232 0% 50%) 0 / 20px 20px; }
+    #message { font: 13px/1.7 ui-monospace, monospace; overflow-wrap: anywhere; min-height: 3em; }
+    code { color: #8bdfbb; }
+</style>
+<small>WX / WEBASSEMBLY / BINARY CODECS</small>
+<h1>Quite OK pixels.</h1>
+<p>A real QOI image decoder written in WX. Compressed bytes in one memory,
+RGBA pixels in another. No allocator, no host callbacks, no JavaScript decoder.</p>
+<div class="controls">
+    <button disabled>Generate plasma</button>
+    <label>Open .qoi <input type="file" accept=".qoi" disabled></label>
+</div>
+<canvas width="384" height="256" aria-label="Decoded QOI image"></canvas>
+<p id="message" role="status">Loading the WX decoder…</p>
+<p>The sample is generated and QOI-encoded in JavaScript, then decoded by
+<code>main.wasm</code>. You can also open your own QOI files. Files stay local.</p>
+<script type="module" src="./viewer.mjs"></script>
+</html>

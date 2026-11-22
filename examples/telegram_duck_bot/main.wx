@@ -1,0 +1,162 @@
+// A second, deliberately small bot on the same framework.
+//
+// It exists to show the shape of a new bot: an action enum, one declarative
+// command table, and a handler. There is no framework edit and no command
+// hardcoded in the library.
+
+package "telegram" as telegram;
+
+use telegram::{Command, Input, Response};
+
+global mut echoes: u64 = 0;
+
+struct Duck(version: u8);
+
+enum Action(value: u32) {
+    Start = 0,
+    Help,
+    Quack,
+    Shout,
+    Repeat,
+    About,
+    Stats,
+}
+
+const COMMANDS: telegram::text::&[Command<Action>] = [Command(
+    "start",
+    "meet the duck",
+    Action::Start,
+), Command("help", "show this help", Action::Help), Command(
+    "quack",
+    "a random quack",
+    Action::Quack,
+), Command(
+    "shout",
+    "<text> ASCII uppercase, with feeling",
+    Action::Shout,
+), Command("repeat", "<n> <text> say it n times", Action::Repeat), Command(
+    "about",
+    "what this bot is",
+    Action::About,
+), Command("stats", "process stats", Action::Stats)];
+
+func help_text(res: Response) -> Response {
+    telegram::help(res, COMMANDS)
+}
+
+func start_message(res: Response) -> Response {
+    telegram::help(
+        res.text(
+            "Quack. I am a second bot built from the same WX package.\n\n",
+        ),
+        COMMANDS,
+    )
+}
+
+func ascii_upper(res: Response, text: Input) -> Response {
+    loop (out = res, i: u32 = 0) {
+        if (i == text.len()) { break out };
+        local byte = text[i];
+        local next = if (byte >= 'a' && byte <= 'z') {
+            out.push(byte - 32)
+        } else {
+            out.push(byte)
+        };
+        (next, i + 1)
+    }
+}
+
+func quack(index: u32) -> telegram::Text {
+    match (index) {
+        0 => "Quack.",
+        1 => "Quack quack!",
+        _ => "Quaaack.",
+    }
+}
+
+func show_repeat(res: Response, args: Input) -> Response {
+    local (count_word, text) = telegram::split_word(telegram::trim(args));
+    local (ok, count) = telegram::parse_u32(count_word);
+    if (!ok || count < 1 || count > 20 || text.len() == 0) {
+        return res.text("Usage: /repeat <n> <text>, with 1<=n<=20.")
+    }
+    loop (out = res, i: u32 = 0) {
+        if (i == count) { break out };
+        local next = if (i + 1 == count) {
+            out.input(text)
+        } else {
+            out.input(text).newline()
+        };
+        (next, i + 1)
+    }
+}
+
+impl telegram::Bot for Duck {
+    type Action = Action;
+
+    func command(
+        self: Self,
+        res: Response,
+        ctx: telegram::Context,
+        action: Action,
+        args: Input,
+    ) -> Response {
+        _ = ctx;
+        local text = telegram::trim(args);
+        match (action) {
+            Action::Start => start_message(res),
+            Action::Help => help_text(res),
+            Action::Quack => res.text(quack(telegram::random() % 3)),
+            Action::Shout => {
+                if (text.len() == 0) {
+                    res.text("Usage: /shout <text>")
+                } else {
+                    ascii_upper(res, text).text("!!!")
+                }
+            },
+            Action::Repeat => show_repeat(res, text),
+            Action::About => res
+                .text("A minimal bot on the WX `telegram` framework: ")
+                .text("one table, one enum, one handler."),
+            Action::Stats => telegram::stats(res)
+                .newline()
+                .text("messages seen: ")
+                .decimal64(echoes.get()),
+        }
+    }
+
+    func message(
+        self: Self,
+        res: Response,
+        ctx: telegram::Context,
+        text: Input,
+    ) -> Response {
+        _ = ctx;
+        if (text.len() == 0) { return res.text("Quack. Try /help.") };
+        echoes.set(echoes.get() + 1);
+        res.text("Quack. Try /help.")
+    }
+
+    func unknown(
+        self: Self,
+        res: Response,
+        ctx: telegram::Context,
+        name: Input,
+    ) -> Response {
+        _ = ctx;
+        _ = name;
+        res.text("No such command. Try /help.")
+    }
+}
+
+func handle(
+    chat_id: i64,
+    input: telegram::Input,
+    output: telegram::Output,
+) -> u32 {
+    telegram::serve(Duck(1), COMMANDS, chat_id, input, output)
+}
+
+export {
+    handle,
+}

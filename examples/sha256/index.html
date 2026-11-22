@@ -1,0 +1,138 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SHA-256 in WX</title>
+<style>
+    :root {
+        color-scheme: dark;
+        --bg: #0d1117;
+        --panel: #161b22;
+        --line: #30363d;
+        --text: #e6edf3;
+        --muted: #8b949e;
+        --accent: #7ee787;
+    }
+    * { box-sizing: border-box; }
+    body {
+        margin: 0;
+        padding: 2rem 1rem 4rem;
+        background: radial-gradient(circle at 20% 0%, #17233a 0, var(--bg) 45rem);
+        color: var(--text);
+        font: 16px/1.55 ui-sans-serif, system-ui, sans-serif;
+    }
+    main { max-width: 52rem; margin: 0 auto; }
+    h1 { font-size: clamp(1.8rem, 5vw, 2.8rem); margin: 0 0 .25rem; letter-spacing: -.03em; }
+    h1 span { color: var(--accent); }
+    p.lede { color: var(--muted); margin: 0 0 2rem; }
+    section {
+        background: color-mix(in srgb, var(--panel) 90%, transparent);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+    }
+    label { display: block; color: var(--muted); font-size: .85rem; margin: 0 0 .4rem; }
+    textarea, input[type=password], input[type=file] {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #0b0f14;
+        color: var(--text);
+        padding: .65rem .75rem;
+        font: inherit;
+    }
+    textarea { min-height: 7rem; resize: vertical; }
+    .row { display: grid; gap: 1rem; grid-template-columns: 1fr 1fr; }
+    @media (max-width: 44rem) { .row { grid-template-columns: 1fr; } }
+    code.block {
+        display: block;
+        overflow-wrap: anywhere;
+        font: .95rem ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: var(--accent);
+        min-height: 1.5em;
+    }
+    .muted { color: var(--muted); }
+    .file-line { margin-top: .6rem; font: .9rem ui-monospace, monospace; overflow-wrap: anywhere; }
+    .status { color: var(--muted); font-size: .8rem; margin-top: .75rem; }
+    .error { color: #ff7b72; }
+</style>
+<h1>SHA-256 <span>in WX</span></h1>
+<p class="lede">The digest and HMAC on this page are computed by the WX module in <code>sha.wasm</code>. The browser only copies bytes into its memory and reads 32 bytes back.</p>
+
+<main>
+    <section>
+        <label for="message">Message</label>
+        <textarea id="message">The quick brown fox jumps over the lazy dog</textarea>
+    </section>
+
+    <section>
+        <div class="row">
+            <div>
+                <label for="key">HMAC key (optional)</label>
+                <input id="key" type="password" placeholder="leave empty for digest only">
+            </div>
+            <div>
+                <label for="file">Hash a file</label>
+                <input id="file" type="file">
+            </div>
+        </div>
+        <div id="fileResult" class="file-line muted"></div>
+    </section>
+
+    <section>
+        <label>SHA-256</label>
+        <code id="digest" class="block"></code>
+        <label style="margin-top:1rem">HMAC-SHA-256</label>
+        <code id="hmac" class="block"></code>
+        <div id="status" class="status"></div>
+    </section>
+</main>
+
+<script type="module">
+    import { createHasher } from "./app.mjs";
+
+    const message = document.querySelector("#message");
+    const key = document.querySelector("#key");
+    const file = document.querySelector("#file");
+    const fileResult = document.querySelector("#fileResult");
+    const digest = document.querySelector("#digest");
+    const hmac = document.querySelector("#hmac");
+    const status = document.querySelector("#status");
+
+    const response = await fetch("./sha.wasm");
+    if (!response.ok) {
+        status.textContent = "Build first: wx build examples/sha256 -o examples/sha256/sha.wasm";
+        status.className = "status error";
+        throw new Error("missing sha.wasm");
+    }
+    const hasher = await createHasher(await response.arrayBuffer());
+    status.textContent = `${hasher.moduleBytes.toLocaleString()} bytes of Wasm · no host imports`;
+
+    function update() {
+        try {
+            digest.textContent = hasher.hash(hasher.text(message.value));
+            hmac.textContent = key.value
+                ? hasher.hmac(hasher.text(key.value), hasher.text(message.value))
+                : "—";
+        } catch (error) {
+            status.textContent = error.message;
+            status.className = "status error";
+        }
+    }
+
+    message.addEventListener("input", update);
+    key.addEventListener("input", update);
+    file.addEventListener("change", async () => {
+        const selected = file.files[0];
+        if (!selected) return;
+        try {
+            const bytes = new Uint8Array(await selected.arrayBuffer());
+            const value = hasher.hash(bytes);
+            fileResult.textContent = `${selected.name} · ${bytes.length.toLocaleString()} bytes\n${value}`;
+        } catch (error) {
+            fileResult.textContent = error.message;
+        }
+    });
+
+    update();
+</script>

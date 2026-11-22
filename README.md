@@ -104,9 +104,12 @@ uses `wx lsp`; set `wx.path` if the CLI is not on your `PATH`.
 ## Examples
 
 See [two memories](examples/two_memories) for typed memory separation,
-[hello browser](examples/hello_browser) for host imports, and
-[WASI word count](examples/wasi_wc) for a command-line application.
-More packages live in [examples/](examples).
+[hello browser](examples/hello_browser) for host imports,
+[SHA-256](examples/sha256) for reusable cryptographic primitives generic over
+memories, [UTF-8](examples/utf8) for a validated borrowed string primitive,
+[telegram](examples/telegram) for a declarative bot framework with a
+[stateful quiz bot](examples/telegram_bot), and [WASI word count](examples/wasi_wc)
+for a command-line application. More packages live in [examples/](examples).
 
 ## Credits
 
