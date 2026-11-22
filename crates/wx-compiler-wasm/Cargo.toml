@@ -21,3 +21,17 @@ serde_bytes = "0.11"
 serde-wasm-bindgen = "0.6"
 codespan-reporting = { workspace = true, features = ["serialization"] }
 wx-compiler = { path = "../wx-compiler" }
+
+# wasm-pack runs wasm-opt without the features rustc enables by default for
+# wasm32-unknown-unknown, so it rejects the module unless they are listed.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+    "-O",
+    "--enable-bulk-memory",
+    "--enable-bulk-memory-opt",
+    "--enable-multivalue",
+    "--enable-mutable-globals",
+    "--enable-nontrapping-float-to-int",
+    "--enable-reference-types",
+    "--enable-sign-ext",
+]
