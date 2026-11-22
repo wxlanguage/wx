@@ -174,8 +174,10 @@ means on a struct, restricted by the enum being closed:
 - **`mut` is an error**, with a hint to assign a variant. Writing the number in
   place can store a value no variant names, and restricting the write to
   variants' values is assigning the enum (`o = Ordering::Less`), which already
-  works. Whatever `mut` comes to mean on a struct field (it is parsed and not
-  checked yet), it has nothing to mean here.
+  works. A repr is otherwise an ordinary field: a field without `mut` is
+  never written in place, so a write to the repr is the immutable-field
+  error, through a pointer too, and the repr is a place there that `.&` can
+  address.
 - **What a pattern takes inside.** A binding or `_` only, to start with. A
   literal (`Ordering(-1)`) would work, since usefulness already reasons about
   integer values, but it is a second way to write `Ordering::Less`.
@@ -214,11 +216,14 @@ from the object's type. On an enum:
 - a pattern of its fields holds no test (E2111, `TestInEnumRepr`, and the
   pattern is then the error pattern); usefulness counts it as `_`, so after
   every variant it is unreachable and before some a catch-all;
-- a field access is always a value, never a place, so `=`, `op=` and `.&` on
-  it are refused (E2012, "cannot assign to the repr of enum");
+- a field access is a field as on a struct: a value of a value, a place of a
+  place. Its field is never `mut`, so `=` and `op=` on it are the
+  immutable-field error (E2001); `.&` takes its address where the enum is a
+  place;
 - reading needs every field read to be visible (E2054);
 - lowering reuses the struct path: a pattern retypes the matched scalar as the
-  repr, and a field read is the enum's value itself.
+  repr, a field read of a value is the enum's value itself, and the layout
+  puts the repr at offset 0 of the enum (`field_offset`).
 
 Step 3 (the construction error) came with it: `E(5)` and `E({ value: 5 })`
 are E2110, `EnumConstructedFromRepr`.

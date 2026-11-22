@@ -353,7 +353,7 @@ is the rule it replaced.
 |---|---|---|
 | `i32`, `_: i32` | unnamed, binds nothing | unnamed: built and destructured by position only |
 | `x: i32` | an immutable local `x` | a field `x` |
-| `mut x: i32` | a mutable local `x` | a mutable field `x` (designed, not checked yet) |
+| `mut x: i32` | a mutable local `x` | a mutable field `x`, written in place |
 | `self: Self` | the receiver, first in a trait or impl function | reported: a field cannot be named `self` (E1007) |
 | `x` | the type `x`: "cannot find type `x`" | the same |
 | `_` | the type `_`: rejected, signatures do not infer | the same |

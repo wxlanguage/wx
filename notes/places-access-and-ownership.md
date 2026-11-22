@@ -20,10 +20,9 @@ A place such as `s.pointer.value` is a sequence of steps from a name:
 
 | Step | Wasm | Where it leads |
 |---|---|---|
-| field `.inner` | a sub-range of the same locals, or a constant offset in the same memory | stays in the same storage |
+| field `.inner`, of a struct or an enum | a sub-range of the same locals, or a constant offset in the same memory | stays in the same storage |
 | element `[i]` of an array place | an offset in the same storage | stays in the same storage |
 | pointer step: `p.*`, or implicitly `p.field`, `s[i]` on a pointer | `local.get` of the pointer, then the address it holds, in its memory | leaves the name's storage; the pointer is only read |
-| enum repr `e.repr` | the enum's value is copied, the repr taken from the copy | leaves the enum's storage; it is only read |
 
 ## The access rule
 
@@ -39,29 +38,53 @@ p.inner.value = n;    // p: Read                  (local.get $p; i32.store offse
                       // inner, value: Write      (that memory changed)
 s.pointer.value += n; // s, pointer: Read; value: ReadWrite
 p.data[i][j] = 1;     // p, data: Read            (data[i] is a pointer read from memory)
-e.repr = x;           // rejected; e, repr: Read
+e.repr = x;           // e, repr: Write; rejected: a repr is never `mut`
 ```
 
-Of this rule, one consequence is used today: whether a local's own storage
-changes, which is what it needs `mut` for. A local changes exactly
-when an assignment to a value (`=`, `op=`) has a target whose field chain
-starts at it; a write through a pointer is a `Store` into memory and only
-reads the local. `p.x = 1` needs no `local mut p`. The checker requires `mut`
-by that rule (`check_assignable`), and the `unnecessary_mutability` and
-`unused_variable` lints read it from the checked body (`wx-lint`).
+This rule decides what needs `mut`: every name a write changes. A local
+changes exactly when an assignment to a value (`=`, `op=`) has a target
+whose field chain starts at it; a write through a pointer is a `Store` into
+memory and only reads the local. `p.x = 1` needs no `local mut p`. A field
+changes when it is on the write's way up to the pointer it goes through,
+or up to its root local:
+
+```wx
+struct Inner(mut value: u32, id: u32);
+struct Outer(mut inner: Inner, ptr: heap::*Inner);
+
+o.inner.value = n;  // o: local mut; inner, value: mut
+o.inner.id = n;     // rejected: `id` is not `mut`
+o.ptr.value = n;    // o, ptr: only read; value: mut
+o.inner = Inner(1, 2); // inner: mut; Inner's fields: replaced, not changed
+p.* = Inner(1, 2);  // p: exclusive; no field changes
+```
+
+A field without `mut` is set when its value is built and never changed in
+place; replacing the whole value builds a new one. That makes a struct
+immutable by its declaration alone, without getters. Whether a field may be
+written follows its visibility: anyone who can name it can write it if it
+is `mut`.
+
+The checker requires `mut` by this rule (`check_assignable` for a value,
+`check_place_writable` for a place). The `unnecessary_mutability` and
+`unused_variable` lints read the same rule from the checked bodies
+(`wx-lint`): `mut` on a local never assigned, and on a private field no
+body of the package writes in place. A public field may be written by
+another package, so it is not reported.
 
 The name resolution table records what each name means, not how it is
-used. The language server marks a local declared `mut` wherever it is
-named, as rust-analyzer does, rather than each write.
+used. The language server marks a local or field declared `mut` wherever
+it is named, as rust-analyzer does, rather than each write.
 
 ## Permission is separate
 
-Whether a write is allowed is not the access rule's question. Today a place
-reached through a pointer is writable when that pointer is exclusive
-(`Place::mutable`, `check_place_writable`), whatever the pointer was read
-from:
+The access rule says which names a write changes, and so which need `mut`;
+the pointer a place is reached through is a separate permission. Today it
+must be exclusive (the ownership of `PlaceKind::Deref`, checked by
+`check_place_writable`), whatever the pointer was read from:
 
 ```wx
+struct Inner(mut value: u32);
 struct Outer(inner: heap::*Inner);               // * exclusive
 func f(p: heap::&Outer) { p.inner.value = 1; }   // & shared: accepted today
 ```
