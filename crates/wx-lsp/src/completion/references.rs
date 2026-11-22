@@ -157,7 +157,8 @@ pub(super) fn complete(
 								snapshot.sema.decls.functions
 									[usize::from(function)]
 								.params
-								.len() - 1,
+								.len()
+									- 1,
 							)
 						}
 						_ => arguments(snapshot, definition),

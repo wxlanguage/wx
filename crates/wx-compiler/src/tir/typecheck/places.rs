@@ -971,9 +971,9 @@ impl BodyBuilder<'_, '_> {
 									self.scope.file_id,
 									local.name.span,
 								)
-								.with_message(format!(
-									"declare it `mut {name}`"
-								)),
+								.with_message(
+									format!("declare it `mut {name}`"),
+								),
 							),
 					);
 				}

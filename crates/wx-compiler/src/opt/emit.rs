@@ -73,7 +73,8 @@ pub fn emit(
 				matches!(placement.value(node), Some(ValuePlacement::Stack(_)));
 			if stored || on_stack {
 				let slot = graph.joins[usize::from(join)].columns.start
-					as usize + column as usize;
+					as usize
+					+ column as usize;
 				assert!(emitter.phi_targets[slot].replace(node).is_none());
 			}
 			if on_stack {

@@ -1148,7 +1148,8 @@ impl<'a> Builder<'a> {
 								field.extract_str(self.source),
 							)
 							.ok()
-							.as_deref() != self.interner.resolve(name)
+							.as_deref()
+								!= self.interner.resolve(name)
 						{
 							entry_nodes.push(self.source_text(*field));
 							entry_nodes.push(self.text(Text::ColonSp));
@@ -2516,7 +2517,8 @@ impl<'a> Builder<'a> {
 								| ast::Expression::Grouped { .. }
 								| ast::Expression::Placeholder
 								| ast::Expression::String
-								| ast::Expression::Char | ast::Expression::Call { .. }
+								| ast::Expression::Char
+								| ast::Expression::Call { .. }
 								| ast::Expression::ObjectAccess { .. }
 								| ast::Expression::Deref { .. }
 								| ast::Expression::AddressOf { .. }
@@ -3157,25 +3159,26 @@ impl<'a> Builder<'a> {
 		destructure: ast::Destructure,
 	) {
 		let ast = self.ast;
-		let elements = |this: &mut Self,
-		                out: &mut Vec<NodeId>,
-		                elements: &[ast::PatternElement]| {
-			out.push(this.text(Text::LParen));
-			for (i, element) in elements.iter().enumerate() {
-				if i > 0 {
-					out.push(this.text(Text::CommaSp));
-				}
-				match *element {
-					ast::PatternElement::Pattern(pattern) => {
-						this.build_pattern(out, pattern);
+		let elements =
+			|this: &mut Self,
+			 out: &mut Vec<NodeId>,
+			 elements: &[ast::PatternElement]| {
+				out.push(this.text(Text::LParen));
+				for (i, element) in elements.iter().enumerate() {
+					if i > 0 {
+						out.push(this.text(Text::CommaSp));
 					}
-					ast::PatternElement::Rest(_) => {
-						out.push(this.text(Text::DotDot));
+					match *element {
+						ast::PatternElement::Pattern(pattern) => {
+							this.build_pattern(out, pattern);
+						}
+						ast::PatternElement::Rest(_) => {
+							out.push(this.text(Text::DotDot));
+						}
 					}
 				}
-			}
-			out.push(this.text(Text::RParen));
-		};
+				out.push(this.text(Text::RParen));
+			};
 		match destructure {
 			// A tuple of one is its element, unless it groups alternatives.
 			ast::Destructure::Tuple { elements: items }
@@ -3402,7 +3405,8 @@ impl<'a> Builder<'a> {
 						if let ast::AssocBindingKind::ConstRepresentable {
 							..
 						}
-						| ast::AssocBindingKind::ConstEquals { .. } = binding.kind
+						| ast::AssocBindingKind::ConstEquals { .. } =
+							binding.kind
 						{
 							let marker = self.text(Text::Const);
 							key = self.arena.concat(&[marker, key]);

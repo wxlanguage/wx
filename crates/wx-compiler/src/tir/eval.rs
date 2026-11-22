@@ -403,7 +403,8 @@ impl Semantics {
 				&mut scalars,
 				&mut Vec::new(),
 			)
-			.is_err() || scalars.len() != 1
+			.is_err()
+			|| scalars.len() != 1
 		{
 			return;
 		}

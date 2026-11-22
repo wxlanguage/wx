@@ -569,7 +569,8 @@ impl Semantics {
 				);
 				if let BindingLookup::Found {
 					target, reachable, ..
-				} = lookup && let Some(loc) = target.loc()
+				} = lookup
+					&& let Some(loc) = target.loc()
 					&& used_as.admits(tier, self.declaration_kind(loc))
 					&& reachable
 				{

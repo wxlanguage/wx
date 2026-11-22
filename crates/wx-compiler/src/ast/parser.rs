@@ -2276,14 +2276,19 @@ impl<'ctx> Parser<'ctx> {
 			Token::Identifier
 				| Token::Keyword(
 					Keyword::Return
-						| Keyword::If | Keyword::Loop
-						| Keyword::Match | Keyword::Break
+						| Keyword::If
+						| Keyword::Loop
+						| Keyword::Match
+						| Keyword::Break
 						| Keyword::Continue
 						| Keyword::Underscore
-						| Keyword::Block | Keyword::SelfLower
+						| Keyword::Block
+						| Keyword::SelfLower
 						| Keyword::SelfPascal
-						| Keyword::Package | Keyword::Super
-				) | Token::Int
+						| Keyword::Package
+						| Keyword::Super
+				)
+				| Token::Int
 				| Token::Float
 				| Token::String
 				| Token::Char
@@ -4749,7 +4754,8 @@ impl<'ctx> Parser<'ctx> {
 			Token::Identifier
 				| Token::Keyword(
 					Keyword::Package | Keyword::Super | Keyword::SelfLower
-				) | Token::Star
+				)
+				| Token::Star
 				| Token::OpenBrace
 		) {
 			return Self::parse_use_tree(parser);

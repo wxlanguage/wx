@@ -294,7 +294,8 @@ impl<'a> BodyContext<'a> {
 		let ty = self
 			.sema
 			.types
-			.list(self.sema.structs[usize::from(struct_index)].field_types)[field];
+			.list(self.sema.structs[usize::from(struct_index)].field_types)
+			[field];
 		let ty = self.sema.types.substitute(
 			ty,
 			Substitution {

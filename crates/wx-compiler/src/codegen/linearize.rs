@@ -181,7 +181,8 @@ impl<'a> Linearizer<'a> {
 				Task::AfterOperands(expr) => self.after_operands(expr),
 				Task::Operands { expression, next } => {
 					let (ExprKind::Values { values }
-					| ExprKind::Call { args: values, .. }) = self.body.kind(expression)
+					| ExprKind::Call { args: values, .. }) =
+						self.body.kind(expression)
 					else {
 						unreachable!("only values and calls have operand lists")
 					};

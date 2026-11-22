@@ -1171,7 +1171,8 @@ fn operation_types_fit(body: &Body, expr: ExprId) -> bool {
 			lhs == ValueType::Never
 				|| rhs == ValueType::Never
 				|| op.operands().admit(lhs)
-					&& rhs == lhs && ty == ValueType::I32
+					&& rhs == lhs
+					&& ty == ValueType::I32
 		}
 		ExprKind::Convert { op, value } => {
 			let from = operand(value);

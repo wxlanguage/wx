@@ -3486,7 +3486,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 				};
 				if matches!(item, ast::Item::PackageFunction { .. }) {
 					sema.function_implementations
-						[usize::from(function_index)] = FunctionImplementation::Parameter;
+						[usize::from(function_index)] =
+						FunctionImplementation::Parameter;
 				}
 				self.resolve_function_signature(
 					sema,
@@ -4226,10 +4227,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 		infer_policy: InferPolicy,
 	) -> TypeIndex {
 		let first = segments[0].ident.inner;
-		let through_type =
-			sema.generic_envs
-				.resolve(scope.generic_env, first)
-				.is_some() || first == Keyword::SelfPascal.symbol();
+		let through_type = sema
+			.generic_envs
+			.resolve(scope.generic_env, first)
+			.is_some()
+			|| first == Keyword::SelfPascal.symbol();
 		let walk = (!through_type).then(|| {
 			PathResolver::new(
 				&mut sema.diagnostics,
@@ -4512,7 +4514,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 				&sema.decls,
 				self.asts,
 			)
-			.walk_path(scope.file_id, scope.namespace, segments, Tier::Type);
+			.walk_path(
+				scope.file_id,
+				scope.namespace,
+				segments,
+				Tier::Type,
+			);
 			let Some(loc) = walk.target.loc() else {
 				return TypeIndex::ERROR;
 			};
@@ -6461,7 +6468,8 @@ pub(super) mod tests {
 						);
 						let count = case.sema.functions[usize::from(method)]
 							.param_types
-							.len() - usize::from(receiver.is_some());
+							.len()
+							- usize::from(receiver.is_some());
 						for arg in receiver
 							.into_iter()
 							.chain(arguments(body, count, args))
@@ -6513,12 +6521,12 @@ pub(super) mod tests {
 						for (at, &arg) in args.iter().enumerate() {
 							text.push(' ');
 							if let ElementOrder::Permuted { .. } = order {
-								let name = case
-									.sema
-									.decls
-									.fields
-									.names(decl.fields)[usize::from(body.declared_index(order, at))]
-								.unwrap();
+								let name =
+									case.sema.decls.fields.names(decl.fields)
+										[usize::from(
+											body.declared_index(order, at),
+										)]
+									.unwrap();
 								text.push_str(strings.resolve(name).unwrap());
 								text.push('=');
 							}
@@ -8910,11 +8918,11 @@ pub(super) mod tests {
 			case.sema.diagnostics
 		);
 		assert!(
-			case.sema.diagnostics.iter().all(|diagnostic| diagnostic
-				.code
-				.as_deref() == Some(
-				DiagnosticCode::InvalidImplTarget.code()
-			))
+			case.sema
+				.diagnostics
+				.iter()
+				.all(|diagnostic| diagnostic.code.as_deref()
+					== Some(DiagnosticCode::InvalidImplTarget.code()))
 		);
 		assert_eq!(
 			case.sema.trait_impls.len(),
@@ -10631,7 +10639,8 @@ pub(super) mod tests {
 				assert!(matches!(
 					sema.types.resolve(
 						sema.types
-							.list(sema.functions[function_index].param_types)[0]
+							.list(sema.functions[function_index].param_types)
+							[0]
 					),
 					Type::Enum { .. }
 				));
@@ -14489,7 +14498,8 @@ pub(super) mod tests {
 			assert_eq!(
 				case.sema
 					.types
-					.list(case.function_signature("independent").param_types)[0],
+					.list(case.function_signature("independent").param_types)
+					[0],
 				TypeIndex::I32
 			);
 		}
@@ -18810,10 +18820,11 @@ pub(super) mod tests {
 						.iter()
 						.position(|definition| {
 							case.sema.decls.item(definition.loc).name.inner
-								== name && matches!(
-								definition.owner,
-								MemberOwner::Trait(_)
-							)
+								== name
+								&& matches!(
+									definition.owner,
+									MemberOwner::Trait(_)
+								)
 						})
 						.unwrap(),
 				)

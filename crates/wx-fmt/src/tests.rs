@@ -3221,7 +3221,8 @@ impl Roles<'_> {
 					return;
 				};
 				if let (ast::Branch::Block(block), ast::Branch::Expression(b)) =
-					(a, b) && matches!(self.b.expr(b), E::IfElse { .. })
+					(a, b)
+					&& matches!(self.b.expr(b), E::IfElse { .. })
 				{
 					let block = self.a.block(block);
 					assert!(

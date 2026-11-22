@@ -2935,16 +2935,17 @@ impl Semantics {
 									other.value,
 									clause.value,
 								)
-						}) || !failed.is_empty()
-						&& (reads_failed(
-							&self.types,
-							clause.projection,
-							&failed,
-						) || reads_failed(
-							&self.types,
-							clause.value,
-							&failed,
-						)) {
+						})
+						|| !failed.is_empty()
+							&& (reads_failed(
+								&self.types,
+								clause.projection,
+								&failed,
+							) || reads_failed(
+								&self.types,
+								clause.value,
+								&failed,
+							)) {
 						continue;
 					}
 					self.solver.record_proving(judgement, clause.origin);

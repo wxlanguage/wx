@@ -825,7 +825,8 @@ impl Body {
 	fn scopes_from(
 		&self,
 		offset: TextOffset,
-	) -> impl Iterator<Item = (Scope, impl Iterator<Item = LocalIdx>)> + '_ {
+	) -> impl Iterator<Item = (Scope, impl Iterator<Item = LocalIdx>)> + '_
+	{
 		std::iter::successors(self.scope_at(offset), |&at| {
 			self.scope(at).parent
 		})
@@ -1324,7 +1325,8 @@ mod tests {
 					let name = body.local(local).name;
 					let line = self.source[..usize::from(name.span.start)]
 						.matches('\n')
-						.count() + 1;
+						.count()
+						+ 1;
 					format!(
 						"{}@{line}",
 						self.strings.resolve(name.inner).unwrap()
@@ -1936,7 +1938,8 @@ mod tests {
 				body.pat_spans
 					.iter()
 					.filter(|&&found| found == span)
-					.count() >= 2
+					.count()
+					>= 2
 			);
 			let checked = body.pattern_of(ast, written).unwrap();
 			assert!(matches!(

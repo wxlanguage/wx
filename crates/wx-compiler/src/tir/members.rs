@@ -1559,7 +1559,8 @@ impl Semantics {
 			}
 			Type::Enum { enum_index } => Some(
 				self.types
-					.list(self.enums[usize::from(enum_index)].field_types)[usize::from(field)],
+					.list(self.enums[usize::from(enum_index)].field_types)
+					[usize::from(field)],
 			),
 			_ => None,
 		}

@@ -666,11 +666,12 @@ mod tests {
 			plan.computations()
 				.iter()
 				.position(|&node| node == input)
-				.unwrap() < plan
-				.computations()
-				.iter()
-				.position(|&node| node == shared)
 				.unwrap()
+				< plan
+					.computations()
+					.iter()
+					.position(|&node| node == shared)
+					.unwrap()
 		);
 	}
 
