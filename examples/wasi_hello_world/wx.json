@@ -1,4 +1,9 @@
 {
-    "type": "bin",
-    "entry": "main.wx"
+    "entry": "main.wx",
+    "dependencies": {
+        "alloc": {
+            "type": "local",
+            "path": "../alloc"
+        }
+    }
 }

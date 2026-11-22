@@ -1500,10 +1500,12 @@ Each step ends somewhere the tree compiles and the suite is green.
    this step by asserting the collected forest in a test, so the shape is
    pinned before a solver depends on it.
 4. **The naive solver + diagnostics.** The forty-line worklist, `contract()`
-   wiring, the two checks, three new `DiagnosticCode` entries — `E1082`
-   (inferred ⊄ declared), `E1083` (missing effect clause on a bodyless
-   function, raised in step 2), `W1011` (declared but never performed);
-   next free codes verified at `diagnostics.rs:196`. **This is the first
+   wiring, the two checks, three new `DiagnosticCode` entries — `E1083`
+   (inferred ⊄ declared), `E1084` (missing effect clause on a bodyless
+   function, raised in step 2), `W1011` (declared but never performed).
+   *(Shifted up one: `E1082` was taken by `CyclicSupertrait` on 2026-09-07.
+   Re-verify the next free code at `diagnostics.rs` rather than trusting
+   this line — nothing reserves a number until it is in the macro.)* **This is the first
    step that produces a user-visible answer**, and the end-to-end demo in §5
    should be a test here.
 5. **LSP hover** showing the resolved set.

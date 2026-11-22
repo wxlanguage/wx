@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Hello, world (wx)</title>
+<!-- wx build examples/hello_browser -o examples/hello_browser/hello.wasm
+     python3 -m http.server -d examples/hello_browser, then open the page. -->
+<pre id="out"></pre>
+<script type="module">
+    import { run } from "./hello.mjs";
+    const bytes = await (await fetch("hello.wasm")).arrayBuffer();
+    await run(bytes, line => out.textContent += line + "\n");
+</script>

@@ -1,0 +1,77 @@
+// Hello, world for a WASI host (`wasmtime run`, Node's `node:wasi`, ...).
+// WASI has no `print`: the program calls `fd_write` with a list of buffers.
+// Everything here is static data, so there is no allocator.
+memory heap: u32;
+
+// The descriptors every WASI program starts with. The host may hand out
+// others (from `path_open`, say), which this program does not use.
+enum FileDescriptor(value: u32) {
+    StdIn = 0,
+    StdOut = 1,
+    StdErr = 2,
+}
+
+// What every WASI function returns: 0 on success, otherwise an error code.
+// These are the ones a write can fail with; the full list of 77 is in
+// `examples/wasi_preview1_port`. The host may return a code not listed here,
+// so `Errno` is a struct holding the number, not an enum: every `u16` is a
+// valid `Errno`, the names are constants, and a `match` on it needs a
+// catch-all arm.
+struct Errno(pub code: u16);
+
+impl Errno {
+    pub const SUCCESS: Self = Self(0);
+    pub const AGAIN: Self = Self(6);
+    pub const BADF: Self = Self(8);
+    pub const FAULT: Self = Self(21);
+    pub const FBIG: Self = Self(22);
+    pub const INTR: Self = Self(27);
+    pub const INVAL: Self = Self(28);
+    pub const IO: Self = Self(29);
+    pub const NOSPC: Self = Self(51);
+    pub const PERM: Self = Self(63);
+    pub const PIPE: Self = Self(64);
+}
+
+// A constant is a pattern through the type's `Eq`.
+impl PartialEq for Errno {
+    #[inline]
+    func eq(self: Self, other: Self) -> Bool {
+        local Errno(a) = self;
+        local Errno(b) = other;
+        a == b
+    }
+}
+
+impl Eq for Errno {}
+
+import "wasi_snapshot_preview1" as wasi {
+    use super::*;
+    func fd_write(
+        fd: FileDescriptor,
+        io_vecs: heap::&[heap::&[u8]],
+        bytes_written: heap::*u32,
+    ) -> Errno;
+}
+
+func main() {
+    // A one-element list of buffers. In memory it is the pair (address,
+    // length) that WASI calls an iovec.
+    local io_vecs: heap::&[heap::&[u8]] = ["Hello, world!\n"];
+    // fd_write reports how many bytes it wrote through a pointer, so it needs
+    // a writable u32: the first word after the static data.
+    local written = heap::DATA_END;
+    match (wasi::fd_write(
+        FileDescriptor::StdOut,
+        io_vecs,
+        transmute(written),
+    )) {
+        Errno::SUCCESS => (),
+        _ => trap(),
+    }
+}
+
+export {
+    main as "_start",
+    heap as "memory",
+}

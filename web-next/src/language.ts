@@ -14,7 +14,7 @@ export const wxLanguageExtensionConfig: monaco.languages.ILanguageExtensionPoint
 /** Minimal syntax highlighting for WX — enough to be readable, not a full grammar. */
 export const wxMonarchLanguage: monaco.languages.IMonarchLanguage = {
 	keywords: [
-		"fn",
+		"func",
 		"local",
 		"mut",
 		"if",
@@ -23,8 +23,6 @@ export const wxMonarchLanguage: monaco.languages.IMonarchLanguage = {
 		"break",
 		"continue",
 		"return",
-		"true",
-		"false",
 		"struct",
 		"enum",
 		"impl",
@@ -51,8 +49,6 @@ export const wxMonarchLanguage: monaco.languages.IMonarchLanguage = {
 		"u64",
 		"f32",
 		"f64",
-		"bool",
-		"char",
 	],
 	tokenizer: {
 		root: [

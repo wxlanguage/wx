@@ -23,8 +23,8 @@ use crate::vfs::{FileId, Files};
 /// into so failures can be rendered with source context.
 ///
 /// `stage` names the stage in panic messages ("parse", "link", "check"). With
-/// three stages reporting into the same `FileId` space, "expected E1015" is a
-/// good deal less useful than "expected E1015 during check".
+/// three stages reporting into the same `FileId` space, "expected E1012" is a
+/// good deal less useful than "expected E1012 during check".
 ///
 /// Borrows throughout — a stage whose diagnostics are not already in one
 /// place (linker diagnostics live per package, parse diagnostics per module)
@@ -80,6 +80,22 @@ impl<'a> DiagnosticView<'a> {
 		self.items.is_empty()
 	}
 
+	/// Renders every diagnostic with its source context.
+	///
+	/// Useful while developing a test that needs to inspect the compiler's
+	/// complete output without first choosing an assertion.
+	pub fn render(&self) -> String {
+		self.render_items(self.items.iter())
+	}
+
+	/// Prints every rendered diagnostic to stdout.
+	///
+	/// Rust's test harness captures stdout by default; pass `--nocapture` when
+	/// running the test to see this output immediately.
+	pub fn print(&self) {
+		print!("{}", self.render());
+	}
+
 	// ── assertions ──────────────────────────────────────────────────────
 
 	/// Nothing was reported at all, warnings included.
@@ -89,7 +105,7 @@ impl<'a> DiagnosticView<'a> {
 				"expected no {} diagnostics, found {}:\n{}",
 				self.stage,
 				self.items.len(),
-				self.render(self.items.iter()),
+				self.render_items(self.items.iter()),
 			);
 		}
 	}
@@ -104,7 +120,7 @@ impl<'a> DiagnosticView<'a> {
 				"expected no {} errors, found {}:\n{}",
 				self.stage,
 				errors.len(),
-				self.render(errors.into_iter()),
+				self.render_items(errors.into_iter()),
 			);
 		}
 	}
@@ -112,6 +128,22 @@ impl<'a> DiagnosticView<'a> {
 	/// At least one *error* carrying `code`.
 	pub fn assert_error(&self, code: DiagnosticCode) {
 		self.assert_reported_inner(code.code(), Some(Severity::Error), "error");
+	}
+
+	/// Like [`Self::assert_error`], but also runs `check` against the first
+	/// matching diagnostic — for assertions `assert_error_saying`'s
+	/// message/notes-only substring search can't express, such as a
+	/// label's own text or span.
+	pub fn assert_error_with(
+		&self,
+		code: DiagnosticCode,
+		check: impl FnOnce(&Diagnostic<FileId>),
+	) {
+		check(self.assert_reported_inner(
+			code.code(),
+			Some(Severity::Error),
+			"error",
+		));
 	}
 
 	/// At least one *warning* carrying `code`.
@@ -141,7 +173,7 @@ impl<'a> DiagnosticView<'a> {
 				"expected no `{}` during {}, but it was reported:\n{}",
 				wanted,
 				self.stage,
-				self.render(self.items.iter()),
+				self.render_items(self.items.iter()),
 			);
 		}
 	}
@@ -158,7 +190,7 @@ impl<'a> DiagnosticView<'a> {
 				self.stage,
 				substring,
 				self.describe_count(),
-				self.render(self.items.iter()),
+				self.render_items(self.items.iter()),
 			);
 		}
 	}
@@ -178,7 +210,7 @@ impl<'a> DiagnosticView<'a> {
 				self.stage,
 				expected,
 				actual,
-				self.render(self.items.iter()),
+				self.render_items(self.items.iter()),
 			);
 		}
 	}
@@ -190,21 +222,23 @@ impl<'a> DiagnosticView<'a> {
 		wanted: &str,
 		severity: Option<Severity>,
 		noun: &str,
-	) {
-		let found = self.items.iter().any(|d| {
-			d.code.as_deref() == Some(wanted)
-				&& severity.is_none_or(|expected| d.severity == expected)
-		});
-		if !found {
-			panic!(
-				"expected {} `{}` during {}, found {}:\n{}",
-				noun,
-				wanted,
-				self.stage,
-				self.describe_count(),
-				self.render(self.items.iter()),
-			);
-		}
+	) -> &'a Diagnostic<FileId> {
+		self.items
+			.iter()
+			.find(|d| {
+				d.code.as_deref() == Some(wanted)
+					&& severity.is_none_or(|expected| d.severity == expected)
+			})
+			.unwrap_or_else(|| {
+				panic!(
+					"expected {} `{}` during {}, found {}:\n{}",
+					noun,
+					wanted,
+					self.stage,
+					self.describe_count(),
+					self.render_items(self.items.iter()),
+				)
+			})
 	}
 
 	fn describe_count(&self) -> String {
@@ -216,7 +250,7 @@ impl<'a> DiagnosticView<'a> {
 
 	/// Renders with source context, so a failure shows the offending line
 	/// rather than only a code and a message.
-	fn render(
+	fn render_items(
 		&self,
 		diagnostics: impl Iterator<Item = &'a Diagnostic<FileId>>,
 	) -> String {
@@ -254,7 +288,7 @@ mod tests {
 		let file_id = files
 			.add(
 				"main.wx".to_string(),
-				"fn f() {}".to_string(),
+				"func f() {}".to_string(),
 				FileOrigin::Local,
 			)
 			.unwrap();
@@ -295,7 +329,7 @@ mod tests {
 	#[test]
 	fn no_errors_passes_when_only_warnings_were_reported() {
 		let (files, items) =
-			fixture(&[(DiagnosticCode::UnusedVariable, Severity::Warning)]);
+			fixture(&[(DiagnosticCode::UnreachableCode, Severity::Warning)]);
 		view(&files, &items).assert_no_errors();
 	}
 
@@ -306,7 +340,16 @@ mod tests {
 		let message = fails(|| view(&files, &items).assert_no_errors());
 		assert!(message.contains("expected no check errors"), "{message}");
 		// the whole point: the failure shows the source, not just a bool
-		assert!(message.contains("fn f() {}"), "{message}");
+		assert!(message.contains("func f() {}"), "{message}");
+	}
+
+	#[test]
+	fn render_exposes_diagnostics_with_source_context() {
+		let (files, items) =
+			fixture(&[(DiagnosticCode::PrivateItem, Severity::Error)]);
+		let rendered = view(&files, &items).render();
+		assert!(rendered.contains(DiagnosticCode::PrivateItem.code()));
+		assert!(rendered.contains("func f() {}"));
 	}
 
 	#[test]
@@ -323,20 +366,20 @@ mod tests {
 		// it. This is exactly what the `has_error_code` helper it replaces got
 		// wrong.
 		let (files, items) =
-			fixture(&[(DiagnosticCode::UnusedVariable, Severity::Warning)]);
+			fixture(&[(DiagnosticCode::UnreachableCode, Severity::Warning)]);
 		let message = fails(|| {
-			view(&files, &items).assert_error(DiagnosticCode::UnusedVariable)
+			view(&files, &items).assert_error(DiagnosticCode::UnreachableCode)
 		});
 		assert!(message.contains("expected error"), "{message}");
-		view(&files, &items).assert_warning(DiagnosticCode::UnusedVariable);
-		view(&files, &items).assert_reported(DiagnosticCode::UnusedVariable);
+		view(&files, &items).assert_warning(DiagnosticCode::UnreachableCode);
+		view(&files, &items).assert_reported(DiagnosticCode::UnreachableCode);
 	}
 
 	#[test]
 	fn assert_absent_rejects_a_reported_code() {
 		let (files, items) =
 			fixture(&[(DiagnosticCode::PrivateItem, Severity::Error)]);
-		view(&files, &items).assert_absent(DiagnosticCode::UnusedVariable);
+		view(&files, &items).assert_absent(DiagnosticCode::UnreachableCode);
 		let message = fails(|| {
 			view(&files, &items).assert_absent(DiagnosticCode::PrivateItem)
 		});
@@ -347,16 +390,16 @@ mod tests {
 	fn assert_codes_is_exact_and_ordered() {
 		let (files, items) = fixture(&[
 			(DiagnosticCode::PrivateItem, Severity::Error),
-			(DiagnosticCode::UnusedVariable, Severity::Warning),
+			(DiagnosticCode::UnreachableCode, Severity::Warning),
 		]);
 		view(&files, &items).assert_codes(&[
 			DiagnosticCode::PrivateItem,
-			DiagnosticCode::UnusedVariable,
+			DiagnosticCode::UnreachableCode,
 		]);
 		// order matters
 		let message = fails(|| {
 			view(&files, &items).assert_codes(&[
-				DiagnosticCode::UnusedVariable,
+				DiagnosticCode::UnreachableCode,
 				DiagnosticCode::PrivateItem,
 			])
 		});
@@ -374,7 +417,7 @@ mod tests {
 		let file_id = files
 			.add(
 				"main.wx".to_string(),
-				"fn f() {}".to_string(),
+				"func f() {}".to_string(),
 				FileOrigin::Local,
 			)
 			.unwrap();
@@ -398,7 +441,7 @@ mod tests {
 	#[test]
 	fn assert_none_rejects_even_a_warning() {
 		let (files, items) =
-			fixture(&[(DiagnosticCode::UnusedVariable, Severity::Warning)]);
+			fixture(&[(DiagnosticCode::UnreachableCode, Severity::Warning)]);
 		let message = fails(|| view(&files, &items).assert_none());
 		assert!(
 			message.contains("expected no check diagnostics"),
