@@ -873,10 +873,12 @@ impl BodyBuilder<'_, '_> {
 	) -> ExprIdx {
 		let span = self.body.span(receiver);
 		let place = self.body.push_place(Place {
-			kind: PlaceKind::Deref { pointer: receiver },
+			kind: PlaceKind::Deref {
+				pointer: receiver,
+				ownership: Ownership::Exclusive,
+			},
 			ty: to,
 			memory,
-			mutable: true,
 			span,
 		});
 		let ty = self.sema.types.intern(Type::Pointer {

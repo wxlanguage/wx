@@ -1221,7 +1221,7 @@ mod tests {
 	#[test]
 	fn field_reads_and_assignment_targets_record_owner_relative_identity() {
 		let a = Analysis::clean(indoc! {"
-			struct A(value: u32);
+			struct A(mut value: u32);
 			struct B(value: u32);
 			func f(mut a: A, b: B) -> u32 {
 				a.value = b.value;
@@ -1485,7 +1485,7 @@ mod tests {
 	fn field_selection_through_a_pointer_uses_the_struct_identity() {
 		let a = Analysis::clean(indoc! {"
 			memory heap: u32;
-			struct S(value: u32);
+			struct S(mut value: u32);
 			func f(p: heap::*S, s: S) -> u32 {
 				p.value = s.value;
 				p.value

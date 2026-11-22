@@ -22,7 +22,7 @@ use crate::symbols::Keyword;
 use crate::tir::body::{
 	ExprIdx, ExprKind, Operand, Place, PlaceIdx, PlaceKind,
 };
-use crate::tir::decls::{FieldOwner, TraitIdx};
+use crate::tir::decls::{FieldIdx, FieldOwner, TraitIdx};
 use crate::tir::operators::is_primitive_binary;
 use crate::tir::resolutions::{Reference, Site};
 use crate::tir::solver::SolverError;
@@ -79,8 +79,7 @@ impl BodyBuilder<'_, '_> {
 		}
 	}
 
-	/// `pointer.*`: the place the pointer points at, in its memory, writable
-	/// when the pointer is exclusive.
+	/// `pointer.*`: the place the pointer points at, in its memory.
 	fn build_deref(&mut self, pointer: ast::ExprId, span: TextSpan) -> Operand {
 		let pointer = self.build(pointer, TypeIndex::INFER);
 		let pointer_ty = self.body.ty(pointer);
@@ -90,10 +89,9 @@ impl BodyBuilder<'_, '_> {
 				memory,
 				ownership,
 			} => Operand::Place(self.body.push_place(Place {
-				kind: PlaceKind::Deref { pointer },
+				kind: PlaceKind::Deref { pointer, ownership },
 				ty: to,
 				memory,
-				mutable: ownership == Ownership::Exclusive,
 				span,
 			})),
 			Type::Error => Operand::Value(self.body.push(
@@ -163,46 +161,27 @@ impl BodyBuilder<'_, '_> {
 				Operand::Value(value) => value,
 			};
 			object = Operand::Place(self.body.push_place(Place {
-				kind: PlaceKind::Deref { pointer },
+				kind: PlaceKind::Deref { pointer, ownership },
 				ty: to,
 				memory,
-				mutable: ownership == Ownership::Exclusive,
 				span: self.body.span(pointer),
 			}));
 			object_ty = to;
 		}
-		let Some((owner, field, ty)) = self.select_field(object_ty, member)
-		else {
+		let Some((field, ty)) = self.select_field(object_ty, member) else {
 			return Operand::Value(self.body.push(
 				ExprKind::Error,
 				TypeIndex::ERROR,
 				span,
 			));
 		};
-		// An enum's repr is read, never written: its value is always one of
-		// the variants. So it is a value even where the enum is a place, and
-		// `=` and `.&` on it are refused as on any value.
-		if let FieldOwner::Enum(_) = owner {
-			let object = match object {
-				Operand::Place(place) => self.load(place),
-				Operand::Value(value) => value,
-			};
-			return Operand::Value(self.body.push(
-				ExprKind::FieldAccess { object, field },
-				ty,
-				span,
-			));
-		}
 		match object {
 			Operand::Place(object) => {
-				let Place {
-					memory, mutable, ..
-				} = *self.body.place(object);
+				let memory = self.body.place(object).memory;
 				Operand::Place(self.body.push_place(Place {
 					kind: PlaceKind::Field { object, field },
 					ty,
 					memory,
-					mutable,
 					span,
 				}))
 			}
@@ -259,10 +238,9 @@ impl BodyBuilder<'_, '_> {
 			));
 		};
 		let sequence = self.body.push_place(Place {
-			kind: PlaceKind::Deref { pointer },
+			kind: PlaceKind::Deref { pointer, ownership },
 			ty: to,
 			memory,
-			mutable: ownership == Ownership::Exclusive,
 			span: self.body.span(pointer),
 		});
 		self.build_element(sequence, element, index, span)
@@ -276,9 +254,7 @@ impl BodyBuilder<'_, '_> {
 		index: ast::ExprId,
 		span: TextSpan,
 	) -> Operand {
-		let Place {
-			memory, mutable, ..
-		} = *self.body.place(sequence);
+		let memory = self.body.place(sequence).memory;
 		let size = self.memory_size(memory);
 		let index = self.check(index, size);
 		Operand::Place(self.body.push_place(Place {
@@ -288,7 +264,6 @@ impl BodyBuilder<'_, '_> {
 			},
 			ty: element,
 			memory,
-			mutable,
 			span,
 		}))
 	}
@@ -483,7 +458,7 @@ impl BodyBuilder<'_, '_> {
 		&mut self,
 		object_ty: TypeIndex,
 		member: Spanned<SymbolU32>,
-	) -> Option<(FieldOwner, crate::tir::decls::FieldIdx, TypeIndex)> {
+	) -> Option<(FieldIdx, TypeIndex)> {
 		// No name is written (`x.` unfinished): the parser reported it.
 		if object_ty == TypeIndex::ERROR
 			|| member.inner == Keyword::Error.symbol()
@@ -596,7 +571,7 @@ impl BodyBuilder<'_, '_> {
 				.list(self.sema.enums[usize::from(enum_index)].field_types)
 				[usize::from(field)],
 		};
-		Some((owner, field, self.context().normalized(ty)))
+		Some((field, self.context().normalized(ty)))
 	}
 
 	/// `place.&`: a shared pointer to a place, in its memory. Only a place
@@ -831,61 +806,120 @@ impl BodyBuilder<'_, '_> {
 		)))
 	}
 
-	/// Reports a write through a shared pointer.
+	/// Reports what a write to `place` lacks permission for. The write
+	/// changes every step up to the pointer the place is reached through:
+	/// each field on the way needs `mut`, and the pointer must be exclusive.
+	/// What the pointer was read from is only read.
 	fn check_place_writable(&mut self, place: PlaceIdx) {
-		let place = *self.body.place(place);
-		if place.mutable || place.ty == TypeIndex::ERROR {
+		let Place { ty, span, .. } = *self.body.place(place);
+		if ty == TypeIndex::ERROR {
 			return;
 		}
+		let mut at = place;
+		loop {
+			match self.body.place(at).kind {
+				PlaceKind::Field { object, field } => {
+					self.check_field_mut(
+						self.body.place(object).ty,
+						field,
+						span,
+					);
+					at = object;
+				}
+				PlaceKind::Element { object, .. } => at = object,
+				PlaceKind::Deref { ownership, .. } => {
+					if ownership == Ownership::Shared {
+						self.sema.diagnostics.push(
+							Diagnostic::error()
+								.with_code(
+									DiagnosticCode::CannotMutateImmutable
+										.code(),
+								)
+								.with_message(
+									"cannot write through a shared pointer",
+								)
+								.with_label(Label::primary(
+									self.scope.file_id,
+									span,
+								))
+								.with_note(
+									"a place reached through `&T` is \
+									 read-only; `*T` may be written",
+								),
+						);
+					}
+					return;
+				}
+			}
+		}
+	}
+
+	/// Reports a write at `span` that changes `field` of a value of type
+	/// `object_ty` in place, when the field is not `mut`.
+	fn check_field_mut(
+		&mut self,
+		object_ty: TypeIndex,
+		field: FieldIdx,
+		span: TextSpan,
+	) {
+		let owner = match *self.sema.types.resolve(object_ty) {
+			Type::Struct { struct_index, .. } => {
+				FieldOwner::Struct(struct_index)
+			}
+			Type::Enum { enum_index } => FieldOwner::Enum(enum_index),
+			_ => return,
+		};
+		let decls = &self.sema.decls;
+		let fields = owner.fields(decls);
+		if decls.fields.mut_span(fields, field).is_some() {
+			return;
+		}
+		let Some(name) = decls.fields.name(fields, field) else {
+			return;
+		};
+		let declared = SourceSpan::new(
+			decls.file_id(owner.loc(decls)),
+			decls.fields.name_span(fields, field),
+		);
+		let name = self.builder.strings.resolve(name).unwrap();
+		let owner_name = self
+			.builder
+			.strings
+			.resolve(decls.item(owner.loc(decls)).name.inner)
+			.unwrap();
+		// A repr is never `mut`: its value is one of the variants, so it is
+		// changed by assigning one.
+		let hint = match owner {
+			FieldOwner::Struct(_) => format!("declare it `mut {name}`"),
+			FieldOwner::Enum(_) => {
+				"a repr cannot be `mut`; assign a variant instead".to_owned()
+			}
+		};
 		self.sema.diagnostics.push(
 			Diagnostic::error()
 				.with_code(DiagnosticCode::CannotMutateImmutable.code())
-				.with_message("cannot write through a shared pointer")
-				.with_label(Label::primary(self.scope.file_id, place.span))
-				.with_note(
-					"a place reached through `&T` is read-only; `*T` may be written",
-				),
+				.with_message(format!(
+					"cannot assign to immutable field `{name}` of {} \
+					 `{owner_name}`",
+					owner.noun()
+				))
+				.with_label(Label::primary(self.scope.file_id, span))
+				.with_label(declared.secondary_label().with_message(hint)),
 		);
 	}
 
 	/// Whether `target`, a value, is something `=` can write: a local or a
 	/// field of a local. A target that is not is reported and gives
-	/// `false`; one that is but is not `mut` is reported and gives `true`,
-	/// since its type still holds the value to it. The root local is the one
-	/// that needs `mut`, however deep the field chain is: a chain that went
-	/// through a pointer is a place, not a value, and never gets here.
+	/// `false`; one that is but lacks `mut` is reported and gives `true`,
+	/// since its type still holds the value to it. The write changes the root
+	/// local and every field on the way, so each needs `mut`: a chain that
+	/// went through a pointer is a place, not a value, and never gets here.
 	fn check_assignable(&mut self, target: ExprIdx) -> bool {
 		let span = self.body.span(target);
 		let mut root = target;
-		while let ExprKind::FieldAccess { object, .. } = self.body.kind(root) {
-			// An enum's repr is never written: its value is one of the
-			// variants, so changing it is assigning one.
-			if let Type::Enum { enum_index } =
-				*self.sema.types.resolve(self.body.ty(object))
-			{
-				let name = self.sema.decls.name(enum_index).inner;
-				let name = self.builder.strings.resolve(name).unwrap();
-				self.sema.diagnostics.push(
-					Diagnostic::error()
-						.with_code(
-							DiagnosticCode::InvalidAssignmentTarget.code(),
-						)
-						.with_message(format!(
-							"cannot assign to the repr of enum `{name}`"
-						))
-						.with_label(
-							Label::primary(self.scope.file_id, span)
-								.with_message(
-									"its value is one of the variants",
-								),
-						)
-						.with_note(format!(
-							"to change the value, assign a variant: \
-							 `{name}::Variant`"
-						)),
-				);
-				return false;
-			}
+		while let ExprKind::FieldAccess { object, field } = self.body.kind(root)
+		{
+			self.check_field_mut(self.body.ty(object), field, span);
 			root = object;
 		}
 		match self.body.kind(root) {

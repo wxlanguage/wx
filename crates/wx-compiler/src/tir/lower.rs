@@ -4396,7 +4396,7 @@ mod tests {
 	#[test]
 	fn lowers_struct_construction_field_access_and_assignment() {
 		let source = r#"
-            struct Point(x: i32, y: i32);
+            struct Point(x: i32, mut y: i32);
             func first(p: Point) -> i32 { p.x }
             func local_field() -> i32 {
                 local mut p: Point = Point(10, 20);
@@ -4419,8 +4419,8 @@ mod tests {
 	#[test]
 	fn nested_fields_are_flat_ranges_for_reads_and_updates() {
 		let source = r#"
-			struct Inner(a: i32, marker: (), b: i64);
-			struct Outer(marker: (), inner: Inner, c: i32);
+			struct Inner(a: i32, mut marker: (), mut b: i64);
+			struct Outer(marker: (), mut inner: Inner, c: i32);
 			func run() -> (i32, i64, i32) {
 				local mut x: i32 = 0;
 				local mut o: Outer = Outer((), Inner(1, (), 2), 3);
@@ -4605,7 +4605,7 @@ mod tests {
 	fn erased_zero_sized_values_still_execute_calls_and_can_trap() {
 		for source in [
 			r#"struct Zero(marker: ()); func fail() { core::trap() } func run() -> i32 { local z: Zero = Zero(fail()); _ = z; 7 } export { run as "run" }"#,
-			r#"struct Zero(marker: ()); func fail() { core::trap() } func run() -> i32 { local mut z: Zero = Zero(()); z.marker = fail(); 7 } export { run as "run" }"#,
+			r#"struct Zero(mut marker: ()); func fail() { core::trap() } func run() -> i32 { local mut z: Zero = Zero(()); z.marker = fail(); 7 } export { run as "run" }"#,
 			r#"struct Zero(); func make() -> Zero { core::trap() } func run() -> i32 { _ = make(); 7 } export { run as "run" }"#,
 		] {
 			let (mut store, instance) = instantiate(source);
@@ -5310,8 +5310,8 @@ mod tests {
 	#[test]
 	fn compound_assignment_updates_a_nested_field_in_place() {
 		let source = r#"
-            struct Inner(a: i32, marker: (), b: i64);
-            struct Outer(marker: (), inner: Inner, c: i32);
+            struct Inner(mut a: i32, marker: (), mut b: i64);
+            struct Outer(marker: (), mut inner: Inner, mut c: i32);
             func run() -> (i32, i64, i32) {
                 local mut o: Outer = Outer((), Inner(1, (), 2), 3);
                 o.inner.a += 4;
@@ -8731,7 +8731,7 @@ mod tests {
 		let source = r#"
 			#[memory_limits{ min_pages: 1 }]
 			memory heap: u32;
-			struct Pixel(flag: Bool, value: u32, tag: u8);
+			struct Pixel(mut flag: Bool, value: u32, tag: u8);
 			func write(address: u32) {
 				local p: heap::*Pixel = transmute(address);
 				p.* = Pixel(True, 0x01020304, 7);
@@ -8782,12 +8782,67 @@ mod tests {
 	}
 
 	#[test]
+	fn an_enums_repr_in_memory_is_a_place_at_the_enums_address() {
+		// `Slot` is laid out `signal` at 0, `tag` at 2: the repr is read and
+		// addressed where the enum is, not loaded as a whole first.
+		let source = r#"
+			#[memory_limits{ min_pages: 1 }]
+			memory heap: u32;
+			enum Signal(number: i16) { Hangup = 1, Interrupt = 258 }
+			struct Slot(tag: u8, signal: Signal);
+			func write(address: u32) {
+				local p: heap::*Slot = transmute(address);
+				p.* = Slot(7, Signal::Interrupt);
+			}
+			func read(address: u32) -> i32 {
+				local p: heap::*Slot = transmute(address);
+				transmute::<i16, i32>(p.signal.number)
+			}
+			func through_address(address: u32) -> i32 {
+				local p: heap::*Slot = transmute(address);
+				local number: heap::&i16 = p.signal.number.&;
+				transmute::<i16, i32>(number.*)
+			}
+			func address(address: u32) -> u32 {
+				local p: heap::*Slot = transmute(address);
+				transmute(p.signal.number.&)
+			}
+			export {
+				write as "write",
+				read as "read",
+				through_address as "through_address",
+				address as "address",
+				heap as "heap",
+			}
+		"#;
+		each_policy(source, |store, instance, memory| {
+			memory.data_mut(&mut *store)[..16].fill(0xFF);
+			instance
+				.get_typed_func::<u32, ()>(&mut *store, "write")
+				.unwrap()
+				.call(&mut *store, 8)
+				.unwrap();
+			assert_eq!(memory.data(&*store)[8..11], [2, 1, 7]);
+			for name in ["read", "through_address"] {
+				let f = instance
+					.get_typed_func::<u32, i32>(&mut *store, name)
+					.unwrap();
+				assert_eq!(f.call(&mut *store, 8).unwrap(), 258, "{name}");
+			}
+			let address = instance
+				.get_typed_func::<u32, u32>(&mut *store, "address")
+				.unwrap();
+			assert_eq!(address.call(&mut *store, 8).unwrap(), 8);
+		});
+	}
+
+	#[test]
 	fn a_compound_store_and_a_fields_address_go_through_the_place() {
 		// `Pair` is laid out `b` at 0, `a` at 8.
 		let source = r#"
 			#[memory_limits{ min_pages: 1 }]
 			memory heap: u32;
-			struct Pair(a: u32, b: u64);
+			struct Pair(mut a: u32, b: u64);
 			func bump(address: u32, by: u32) -> u32 {
 				local p: heap::*Pair = transmute(address);
 				p.a += by;
@@ -8936,7 +8991,7 @@ mod tests {
 		let source = r#"
 			#[memory_limits{ min_pages: 1 }]
 			memory heap: u64;
-			struct Pair(a: u32, b: u64);
+			struct Pair(a: u32, mut b: u64);
 			func run(address: u64, value: u64) -> u64 {
 				local p: heap::*Pair = transmute(address);
 				p.* = Pair(1, value);
@@ -9564,7 +9619,7 @@ mod tests {
 			#[memory_limits{ min_pages: 1 }]
 			memory heap: u32;
 			#[fixed_order]
-			struct C(pad: u32, z: u32);
+			struct C(pad: u32, mut z: u32);
 			#[fixed_order]
 			struct B(w: u32, c: C, next: heap::&C);
 			#[fixed_order]
@@ -9632,7 +9687,7 @@ mod tests {
 			#[memory_limits{ min_pages: 1 }]
 			memory heap: u32;
 			#[fixed_order]
-			struct Header(len: u8, data: [u16; 3], tail: u32);
+			struct Header(len: u8, mut data: [u16; 3], tail: u32);
 			func get(h: heap::&Header, i: u32) -> u16 { h.data[i] }
 			func tail(h: heap::&Header) -> u32 { h.tail }
 			func set(h: heap::*Header, i: u32, v: u16) { h.data[i] = v; }

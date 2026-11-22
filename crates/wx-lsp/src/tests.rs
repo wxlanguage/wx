@@ -1139,7 +1139,7 @@ fn hover_renders_a_jump_and_its_target_as_signatures() {
 fn hover_renders_signatures_from_the_resolved_name() {
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
-		struct Point(x: i32, pub y: i32);
+		struct Point(x: i32, pub mut y: i32);
 		/// Adds two numbers.
 		///
 		/// Wraps on overflow.
@@ -1179,8 +1179,10 @@ fn hover_renders_signatures_from_the_resolved_name() {
 	assert_eq!(hover("a +", 0).unwrap(), "```wx\na: i32\n```");
 	assert_eq!(
 		hover("Point", 1).unwrap(),
-		"```wx\nstruct Point(x: i32, y: i32)\n```"
+		"```wx\nstruct Point(x: i32, pub mut y: i32)\n```"
 	);
+	assert_eq!(hover("y:", 0).unwrap(), "```wx\npub mut y: i32\n```");
+	assert_eq!(hover("x:", 0).unwrap(), "```wx\nx: i32\n```");
 	assert_eq!(hover("i32", 1).unwrap(), "```wx\ntype i32\n```");
 	assert_eq!(hover("T:", 0).unwrap(), "```wx\ntype T: StackValue\n```");
 	assert_eq!(hover("export", 0), None);
@@ -1861,7 +1863,7 @@ fn semantic_tokens_colour_resolved_and_declared_names() {
 	let root = PathBuf::from("/test/main.wx");
 	let source = indoc::indoc! {"
 		mod geo {
-		    pub struct Point(pub x: i32, pub y: i32);
+		    pub struct Point(pub x: i32, pub mut y: i32);
 		    impl Point {
 		        pub func sum(self: Self) -> i32 { self.x + self.y }
 		        pub func origin() -> Self { Self(0, 0) }
@@ -1891,7 +1893,8 @@ fn semantic_tokens_colour_resolved_and_declared_names() {
 	let tokens = semantic_tokens(&state, &uri, source, None);
 	// A name written as a keyword is a keyword token, whatever it resolves
 	// to (the receiver, the impl's target, the parent module), with no
-	// modifiers; the label `out` is no token.
+	// modifiers; the label `out` is no token. A `mut` field is marked as a
+	// `mut` local is, where it is declared and where it is named.
 	assert_eq!(
 		tokens,
 		[
@@ -1899,7 +1902,7 @@ fn semantic_tokens_colour_resolved_and_declared_names() {
 			"Point:struct.declaration",
 			"x:property.declaration",
 			"i32:type.defaultLibrary",
-			"y:property.declaration",
+			"y:property.declaration.modification",
 			"i32:type.defaultLibrary",
 			"Point:struct",
 			"func:keyword",
@@ -1910,7 +1913,7 @@ fn semantic_tokens_colour_resolved_and_declared_names() {
 			"self:keyword",
 			"x:property",
 			"self:keyword",
-			"y:property",
+			"y:property.modification",
 			"func:keyword",
 			"origin:function.declaration",
 			"Self:keyword",

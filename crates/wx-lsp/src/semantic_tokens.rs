@@ -77,8 +77,8 @@ const TOKEN_MODIFIERS: &[SemanticTokenModifier] = &[
 const DECLARATION: u32 = 1 << 0;
 const READONLY: u32 = 1 << 1;
 const STATIC: u32 = 1 << 2;
-/// A local declared `mut`, where it is declared and wherever it is named, as
-/// rust-analyzer marks a mutable binding.
+/// A local or a field declared `mut`, where it is declared and wherever it is
+/// named, as rust-analyzer marks a mutable binding.
 const MODIFICATION: u32 = 1 << 3;
 /// Provided by the compiler rather than defined in wx: an intrinsic (a
 /// function core leaves to the compiler), a primitive type or a literal kind
@@ -311,7 +311,14 @@ fn classify(
 				false => (TokenType::Variable, mutable),
 			}
 		}
-		Definition::Field { .. } => (TokenType::Property, 0),
+		Definition::Field { owner, field } => {
+			let fields = owner.fields(decls);
+			let mutable = match decls.fields.mut_span(fields, field) {
+				Some(_) => MODIFICATION,
+				None => 0,
+			};
+			(TokenType::Property, mutable)
+		}
 		Definition::Parameter { .. } => (TokenType::Parameter, 0),
 		Definition::TypeParam { .. } => (TokenType::TypeParameter, 0),
 		// Only `Self` names an impl's target, and it is a keyword.

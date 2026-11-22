@@ -2218,7 +2218,7 @@ mod tests {
 		trait Peek {
 		    func peek(self: heap::&Self) -> u32;
 		}
-		struct Inner(pub v: u32);
+		struct Inner(pub mut v: u32);
 		impl Inner {
 		    pub func get(self: heap::&Self) -> u32 { self.v }
 		    pub func set(self: heap::*Self, v: u32) { self.v = v; }

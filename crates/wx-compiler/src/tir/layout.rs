@@ -34,7 +34,7 @@ use hashbrown::HashTable;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use super::bounds::AssumptionEnvIdx;
-use super::decls::{FieldOrder, StructIdx};
+use super::decls::{FieldIdx, FieldOrder, StructIdx};
 use super::signatures::Semantics;
 use super::solver::{
 	NormalizationDepth, RewriteFlags, SolverError, metadata_len,
@@ -380,6 +380,26 @@ impl Semantics {
 			Some(Piece::Aggregate(index)) => Some(index),
 			_ => None,
 		})
+	}
+
+	/// The byte offset of `field` in a value of `ty`, normalized: a struct's,
+	/// a tuple's or an enum's field. `None` when `ty` has no layout (an
+	/// aggregate left unsized by a slice).
+	pub(super) fn field_offset(
+		&mut self,
+		strings: &StringInterner,
+		assumption_context: AssumptionEnvIdx,
+		ty: TypeIndex,
+		field: FieldIdx,
+	) -> Result<Option<u32>, SolverError> {
+		// An enum is laid out as its repr, its one field.
+		if let Type::Enum { .. } = *self.types.resolve(ty) {
+			return Ok(Some(0));
+		}
+		let layout = self.aggregate_layout(strings, assumption_context, ty)?;
+		Ok(layout.map(|index| {
+			self.solver.layouts.field_offsets(index)[usize::from(field)]
+		}))
 	}
 
 	/// `visiting` holds the aggregates being laid out, normalized: reaching

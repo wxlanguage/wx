@@ -3753,7 +3753,7 @@ mod tests {
 
 		fn render_place(&self, body: &Body, place: PlaceIdx) -> String {
 			match body.place(place).kind {
-				PlaceKind::Deref { pointer } => {
+				PlaceKind::Deref { pointer, .. } => {
 					format!("(* {})", self.render(body, pointer))
 				}
 				PlaceKind::Field { object, field } => format!(
@@ -4879,8 +4879,8 @@ mod tests {
 	#[test]
 	fn a_field_of_a_value_is_read_and_written_through_its_root() {
 		let case = TestCase::new(indoc! {"
-				struct Inner(v: u8);
-				struct Outer(inner: Inner, n: u32);
+				struct Inner(mut v: u8);
+				struct Outer(mut inner: Inner, mut n: u32);
 				struct Wrap<T>(value: T);
 				func read(o: Outer) -> u8 { o.inner.v }
 				func generic(w: Wrap<u16>) -> u16 { w.value }
@@ -4897,6 +4897,43 @@ mod tests {
 		assert_eq!(
 			case.shape("write"),
 			"(block (local p#1 o#0) (= (. (. p#1 inner) v) 1) (+= (. p#1 n) 1))"
+		);
+	}
+
+	#[test]
+	fn a_write_in_place_needs_mut_on_every_field_it_changes() {
+		let case = TestCase::new(indoc! {"
+				memory heap: u32;
+				struct Inner(mut value: u32, id: u32);
+				struct Outer(mut inner: Inner, fixed: Inner, ptr: heap::*Inner);
+				func local_fields(mut o: Outer) {
+					o.inner.value = 1;
+					o.inner.id = 2;
+					o.fixed.value += 3;
+				}
+				func through_pointers(o: Outer, p: heap::*Outer) {
+					o.ptr.value = 1;
+					p.inner.value = 2;
+					p.fixed.value = 3;
+				}
+				func whole_values(mut i: Inner, mut o: Outer, p: heap::*Inner) {
+					i = Inner(1, 2);
+					o.inner = Inner(3, 4);
+					p.* = Inner(5, 6);
+				}
+			"});
+		let errors: Vec<_> = case
+			.diagnostics()
+			.errors()
+			.map(|error| error.message.as_str())
+			.collect();
+		assert_eq!(
+			errors,
+			[
+				"cannot assign to immutable field `id` of struct `Inner`",
+				"cannot assign to immutable field `fixed` of struct `Outer`",
+				"cannot assign to immutable field `fixed` of struct `Outer`",
+			]
 		);
 	}
 
@@ -4929,7 +4966,7 @@ mod tests {
 	fn a_place_in_memory_is_read_written_and_addressed() {
 		let case = TestCase::new(indoc! {"
 				memory heap: u32;
-				struct Node(value: u32, next: heap::*Node);
+				struct Node(mut value: u32, next: heap::*Node);
 				func read(p: heap::&Node) -> u32 { p.*.value }
 				func write(p: heap::*Node) { p.* = Node(1, p); p.*.value += 2; }
 				func value_address(p: heap::*Node) -> heap::&u32 { p.*.value.& }
@@ -7455,24 +7492,37 @@ mod tests {
 
 	#[test]
 	fn an_enums_repr_is_never_written() {
-		// It is a value even of a `mut` local: changing it is assigning a
-		// variant, and it has no address.
+		// A repr is a field that is never `mut`: changing it is assigning a
+		// variant. Through a pointer it is a place, read and addressed as a
+		// struct's field is.
 		let case = TestCase::new(indoc! {"
+				memory heap: u32;
 				enum Signal(number: i32) { Hangup = 1, Interrupt = 2 }
-				func f(mut s: Signal) {
+				func f(mut s: Signal, p: heap::*Signal) -> i32 {
 					s.number = 2;
-					s.number += 1;
-					local p = s.number.&;
+					p.number += 1;
+					local r: heap::&i32 = p.number.&;
 					s = Signal::Interrupt;
+					p.* = s;
+					r.*
 				}
 		"});
+		let errors: Vec<_> = case
+			.diagnostics()
+			.errors()
+			.map(|error| error.message.as_str())
+			.collect();
+		assert_eq!(
+			errors,
+			[
+				"cannot assign to immutable field `number` of enum `Signal`",
+				"cannot assign to immutable field `number` of enum `Signal`",
+			]
+		);
 		case.diagnostics().assert_codes(&[
-			DiagnosticCode::InvalidAssignmentTarget,
-			DiagnosticCode::InvalidAssignmentTarget,
-			DiagnosticCode::InvalidAssignmentTarget,
+			DiagnosticCode::CannotMutateImmutable,
+			DiagnosticCode::CannotMutateImmutable,
 		]);
-		case.diagnostics()
-			.assert_error_saying("cannot assign to the repr of enum `Signal`");
 	}
 
 	#[test]
@@ -8602,7 +8652,7 @@ mod tests {
 	fn an_array_place_is_indexed_in_place() {
 		let case = TestCase::new(indoc! {"
 				memory heap: u32;
-				struct Header(len: u32, data: [u8; 4]);
+				struct Header(len: u32, mut data: [u8; 4]);
 				func f(h: heap::*Header, s: heap::&[u8], m: heap::&[[u8; 2]]) {
 					h.data[1] = 5;
 					local a: u8 = s.*[0];
@@ -8736,7 +8786,7 @@ mod tests {
 	fn a_field_is_reached_through_one_pointer() {
 		let case = TestCase::new(indoc! {"
 				memory heap: u32;
-				struct P(x: u32, next: heap::&P);
+				struct P(mut x: u32, next: heap::&P);
 				func f(p: heap::*P) {
 					local x: u32 = p.x;
 					p.x = 3;
@@ -8762,7 +8812,7 @@ mod tests {
 	fn a_field_through_a_pointer_is_a_place() {
 		let case = TestCase::new(indoc! {"
 				memory heap: u32;
-				struct P(x: u32, next: heap::&P);
+				struct P(mut x: u32, next: heap::&P);
 				func f(p: heap::*P, s: heap::&[heap::&P], v: heap::&[P]) {
 					p.x += 1;
 					local r: heap::&u32 = p.x.&;
@@ -8787,7 +8837,7 @@ mod tests {
 	fn a_field_through_a_shared_pointer_is_read_only() {
 		let case = TestCase::new(indoc! {"
 				memory heap: u32;
-				struct P(x: u32);
+				struct P(mut x: u32);
 				func f(p: heap::&P) { p.x = 1; }
 			"});
 		case.diagnostics()

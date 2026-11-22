@@ -15,6 +15,7 @@ use wx_compiler::symbols::StringInterner;
 use wx_compiler::tir::Semantics;
 use wx_compiler::vfs::{CompilationUnit, FileId, PackageId};
 
+mod fields;
 mod unused;
 
 #[cfg(test)]
@@ -26,7 +27,8 @@ mod tests;
 pub enum Lint {
 	/// A local never read.
 	UnusedVariable,
-	/// `mut` on a local never assigned.
+	/// `mut` on a local never assigned, or on a field never written in
+	/// place.
 	UnnecessaryMutability,
 	/// A label no jump names.
 	UnusedLabel,
@@ -129,5 +131,14 @@ pub fn lint(
 	}
 	let mut diagnostics = Vec::new();
 	unused::report_unused(&mut diagnostics, config, sema, strings, package);
+	if let Some(severity) = config.severity(Lint::UnnecessaryMutability) {
+		fields::report_unnecessary_field_mut(
+			&mut diagnostics,
+			severity,
+			sema,
+			strings,
+			package,
+		);
+	}
 	diagnostics
 }

@@ -1234,7 +1234,8 @@ pub enum Item {
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
 pub struct StructField {
 	pub pub_at: Option<TextOffset>,
-	/// A binding's `mut` is parsed; what it allows is not checked yet.
+	/// Its `mut` lets a write change the field in place; an enum's repr
+	/// rejects it.
 	pub binding: Binding,
 	/// `None` when none is written, which a signature reports.
 	pub ty: Option<TypeId>,

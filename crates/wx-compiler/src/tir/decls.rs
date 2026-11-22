@@ -623,6 +623,9 @@ pub struct FieldArena {
 	/// for a missing one, which is never read, since `names` already says
 	/// it has none.
 	name_spans: Vec<TextSpan>,
+	/// Each field's `mut`: it may be written in place after the value is
+	/// built. Without it, only a whole new value replaces it.
+	mut_spans: Vec<Option<TextSpan>>,
 }
 
 impl FieldArena {
@@ -651,6 +654,15 @@ impl FieldArena {
 		self.name_spans[fields.range()][usize::from(field)]
 	}
 
+	/// Where the field's `mut` is written, if it is.
+	pub fn mut_span(
+		&self,
+		fields: FieldRange,
+		field: FieldIdx,
+	) -> Option<TextSpan> {
+		self.mut_spans[fields.range()][usize::from(field)]
+	}
+
 	/// `field`, written at `span`.
 	fn push(&mut self, field: &ast::StructField, span: TextSpan) {
 		let name = (!field.binding.is_missing()).then_some(field.binding.name);
@@ -661,6 +673,8 @@ impl FieldArena {
 				name.span
 			}),
 		);
+		self.mut_spans
+			.push(field.binding.mut_at.map(|at| Keyword::Mut.span_at(at)));
 	}
 
 	/// The field named `name`: its first occurrence, as a duplicate is

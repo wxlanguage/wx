@@ -132,8 +132,8 @@ fn only_a_write_into_its_own_storage_needs_mut() {
 	// it holds, by a field step or an index, writes memory and reads it.
 	let source = indoc! {"
 		memory heap: u32;
-		struct Inner(value: u32);
-		struct Outer(inner: Inner, pointer: heap::*Inner);
+		struct Inner(mut value: u32);
+		struct Outer(mut inner: Inner, pointer: heap::*Inner);
 		func f(
 			mut owned: Outer,
 			mut holder: Outer,
@@ -167,6 +167,44 @@ fn only_a_write_into_its_own_storage_needs_mut() {
 			source.find("mut pointer").unwrap(),
 			source.find("mut slice").unwrap(),
 		]
+	);
+}
+
+#[test]
+fn mut_on_a_private_field_never_written_in_place_is_reported() {
+	// `chain` and `pointed` are written in place, through a local and through
+	// a pointer. A `Pair` is only replaced as a whole value, which writes none
+	// of its fields; `unused` is not written at all. A public field may be
+	// written by another package.
+	let source = indoc! {"
+		memory heap: u32;
+		struct Inner(mut pointed: u32, mut chain: u32);
+		struct Pair(mut first: u32, mut second: u32);
+		struct Outer(mut inner: Inner, mut unused: u32, pub mut open: u32);
+		func f(mut o: Outer, p: heap::*Inner, q: heap::*Pair) -> u32 {
+			o.inner.chain = 1;
+			p.pointed += 2;
+			local mut pair = Pair(3, 4);
+			pair = Pair(5, 6);
+			q.* = pair;
+			o.inner.chain + o.unused + o.open
+		}
+	"};
+	let reported: Vec<_> = lint_with(source, LintConfig::default())
+		.iter()
+		.map(|diagnostic| {
+			(diagnostic.message.clone(), diagnostic.labels[0].range.start)
+		})
+		.collect();
+	let expected = |field: &str| {
+		(
+			format!("field `{field}` does not need to be mutable"),
+			source.find(&format!("mut {field}")).unwrap(),
+		)
+	};
+	assert_eq!(
+		reported,
+		[expected("first"), expected("second"), expected("unused")]
 	);
 }
 

@@ -12,7 +12,7 @@ use wx_compiler::tir::{
 	AssocTypeIdx, Body, BodyOwner, ConstIdx, ConstScalar, DeclKind, Definition,
 	FieldIdx, FieldOwner, FunctionIdx, GenericEnvIdx, GenericEnvOwner,
 	MemberKind, MemberOwner, Reference, ScopeIdx, Semantics, StructIdx,
-	TargetIdx, Type, TypeIndex, TypesetIdx, Val,
+	TargetIdx, Type, TypeIndex, TypesetIdx, Val, Visibility,
 };
 use wx_compiler::vfs::{FileId, Files};
 
@@ -561,12 +561,13 @@ impl Renderer<'_> {
 		let types = self.sema.types.list(signature.field_types);
 		let fields: Vec<_> = types
 			.iter()
-			.zip(self.sema.decls.fields.names(decl.fields))
-			.map(|(ty, name)| match name {
-				Some(name) => {
-					format!("{}: {}", self.symbol(*name), self.ty(*ty))
-				}
-				None => self.ty(*ty),
+			.enumerate()
+			.map(|(at, &ty)| {
+				self.field_declaration(
+					FieldOwner::Struct(index),
+					FieldIdx::new(at as u32),
+					ty,
+				)
 			})
 			.collect();
 		format!(
@@ -582,11 +583,13 @@ impl Renderer<'_> {
 		let signature = &self.sema.enums[usize::from(index)];
 		// The repr as its field is written, `value: u8`; a wider repr is not
 		// supported, so its first field is all there is.
-		let repr = match self.sema.decls.fields.names(decl.fields).first() {
-			Some(Some(name)) => {
-				format!("{}: {}", self.symbol(*name), self.ty(signature.repr))
-			}
-			_ => self.ty(signature.repr),
+		let repr = match decl.fields.is_empty() {
+			true => self.ty(signature.repr),
+			false => self.field_declaration(
+				FieldOwner::Enum(index),
+				FieldIdx::new(0),
+				signature.repr,
+			),
 		};
 		format!(
 			"enum {}({repr}) {{ .. }}",
@@ -640,15 +643,36 @@ impl Renderer<'_> {
 				self.sema.enums[usize::from(index)].field_types
 			}
 		};
-		let ty = self.sema.types.list(types).get(usize::from(field))?;
-		let name = self
-			.sema
+		let ty = *self.sema.types.list(types).get(usize::from(field))?;
+		self.sema
 			.decls
 			.fields
-			.names(owner.fields(&self.sema.decls))
-			.get(usize::from(field))
-			.copied()??;
-		Some(format!("{}: {}", self.symbol(name), self.ty(*ty)))
+			.name(owner.fields(&self.sema.decls), field)?;
+		Some(self.field_declaration(owner, field, ty))
+	}
+
+	/// A field as it is declared, `pub mut name: Type`; its type alone when
+	/// it has no name.
+	fn field_declaration(
+		&self,
+		owner: FieldOwner,
+		field: FieldIdx,
+		ty: TypeIndex,
+	) -> String {
+		let fields = owner.fields(&self.sema.decls);
+		let arena = &self.sema.decls.fields;
+		let Some(name) = arena.name(fields, field) else {
+			return self.ty(ty);
+		};
+		let public = match arena.visibility(fields)[usize::from(field)] {
+			Visibility::Public => "pub ",
+			Visibility::Private => "",
+		};
+		let mutable = match arena.mut_span(fields, field) {
+			Some(_) => "mut ",
+			None => "",
+		};
+		format!("{public}{mutable}{}: {}", self.symbol(name), self.ty(ty))
 	}
 
 	fn parameter(

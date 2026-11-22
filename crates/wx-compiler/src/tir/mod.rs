@@ -30,14 +30,15 @@ use crate::vfs::CompilationUnit;
 
 pub use self::body::{
 	Body, BodyOwner, Call, ExprIdx, ExprKind, JumpTarget, Local, LocalIdx,
-	Operand, ParamIdx, PlaceIdx, ScopeIdx, TargetIdx, TargetKind,
+	Operand, ParamIdx, Place, PlaceIdx, PlaceKind, ScopeIdx, TargetIdx,
+	TargetKind,
 };
 use self::decls::Declarations;
 pub use self::decls::{
 	AssocTypeIdx, ConstIdx, DeclKind, Declared, EnumIdx, FieldIdx, FieldOwner,
 	FunctionIdx, GlobalIdx, InherentImplIdx, ItemLoc, MemberKind, MemberOwner,
 	MemoryIdx, NameUse, StructIdx, Tier, TraitIdx, TraitImplIdx, TypeAliasIdx,
-	TypeRole, TypesetIdx, UseItemIndex,
+	TypeRole, TypesetIdx, UseItemIndex, Visibility,
 };
 pub use self::eval::{AllocIdx, ConstScalar, Val};
 pub use self::format::{BoundFormatter, TypeFormatter};

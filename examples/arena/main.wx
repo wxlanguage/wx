@@ -74,7 +74,7 @@ trait IntoIterator {
     func into_iter(self: Self) -> Self::IntoIter;
 }
 
-struct BumpAllocator(next: RawPtr<heap, u8>);
+struct BumpAllocator(mut next: RawPtr<heap, u8>);
 
 impl BumpAllocator {
     pub func from_addr(start: u32) -> Self {

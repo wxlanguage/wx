@@ -77,7 +77,7 @@ impl Lowerer<'_> {
 	) -> Result<Address, ()> {
 		let data = *body.place(place);
 		match data.kind {
-			PlaceKind::Deref { pointer } => {
+			PlaceKind::Deref { pointer, .. } => {
 				let pointer = self.lower_expr(body, state, pointer)?;
 				let memory =
 					self.substitute(data.memory, state.env, &state.args);
@@ -94,12 +94,13 @@ impl Lowerer<'_> {
 					self.substitute(object_ty, state.env, &state.args);
 				let object_ty =
 					self.normalize_type(object_ty, state.file_id, data.span)?;
-				let layout = match self.sema.aggregate_layout(
+				let offset = match self.sema.field_offset(
 					self.strings,
 					AssumptionEnvIdx::ROOT,
 					object_ty,
+					field,
 				) {
-					Ok(Some(layout)) => layout,
+					Ok(Some(offset)) => offset,
 					// A slice as the last field leaves the aggregate unsized.
 					Ok(None) => {
 						self.unsupported(
@@ -113,8 +114,6 @@ impl Lowerer<'_> {
 					// Checking reported a failure on this type.
 					Err(_) => return Err(()),
 				};
-				let offset = self.sema.solver.layouts.field_offsets(layout)
-					[usize::from(field)];
 				Ok(Address {
 					offset: address.offset + offset,
 					..address
@@ -171,7 +170,7 @@ impl Lowerer<'_> {
 		let is_slice =
 			matches!(self.sema.types.resolve(sequence_ty), Type::Slice { .. });
 		let (pointer, offset) = match sequence.kind {
-			PlaceKind::Deref { pointer } if is_slice => {
+			PlaceKind::Deref { pointer, .. } if is_slice => {
 				(self.lower_expr(body, state, pointer)?, 0)
 			}
 			_ if is_slice => {

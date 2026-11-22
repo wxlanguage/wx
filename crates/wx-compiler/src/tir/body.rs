@@ -30,7 +30,9 @@ use super::numbers::DecimalFloat;
 use super::obligations::TypeObligation;
 use super::signatures::Semantics;
 use super::types::{GenericArgs, TypeIndex};
-use crate::ast::{self, AST, BinaryOp, ExprId, Expression, Spanned, UnaryOp};
+use crate::ast::{
+	self, AST, BinaryOp, ExprId, Expression, Ownership, Spanned, UnaryOp,
+};
 use crate::diagnostics::{TextOffset, TextSpan};
 use crate::index::index_newtype;
 use crate::symbols::Keyword;
@@ -587,32 +589,33 @@ pub struct Local {
 }
 
 /// A location in linear memory. Every place is reached through a pointer, so
-/// the memory it is in and whether it may be written are known when it is
-/// built, from that pointer's type.
+/// the memory it is in is known when it is built, from that pointer's type.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) struct Place {
-	pub(super) kind: PlaceKind,
+pub struct Place {
+	pub kind: PlaceKind,
 	/// The type of the value stored there.
-	pub(super) ty: TypeIndex,
+	pub ty: TypeIndex,
 	/// The `Type::Memory` it is in.
-	pub(super) memory: TypeIndex,
-	/// Reached through an exclusive pointer (`*T`), so it may be written.
-	pub(super) mutable: bool,
-	pub(super) span: TextSpan,
+	pub memory: TypeIndex,
+	pub span: TextSpan,
 }
 
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug))]
-pub(super) enum PlaceKind {
-	/// `pointer.*`, the only way into linear memory.
-	Deref { pointer: ExprIdx },
-	/// `place.field`; in the same memory as `object`, and as writable. The
-	/// field is its declared index.
+pub enum PlaceKind {
+	/// `pointer.*`, the only way into linear memory, with the pointer's
+	/// ownership: only through an exclusive one (`*T`) may it be written.
+	Deref {
+		pointer: ExprIdx,
+		ownership: Ownership,
+	},
+	/// `place.field`; in the same memory as `object`. The field is its
+	/// declared index.
 	Field { object: PlaceIdx, field: FieldIdx },
 	/// `place[index]`, an element of the slice or array `object`; in its
-	/// memory, and as writable. The index is the memory's `Size`, checked
-	/// against the length when it is read.
+	/// memory. The index is the memory's `Size`, checked against the length
+	/// when it is read.
 	Element { object: PlaceIdx, index: ExprIdx },
 }
 
@@ -742,7 +745,7 @@ impl Body {
 		&self.kinds
 	}
 
-	pub(super) fn ty(&self, expr: ExprIdx) -> TypeIndex {
+	pub fn ty(&self, expr: ExprIdx) -> TypeIndex {
 		self.types[usize::from(expr)]
 	}
 
@@ -1042,7 +1045,7 @@ impl Body {
 		}
 	}
 
-	pub(super) fn place(&self, place: PlaceIdx) -> &Place {
+	pub fn place(&self, place: PlaceIdx) -> &Place {
 		&self.places[usize::from(place)]
 	}
 

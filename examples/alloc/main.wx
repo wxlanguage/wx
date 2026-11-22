@@ -20,7 +20,7 @@
 ///
 /// The state is the `next` free address. `Mem` itself is zero-sized, so the
 /// header is one pointer wide in `Mem`'s address space.
-pub struct BumpAllocator<Mem: Memory>(mem: Mem, next: RawPtr<Mem, u8>);
+pub struct BumpAllocator<Mem: Memory>(mem: Mem, mut next: RawPtr<Mem, u8>);
 
 impl<Mem: Memory> BumpAllocator<Mem> {
     /// Creates an allocator whose first allocation starts at `start`.
