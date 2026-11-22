@@ -6,6 +6,7 @@
 // use super::*;
 
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use std::ops::Range;
 
 use codespan_reporting::diagnostic::Diagnostic;
@@ -15,7 +16,6 @@ use crate::{
 	ast::{self, Keyword, Spanned, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextOffset, TextSpan},
 	index::index_newtype,
-	small_vec::SmallVec,
 	tir::{
 		body::BodyOwner,
 		imports::ImportResolver,
@@ -68,7 +68,7 @@ struct DeclarationsBuilder<'ast, 'ctx> {
 	intrinsics: IntrinsicDefs,
 	// Keyed by local (alias-or-original) name, not the name as written at the `use` site.
 	pending_named_imports:
-		FxHashMap<(Scope, SymbolU32), SmallVec<UseItemIndex>>,
+		FxHashMap<(Scope, SymbolU32), SmallVec<[UseItemIndex; 1]>>,
 	/// Every glob `use` item — `pub` or not — grouped by the namespace it's
 	/// *declared* in — no name dimension, unlike `pending_named_imports`,
 	/// since a glob doesn't claim one. Lets glob resolution find "what does
@@ -79,7 +79,7 @@ struct DeclarationsBuilder<'ast, 'ctx> {
 	/// lookup time includes private edges just as much as `pub` ones, so
 	/// cycle detection has to see the whole graph, not just its `pub`
 	/// subset.
-	pending_glob_targets: FxHashMap<Scope, SmallVec<UseItemIndex>>,
+	pending_glob_targets: FxHashMap<Scope, SmallVec<[UseItemIndex; 1]>>,
 }
 
 index_newtype!(UsePathIndex);
@@ -5284,8 +5284,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				});
 				self.pending_named_imports
 					.entry((namespace, local_name))
-					.and_modify(|items| items.push(item_index))
-					.or_insert_with(|| SmallVec::new(item_index));
+					.or_default()
+					.push(item_index);
 			}
 			ast::UseTree::Glob { segment } => {
 				let path = self.push_use_path(UsePathSegment {
@@ -5302,8 +5302,8 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				});
 				self.pending_glob_targets
 					.entry(namespace)
-					.and_modify(|items| items.push(item_index))
-					.or_insert_with(|| SmallVec::new(item_index));
+					.or_default()
+					.push(item_index);
 			}
 			ast::UseTree::Path { segment, rest } => {
 				let path = self.push_use_path(UsePathSegment {

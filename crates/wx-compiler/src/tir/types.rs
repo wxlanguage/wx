@@ -176,6 +176,11 @@ impl Primitive {
 	}
 }
 
+/// An impl's arguments while one match or proof uses them. Impl chains
+/// rarely have more than two parameters, and four inline make it no larger
+/// than a `Vec` (with `smallvec`'s `union` layout).
+pub(super) type ImplArgs = smallvec::SmallVec<[TypeIndex; 4]>;
+
 /// A list of types inside a `Type`: a run of `TypeInterner::lists`. Not
 /// interned on its own; the type holding it is, by the list's contents, so
 /// equal types still share one `TypeIndex`. Built only by the interner.
@@ -546,9 +551,27 @@ impl TypeInterner {
 		envs: &GenericEnvArena,
 		env: GenericEnvIdx,
 	) -> Option<Box<[TypeIndex]>> {
-		let mut args = vec![None; envs.generic_count(env)];
-		self.match_pattern(pattern, actual, envs, env, &mut args)?;
-		args.into_iter().collect::<Option<Box<[TypeIndex]>>>()
+		let mut args =
+			vec![TypeIndex::INFER; envs.generic_count(env)].into_boxed_slice();
+		self.match_impl_target_into(pattern, actual, envs, env, &mut args)
+			.then_some(args)
+	}
+
+	/// `match_impl_target` into `args`, the chain's flat argument list, each
+	/// slot `INFER` until the target fills it. A hole is never filled with
+	/// `INFER`: a receiver that is not known yet matches nothing.
+	pub(super) fn match_impl_target_into(
+		&self,
+		pattern: TypeIndex,
+		actual: TypeIndex,
+		envs: &GenericEnvArena,
+		env: GenericEnvIdx,
+		args: &mut [TypeIndex],
+	) -> bool {
+		debug_assert!(args.iter().all(|&arg| arg == TypeIndex::INFER));
+		self.match_pattern(pattern, actual, envs, env, args)
+			.is_some()
+			&& !args.contains(&TypeIndex::INFER)
 	}
 
 	fn match_pattern(
@@ -557,7 +580,7 @@ impl TypeInterner {
 		actual: TypeIndex,
 		envs: &GenericEnvArena,
 		env: GenericEnvIdx,
-		args: &mut [Option<TypeIndex>],
+		args: &mut [TypeIndex],
 	) -> Option<()> {
 		let (expected, found) = (self.resolve(pattern), self.resolve(actual));
 		if matches!(expected, Type::Error | Type::Infer)
@@ -575,13 +598,11 @@ impl TypeInterner {
 			) => match envs.flat_slot(env, *owner, *param_index) {
 				Some(slot) => {
 					let slot = args.get_mut(slot)?;
-					match slot {
-						Some(previous) if *previous != actual => None,
-						Some(_) => Some(()),
-						None => {
-							*slot = Some(actual);
-							Some(())
-						}
+					if *slot == TypeIndex::INFER {
+						*slot = actual;
+						Some(())
+					} else {
+						(*slot == actual).then_some(())
 					}
 				}
 				None => (pattern == actual).then_some(()),
@@ -704,7 +725,7 @@ impl TypeInterner {
 		found: &[TypeIndex],
 		envs: &GenericEnvArena,
 		env: GenericEnvIdx,
-		args: &mut [Option<TypeIndex>],
+		args: &mut [TypeIndex],
 	) -> Option<()> {
 		if expected.len() != found.len() {
 			return None;

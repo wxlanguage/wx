@@ -12,9 +12,9 @@ use string_interner::symbol::SymbolU32;
 
 use crate::ast::{self, Ownership, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
-use crate::small_vec::SmallVec;
 use crate::symbols::Keyword;
 use crate::vfs::FileId;
+use smallvec::SmallVec;
 
 use super::body::BodyOwner;
 use super::bounds::{AssumptionEnvIdx, Readiness, report_not_a_binding_member};
@@ -98,6 +98,9 @@ impl TypeProjectionTarget {
 		})
 	}
 }
+
+/// The members a lookup found; more than one is ambiguous.
+type Candidates = SmallVec<[ApplicableMember; 1]>;
 
 /// A member found through impl dispatch or trait bounds. Trait candidates
 /// retain the declaration; a concrete impl can provide a different definition.
@@ -247,10 +250,7 @@ pub(super) enum TraitImplLookup {
 	/// Concrete receiver, with a registered `impl required_trait for
 	/// receiver` (`impls.rs`'s dispatch) — `TraitImplIdx` names it, in
 	/// case it overrides the member being looked up.
-	Concrete {
-		impl_index: TraitImplIdx,
-		args: Box<[TypeIndex]>,
-	},
+	Concrete { impl_index: TraitImplIdx },
 	/// Membership supplied by the caller's assumptions, including evidence
 	/// on an equivalent subject. No concrete provider was selected; dispatch
 	/// remains symbolic until instantiation.
@@ -315,10 +315,7 @@ impl Semantics {
 				receiver,
 				trait_index,
 			)? {
-				Some(TraitImplLookup::Concrete {
-					impl_index,
-					args: impl_args,
-				}) => {
+				Some(TraitImplLookup::Concrete { impl_index }) => {
 					// A function item's `impl Call` is the compiler's: it
 					// declares `Args` and `Result`, and the call runs the item.
 					if let Type::Function {
@@ -340,7 +337,13 @@ impl Semantics {
 							MemberKind::Function(own) | MemberKind::Method(own),
 						) => ResolvedFunction::Instance {
 							function: own,
-							args: impl_args
+							args: self
+								.trait_impl_args(
+									strings,
+									AssumptionEnvIdx::ROOT,
+									impl_index,
+									receiver,
+								)
 								.iter()
 								.chain(&args[1..])
 								.copied()
@@ -722,18 +725,15 @@ impl Semantics {
 		target: ImplTarget,
 		key: BindingKey,
 	) -> MemberLookup {
-		// Only a candidate that declares this name can affect precedence.
-		let declaring: Vec<_> = self
-			.impl_dispatch
-			.inherent_candidates(target)
-			.iter()
-			.filter_map(|&index| {
-				let impl_decl = &self.decls.inherent_impls[usize::from(index)];
-				let &member_index = impl_decl.bindings.get(&key)?;
-				Some((index, impl_decl.members[usize::from(member_index)].kind))
-			})
-			.collect();
-		for (index, kind) in declaring {
+		// Only a candidate that declares this name can affect precedence. The
+		// dispatch is fixed before bodies, so each is read in place.
+		for at in 0..self.impl_dispatch.inherent_candidates(target).len() {
+			let index = self.impl_dispatch.inherent_candidates(target)[at];
+			let impl_decl = &self.decls.inherent_impls[usize::from(index)];
+			let Some(&member_index) = impl_decl.bindings.get(&key) else {
+				continue;
+			};
+			let kind = impl_decl.members[usize::from(member_index)].kind;
 			match self.match_inherent_impl_target_query(
 				strings,
 				assumption_context,
@@ -753,7 +753,7 @@ impl Semantics {
 		// Only impls and the compiler's rules give a concrete receiver a
 		// trait, so no assumption in scope can add a candidate
 		// (`Solver::find_trait_impl_query`).
-		let mut traits = Vec::new();
+		let mut traits = SmallVec::<[TraitIdx; 1]>::new();
 		for trait_index in self.trait_candidates(target) {
 			if self.decls.declared_trait_member(trait_index, key).is_some() {
 				traits.push(trait_index);
@@ -800,10 +800,10 @@ impl Semantics {
 		assumption_context: AssumptionEnvIdx,
 		receiver: TypeIndex,
 		key: BindingKey,
-		traits: Vec<TraitIdx>,
+		traits: impl IntoIterator<Item = TraitIdx>,
 		mut readiness: Readiness,
 	) -> MemberLookup {
-		let mut candidates: Option<SmallVec<ApplicableMember>> = None;
+		let mut candidates = Candidates::new();
 		for trait_index in traits {
 			let Some(declaration) =
 				self.decls.declared_trait_member(trait_index, key)
@@ -817,25 +817,19 @@ impl Semantics {
 				trait_index,
 			) {
 				Ok(Some(TraitImplLookup::Concrete { impl_index, .. })) => {
-					Self::push_candidate(
-						&mut candidates,
-						ApplicableMember::TraitImplMember {
-							trait_index,
-							impl_index,
-							declaration,
-						},
-					);
+					candidates.push(ApplicableMember::TraitImplMember {
+						trait_index,
+						impl_index,
+						declaration,
+					});
 				}
 				Ok(Some(
 					TraitImplLookup::Abstract | TraitImplLookup::Builtin,
 				)) => {
-					Self::push_candidate(
-						&mut candidates,
-						ApplicableMember::AbstractTraitMember {
-							trait_index,
-							declaration,
-						},
-					);
+					candidates.push(ApplicableMember::AbstractTraitMember {
+						trait_index,
+						declaration,
+					});
 				}
 				Ok(None) => {}
 				Err(SolverError::Pending) => {
@@ -846,9 +840,7 @@ impl Semantics {
 		}
 		// Two known declarations already establish ambiguity. Otherwise pending
 		// discovery or applicability could change a unique or absent answer.
-		if !matches!(candidates, Some(SmallVec::Many(_)))
-			&& readiness == Readiness::Pending
-		{
+		if candidates.len() < 2 && readiness == Readiness::Pending {
 			MemberLookup::Pending
 		} else {
 			Self::classify(candidates)
@@ -861,51 +853,34 @@ impl Semantics {
 		traits: impl IntoIterator<Item = TraitIdx>,
 		key: BindingKey,
 	) -> MemberLookup {
-		let mut candidates: Option<SmallVec<ApplicableMember>> = None;
+		let mut candidates = Candidates::new();
 		for trait_index in traits {
 			// The same trait can be supplied by a declaration and a nested
 			// receiver constraint; that does not make its member ambiguous.
-			if candidates.as_ref().is_some_and(|items| {
-				items.into_iter().any(|candidate| {
-					matches!(candidate, ApplicableMember::AbstractTraitMember { trait_index: index, .. } if index == trait_index)
-				})
+			if candidates.iter().any(|candidate| {
+				matches!(candidate, ApplicableMember::AbstractTraitMember { trait_index: index, .. } if *index == trait_index)
 			}) {
 				continue;
 			}
 			if let Some(declaration) =
 				decls.declared_trait_member(trait_index, key)
 			{
-				Self::push_candidate(
-					&mut candidates,
-					ApplicableMember::AbstractTraitMember {
-						trait_index,
-						declaration,
-					},
-				);
+				candidates.push(ApplicableMember::AbstractTraitMember {
+					trait_index,
+					declaration,
+				});
 			}
 		}
 		Self::classify(candidates)
 	}
 
-	fn push_candidate(
-		candidates: &mut Option<SmallVec<ApplicableMember>>,
-		candidate: ApplicableMember,
-	) {
-		match candidates {
-			Some(items) => items.push(candidate),
-			None => *candidates = Some(SmallVec::new(candidate)),
-		}
-	}
-
-	fn classify(
-		candidates: Option<SmallVec<ApplicableMember>>,
-	) -> MemberLookup {
-		match candidates {
-			None => MemberLookup::NotFound,
-			Some(SmallVec::One(candidate)) => MemberLookup::Found(candidate),
-			Some(SmallVec::Many(candidates)) => {
-				MemberLookup::Ambiguous(candidates.into_boxed_slice())
-			}
+	fn classify(candidates: Candidates) -> MemberLookup {
+		match *candidates {
+			[] => MemberLookup::NotFound,
+			[candidate] => MemberLookup::Found(candidate),
+			_ => MemberLookup::Ambiguous(
+				candidates.into_vec().into_boxed_slice(),
+			),
 		}
 	}
 }
@@ -1721,25 +1696,20 @@ impl<'ast> SemanticsBuilder<'ast> {
 				}
 			}
 		}
-		let mut candidates: Option<SmallVec<ApplicableMember>> = None;
+		let mut candidates = Candidates::new();
 		for trait_index in traits {
 			let declaration = sema
 				.decls
 				.declared_trait_member(trait_index, key)
 				.expect("candidate traits declare the member");
-			Semantics::push_candidate(
-				&mut candidates,
-				ApplicableMember::AbstractTraitMember {
-					trait_index,
-					declaration,
-				},
-			);
+			candidates.push(ApplicableMember::AbstractTraitMember {
+				trait_index,
+				declaration,
+			});
 		}
 		// Two known declarations already establish ambiguity. Otherwise unfinished
 		// discovery could still change a unique or absent answer.
-		if !matches!(candidates, Some(SmallVec::Many(_)))
-			&& readiness == Readiness::Pending
-		{
+		if candidates.len() < 2 && readiness == Readiness::Pending {
 			MemberLookup::Pending
 		} else {
 			Semantics::classify(candidates)

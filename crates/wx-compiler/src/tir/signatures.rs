@@ -67,8 +67,8 @@ use super::solver::{
 };
 use super::typecheck::{BodyBuilder, BodyContext};
 use super::types::{
-	GenericArgArena, GenericEnvArena, GenericEnvIdx, ImplKind, Substitution,
-	Type, TypeIndex, TypeInterner, TypeList,
+	GenericArgArena, GenericEnvArena, GenericEnvIdx, ImplArgs, ImplKind,
+	Substitution, Type, TypeIndex, TypeInterner, TypeList,
 };
 
 /// One accepted bound occurrence, decided once by
@@ -923,7 +923,6 @@ impl Semantics {
 			header.target.inner,
 			receiver,
 		)
-		.map(|args| args.is_some())
 	}
 
 	/// Whether inherent impl `impl_index`'s target matches `receiver`, its
@@ -948,10 +947,17 @@ impl Semantics {
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
 		)?;
-		Ok(self
-			.types
-			.match_impl_target(target, receiver, &self.generic_envs, impl_env)
-			.is_some())
+		let mut args = ImplArgs::from_elem(
+			TypeIndex::INFER,
+			self.generic_envs.generic_count(impl_env),
+		);
+		Ok(self.types.match_impl_target_into(
+			target,
+			receiver,
+			&self.generic_envs,
+			impl_env,
+			&mut args,
+		))
 	}
 
 	/// A constant's declared type (`ERROR` when missing or unresolved), as
@@ -19287,15 +19293,13 @@ pub(super) mod tests {
 		let swapped = case.sema.types.intern_tuple(&[bool_, i32_]);
 		assert_eq!(
 			case.sema
-				.match_impl_target_and_bounds(
-					&case.strings,
-					AssumptionEnvIdx::ROOT,
-					impl_kind,
-					method,
+				.types
+				.match_impl_target(
 					pair,
 					concrete,
+					&case.sema.generic_envs,
+					method
 				)
-				.unwrap()
 				.as_deref(),
 			Some(&[i32_, bool_][..])
 		);
@@ -19306,9 +19310,20 @@ pub(super) mod tests {
 				impl_kind,
 				method,
 				pair,
+				concrete,
+			),
+			Ok(true)
+		);
+		assert_eq!(
+			case.sema.match_impl_target_and_bounds(
+				&case.strings,
+				AssumptionEnvIdx::ROOT,
+				impl_kind,
+				method,
+				pair,
 				swapped,
 			),
-			Ok(None)
+			Ok(false)
 		);
 	}
 

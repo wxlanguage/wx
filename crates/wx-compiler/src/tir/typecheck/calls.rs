@@ -1295,7 +1295,7 @@ impl BodyBuilder<'_, '_> {
 			)
 		};
 		let callee = match found {
-			Ok(Some(TraitImplLookup::Concrete { impl_index, args })) => {
+			Ok(Some(TraitImplLookup::Concrete { impl_index })) => {
 				match self.sema.decls.select_trait_member(
 					impl_index,
 					MemberKind::Method(declaration),
@@ -1303,7 +1303,15 @@ impl BodyBuilder<'_, '_> {
 					TraitMemberSelection::Impl(
 						MemberKind::Method(function)
 						| MemberKind::Function(function),
-					) => Callee::new(self.sema, function, &args, args.len()),
+					) => {
+						let args = self.sema.trait_impl_args(
+							self.builder.strings,
+							self.scope.assumption_env,
+							impl_index,
+							ty,
+						);
+						Callee::new(self.sema, function, &args, args.len())
+					}
 					_ => over_self(self.sema),
 				}
 			}

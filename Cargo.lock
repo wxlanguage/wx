@@ -2283,6 +2283,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "smallvec",
  "string-interner",
  "wasmprinter 0.252.0",
  "wasmtime",

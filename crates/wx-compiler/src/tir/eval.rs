@@ -1815,19 +1815,24 @@ impl Semantics {
 				receiver,
 				trait_index,
 			)? {
-				Some(TraitImplLookup::Concrete {
-					impl_index,
-					args: impl_args,
-				}) => {
+				Some(TraitImplLookup::Concrete { impl_index }) => {
 					match self.decls.select_trait_member(
 						impl_index,
 						MemberKind::Constant(constant),
 					) {
 						TraitMemberSelection::Impl(MemberKind::Constant(
 							own,
-						)) => ResolvedConstant::Instance(
-							self.instance(own, &impl_args),
-						),
+						)) => {
+							let impl_args = self.trait_impl_args(
+								strings,
+								AssumptionEnvIdx::ROOT,
+								impl_index,
+								receiver,
+							);
+							ResolvedConstant::Instance(
+								self.instance(own, &impl_args),
+							)
+						}
 						_ if Some(constant)
 							== self.decls.intrinsics.memory_data_end
 							&& let Type::Memory { memory_index } =

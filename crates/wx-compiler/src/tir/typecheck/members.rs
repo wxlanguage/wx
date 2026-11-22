@@ -23,8 +23,8 @@ use crate::tir::body::{ExprIdx, ExprKind, Place, PlaceKind};
 use crate::tir::decls::{BindingKey, ConstIdx, DeclKind, MemberKind, TraitIdx};
 use crate::tir::impls::ImplTarget;
 use crate::tir::members::{
-	ApplicableMember, MemberLookup, ReceiverFit, TraitImplLookup,
-	TraitMemberSelection, report_ambiguous_type_member,
+	ApplicableMember, MemberLookup, ReceiverFit, TraitMemberSelection,
+	report_ambiguous_type_member,
 };
 use crate::tir::obligations::BoundRequirements;
 use crate::tir::resolutions::{Reference, Site};
@@ -613,25 +613,21 @@ impl BodyBuilder<'_, '_> {
 				(kind, Some(leading), true)
 			}
 			ApplicableMember::TraitImplMember {
-				trait_index,
 				impl_index,
 				declaration,
+				..
 			} => match self
 				.sema
 				.decls
 				.select_trait_member(impl_index, declaration)
 			{
 				TraitMemberSelection::Impl(kind) => {
-					let Ok(Some(TraitImplLookup::Concrete { args, .. })) =
-						self.sema.find_trait_impl_query(
-							self.builder.strings,
-							self.scope.assumption_env,
-							receiver,
-							trait_index,
-						)
-					else {
-						unreachable!("the lookup selected this impl")
-					};
+					let args = self.sema.trait_impl_args(
+						self.builder.strings,
+						self.scope.assumption_env,
+						impl_index,
+						receiver,
+					);
 					(kind, Some(args), true)
 				}
 				TraitMemberSelection::TraitDeclaration(declaration) => {

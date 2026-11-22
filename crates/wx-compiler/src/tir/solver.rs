@@ -32,8 +32,8 @@ use super::literals::UntypedValue;
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::signatures::Semantics;
 use super::types::{
-	GenericEnvArena, GenericEnvIdx, ImplKind, Substitution, Type, TypeIndex,
-	TypeInterner, TypeList,
+	GenericEnvArena, GenericEnvIdx, ImplArgs, ImplKind, Substitution, Type,
+	TypeIndex, TypeInterner, TypeList,
 };
 
 /// Why the solver (normalization and impl selection, which are one recursive
@@ -1453,9 +1453,15 @@ impl Semantics {
 			return Err(SolverError::Poisoned);
 		};
 		let (impl_index, args) = match found {
-			TraitImplLookup::Concrete { impl_index, args } => {
-				(impl_index, args)
-			}
+			TraitImplLookup::Concrete { impl_index } => (
+				impl_index,
+				self.trait_impl_args(
+					strings,
+					assumption_context,
+					impl_index,
+					base,
+				),
+			),
 			// An abstract impl, or a builtin trait with no rule for this
 			// associated member, supplies no value to reduce further.
 			TraitImplLookup::Abstract | TraitImplLookup::Builtin => {
@@ -1740,7 +1746,7 @@ impl Semantics {
 					impl_index,
 					normalized,
 				)?
-				.map(|args| TraitImplLookup::Concrete { impl_index, args }));
+				.then_some(TraitImplLookup::Concrete { impl_index }));
 		}
 		if normalized != receiver
 			&& self.types.is_param_or_projection(normalized)
@@ -2568,17 +2574,17 @@ impl Semantics {
 		}
 	}
 
-	/// Match an impl header's complete target against `receiver`, then validate
-	/// the arguments against the impl's own parameter bounds. The returned
-	/// arguments belong only to this lookup; no declaration frame is changed.
-	/// Reads the finished header: one still missing is `Pending`.
+	/// Whether an impl header's complete target matches `receiver` with
+	/// arguments that meet the impl's own parameter bounds; no declaration
+	/// frame is changed. Reads the finished header: one still missing is
+	/// `Pending`.
 	pub(super) fn match_trait_impl_candidate_query(
 		&mut self,
 		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		impl_index: TraitImplIdx,
 		receiver: TypeIndex,
-	) -> Result<Option<Box<[TypeIndex]>>, SolverError> {
+	) -> Result<bool, SolverError> {
 		let Some(header) = self.trait_impls[usize::from(impl_index)].as_ref()
 		else {
 			return Err(SolverError::Pending);
@@ -2593,6 +2599,37 @@ impl Semantics {
 		)
 	}
 
+	/// The arguments of trait impl `impl_index` for `receiver`, which
+	/// `find_trait_impl_query` selected it for in `assumption_context`.
+	pub(super) fn trait_impl_args(
+		&mut self,
+		strings: &StringInterner,
+		assumption_context: AssumptionEnvIdx,
+		impl_index: TraitImplIdx,
+		receiver: TypeIndex,
+	) -> Box<[TypeIndex]> {
+		let Ok(receiver) = self.normalize(
+			strings,
+			assumption_context,
+			receiver,
+			NormalizationDepth::Deep,
+			RewriteFlags::ALL,
+		) else {
+			unreachable!("the selection normalized this receiver")
+		};
+		let header = self.trait_impls[usize::from(impl_index)]
+			.as_ref()
+			.expect("a selected impl has a header");
+		self.types
+			.match_impl_target(
+				header.target.inner,
+				receiver,
+				&self.generic_envs,
+				header.type_params,
+			)
+			.expect("the selected impl's target matches the receiver")
+	}
+
 	/// `assumption_context` is the caller's; `impl_env` is the candidate impl's own
 	/// parameter frame (for a synthetic impl, the frame it is generic over). The
 	/// impl's requirements are proved in the caller's assumptions, never the
@@ -2605,7 +2642,7 @@ impl Semantics {
 		impl_env: GenericEnvIdx,
 		target: TypeIndex,
 		receiver: TypeIndex,
-	) -> Result<Option<Box<[TypeIndex]>>, SolverError> {
+	) -> Result<bool, SolverError> {
 		// Structural matching below compares `receiver`'s nested children
 		// against `target`'s pattern directly, with no normalization of its
 		// own (`TypeInterner::match_pattern` is `&self`, with no access to
@@ -2624,14 +2661,20 @@ impl Semantics {
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
 		)?;
-		let Some(args) = self.types.match_impl_target(
+		// The arguments live only while the bounds are proved.
+		let mut args = ImplArgs::from_elem(
+			TypeIndex::INFER,
+			self.generic_envs.generic_count(impl_env),
+		);
+		if !self.types.match_impl_target_into(
 			target,
 			receiver,
 			&self.generic_envs,
 			impl_env,
-		) else {
-			return Ok(None);
-		};
+			&mut args,
+		) {
+			return Ok(false);
+		}
 		// The impl's requirements are a definition, judged once before any
 		// selection relies on them. While they are judged, the impl's own
 		// instantiation is that judgement; any other is proved as usual.
@@ -2642,22 +2685,18 @@ impl Semantics {
 				&& *args == *self.generic_envs.identity_args(impl_env)
 			{
 				self.solver.reenter_requirements(impl_kind)?;
-				return Ok(Some(args));
+				return Ok(true);
 			}
 		} else {
 			self.requirements_verdict(strings, impl_kind)?;
 		}
-		if self.prove_requirements(
+		self.prove_requirements(
 			strings,
 			assumption_context,
 			impl_env,
 			&args,
 			None,
-		)? {
-			Ok(Some(args))
-		} else {
-			Ok(None)
-		}
+		)
 	}
 
 	/// `impl_kind`'s requirements, judged once: proved for its own parameters

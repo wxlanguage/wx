@@ -3,6 +3,7 @@
 //! `use` item/path segment.
 
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use codespan_reporting::diagnostic::Diagnostic;
 use string_interner::symbol::SymbolU32;
@@ -10,7 +11,6 @@ use string_interner::symbol::SymbolU32;
 use crate::{
 	ast::{Spanned, StringInterner},
 	diagnostics::{DiagnosticCode, SourceSpan, TextSpan},
-	small_vec::SmallVec,
 	symbols::Keyword,
 	vfs::FileId,
 };
@@ -137,8 +137,8 @@ pub(super) struct ImportResolver<'r> {
 	use_items: &'r [UseItemDecl],
 	use_paths: &'r [UsePathSegment],
 	pending_named_imports:
-		&'r FxHashMap<(Scope, SymbolU32), SmallVec<UseItemIndex>>,
-	pending_glob_targets: &'r FxHashMap<Scope, SmallVec<UseItemIndex>>,
+		&'r FxHashMap<(Scope, SymbolU32), SmallVec<[UseItemIndex; 1]>>,
+	pending_glob_targets: &'r FxHashMap<Scope, SmallVec<[UseItemIndex; 1]>>,
 
 	path_state: &'r mut [ResolveStatus<Namespace>],
 	item_state: &'r mut [ResolveStatus<()>],
@@ -164,9 +164,9 @@ impl<'r> ImportResolver<'r> {
 		use_paths: &[UsePathSegment],
 		pending_named_imports: &FxHashMap<
 			(Scope, SymbolU32),
-			SmallVec<UseItemIndex>,
+			SmallVec<[UseItemIndex; 1]>,
 		>,
-		pending_glob_targets: &FxHashMap<Scope, SmallVec<UseItemIndex>>,
+		pending_glob_targets: &FxHashMap<Scope, SmallVec<[UseItemIndex; 1]>>,
 	) {
 		let mut path_state = vec![ResolveStatus::Pending; use_paths.len()];
 		let mut item_state = vec![ResolveStatus::Pending; use_items.len()];
@@ -247,7 +247,7 @@ impl<'r> ImportResolver<'r> {
 		// asks (`pub use self::b::*;`), and a cycle through globs is
 		// `compute_glob_import`'s to report.
 		if let Some(globs) = self.pending_glob_targets.get(&scope) {
-			for glob in globs {
+			for &glob in globs {
 				if !matches!(
 					self.item_state[usize::from(glob)],
 					ResolveStatus::Resolving
@@ -260,7 +260,7 @@ impl<'r> ImportResolver<'r> {
 		else {
 			return;
 		};
-		for candidate in candidates {
+		for &candidate in candidates {
 			if candidate == current {
 				continue;
 			}
@@ -621,7 +621,7 @@ impl<'r> ImportResolver<'r> {
 			.as_scope()
 			.and_then(|scope| self.pending_glob_targets.get(&scope))
 		{
-			for candidate in candidates {
+			for &candidate in candidates {
 				// O(1) first: `item_state[candidate] == Resolving` iff
 				// `candidate` is on `resolve_stack` right now — the two are
 				// pushed/popped in lockstep around the exact same

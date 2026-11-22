@@ -7,7 +7,6 @@ pub mod diagnostics;
 mod index;
 pub mod mir;
 pub mod opt;
-mod small_vec;
 pub mod symbols;
 #[cfg(test)]
 pub mod testing;
