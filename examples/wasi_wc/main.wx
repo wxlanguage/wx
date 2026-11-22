@@ -43,7 +43,7 @@ func main() {
             if (i == chunk.len()) { break (lines, words, in_word) };
             local byte = chunk[i];
             local lines = if (byte == '\n') { lines + 1 } else { lines };
-            if (is_space(byte)) { continue(i + 1, lines, words, False) };
+            if (is_space(byte)) { continue (i + 1, lines, words, False) };
             (i + 1, lines, if (in_word) { words } else { words + 1 }, True)
         };
         (lines, words, bytes + chunk.len(), in_word)

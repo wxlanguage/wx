@@ -2044,8 +2044,7 @@ pub typeset PointerSize:
     + PartialEq
     + PartialOrd
     + UnsignedInt
-    + StackValue
-    + PartialEq { u32, u64 }
+    + StackValue { u32, u64 }
 
 package func global_get<G: Global>(g: G) -> G::Value;
 
