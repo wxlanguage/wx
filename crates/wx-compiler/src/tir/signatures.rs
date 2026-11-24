@@ -1660,15 +1660,18 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let query_state = entries
 			.iter()
 			.enumerate()
-			.map(|(index, entry)| {
-				(
-					entry.node.query(),
-					QueryEntry {
-						ast_index: u32::try_from(index).unwrap(),
-						state: QueryState::Pending,
-						obligations: 0..0,
-					},
-				)
+			.flat_map(|(index, entry)| {
+				let ast_index = u32::try_from(index).unwrap();
+				entry.node.queries().map(move |query| {
+					(
+						query,
+						QueryEntry {
+							ast_index,
+							state: QueryState::Pending,
+							obligations: 0..0,
+						},
+					)
+				})
 			})
 			.collect();
 		Self {
@@ -1722,13 +1725,15 @@ impl<'ast> SemanticsBuilder<'ast> {
 		// out for the sweep and put back unchanged.
 		let obligations = std::mem::take(&mut self.obligations);
 		for entry in self.entries {
-			let range =
-				self.query_state[&entry.node.query()].obligations.clone();
-			for obligation in
-				&obligations[range.start as usize..range.end as usize]
-			{
-				sema.check_obligation(self.strings, obligation)
-					.expect("every signature and every constant body exists");
+			for query in entry.node.queries() {
+				let range = self.query_state[&query].obligations.clone();
+				for obligation in
+					&obligations[range.start as usize..range.end as usize]
+				{
+					sema.check_obligation(self.strings, obligation).expect(
+						"every signature and every constant body exists",
+					);
+				}
 			}
 			if let SignatureQuery::TraitImpl(impl_index) = entry.node.query() {
 				let checked = self.check_conformance(sema, impl_index);
@@ -2224,7 +2229,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			}
 			return sema.impl_target_type(head.inner);
 		};
-		let query = SignatureQuery::Struct(struct_index);
+		let query = SignatureQuery::StructParams(struct_index);
 		if matches!(self.query_state[&query].state, QueryState::Pending) {
 			let _ = self.ensure_signature(
 				sema,
@@ -2348,13 +2353,24 @@ impl<'ast> SemanticsBuilder<'ast> {
 		// A nested query keeps its own list, so this one's obligations join
 		// the shared list as one run when it finishes.
 		let mut obligations = Vec::new();
-		let location = self.compute_signature(
-			sema,
-			&mut obligations,
-			entry.file_id,
-			entry.namespace,
-			entry.node,
-		);
+		let location = match request.query {
+			SignatureQuery::StructParams(struct_index) => self
+				.compute_struct_params(
+					sema,
+					&mut obligations,
+					entry.file_id,
+					entry.namespace,
+					entry.node,
+					struct_index,
+				),
+			_ => self.compute_signature(
+				sema,
+				&mut obligations,
+				entry.file_id,
+				entry.namespace,
+				entry.node,
+			),
+		};
 
 		self.query_stack.pop();
 		let start = u32::try_from(self.obligations.len()).unwrap();
@@ -2803,6 +2819,37 @@ impl<'ast> SemanticsBuilder<'ast> {
 				},
 			});
 		SignatureLocation::Memory(memory_index)
+	}
+
+	/// Resolves a struct's type parameters into its frame.
+	fn compute_struct_params(
+		&mut self,
+		sema: &mut Semantics,
+		obligations: &mut Vec<TypeObligation>,
+		file_id: FileId,
+		namespace: Scope,
+		ast_node: AstNodeRef,
+		struct_index: StructIdx,
+	) -> SignatureLocation {
+		let AstNodeRef::Struct { item, .. } = ast_node else {
+			unreachable!("a struct's parameters are read from its declaration")
+		};
+		let ast::Item::Struct { type_params, .. } =
+			self.ast(file_id).item(item)
+		else {
+			unreachable!()
+		};
+		let generic_env = self.resolve_generic_params(
+			sema,
+			obligations,
+			file_id,
+			namespace,
+			GenericEnvOwner::Struct(struct_index),
+			GenericEnvIdx::ROOT,
+			type_params,
+		);
+		sema.structs[usize::from(struct_index)].type_params = generic_env;
+		SignatureLocation::Struct(struct_index)
 	}
 
 	fn compute_signature(
@@ -3391,35 +3438,19 @@ impl<'ast> SemanticsBuilder<'ast> {
 				)
 			}
 			AstNodeRef::Struct { struct_index, item } => {
-				let item = &ast.item(item);
-				let ast::Item::Struct {
-					type_params: ast_type_params,
-					fields,
-					..
-				} = item
+				let ast::Item::Struct { name, fields, .. } = &ast.item(item)
 				else {
 					unreachable!()
 				};
-
-				let generic_env = self.resolve_generic_params(
+				let _ = self.ensure_signature(
 					sema,
-					obligations,
-					file_id,
-					namespace,
-					GenericEnvOwner::Struct(struct_index),
-					GenericEnvIdx::ROOT,
-					*ast_type_params,
+					QueryInfo {
+						query: SignatureQuery::StructParams(struct_index),
+						requested_at: Some(SourceSpan::new(file_id, name.span)),
+					},
 				);
-				// Written before fields are touched, not alongside
-				// `field_types` below, so a self-/mutually-referencing
-				// pointer field — `resolve_type` recursing back into this
-				// same struct via `resolve_type_args`, to validate its own
-				// written type arguments — reads this struct's real param
-				// bounds instead of the placeholder `ROOT` frame it started
-				// in. Same reasoning as `ast_node` already letting identity
-				// be read before a query finishes, just for one more fact.
-				sema.structs[usize::from(struct_index)].type_params =
-					generic_env;
+				let generic_env =
+					sema.structs[usize::from(struct_index)].type_params;
 
 				// One-to-one with `decls.structs[..].fields` — a duplicate
 				// name still gets its own slot resolved there, so it does
@@ -4669,15 +4700,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 				}
 			}
 			DeclKind::Struct(struct_index) => {
-				// Only forces resolution for a genuine forward
-				// reference (`Pending`); an in-progress struct
-				// is left alone so `check_struct_direct_recursion`
-				// downstream still gets to observe `Cycle`
-				// itself. Either way `type_params` (written
-				// before fields, see `RecordStruct`/
-				// `TupleStruct` above) is already valid to
-				// read by the time we get here.
-				let query = SignatureQuery::Struct(struct_index);
+				// Naming a struct needs only its type parameters, never
+				// its fields. A struct naming itself in its own
+				// parameters reads the frame they started in.
+				let query = SignatureQuery::StructParams(struct_index);
 				if matches!(self.query_state[&query].state, QueryState::Pending)
 				{
 					let _ = self.ensure_signature(
@@ -5334,7 +5360,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 	fn query_decl(sema: &Semantics, query: SignatureQuery) -> Option<ItemLoc> {
 		let decls = &sema.decls;
 		Some(match query {
-			SignatureQuery::Struct(index) => index.loc(decls),
+			SignatureQuery::StructParams(index)
+			| SignatureQuery::Struct(index) => index.loc(decls),
 			SignatureQuery::Enum(index) => index.loc(decls),
 			SignatureQuery::Trait(index) => index.loc(decls),
 			SignatureQuery::Typeset(index) => index.loc(decls),
@@ -5426,6 +5453,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 		match query {
 			SignatureQuery::TypeAlias(_) => {
 				format!("expanding type alias `{name}`")
+			}
+			SignatureQuery::StructParams(_) => {
+				format!("resolving the type parameters of struct `{name}`")
 			}
 			_ => format!(
 				"resolving {} `{name}`",
@@ -9683,6 +9713,33 @@ pub(super) mod tests {
 			case.sema.diagnostics[0].message,
 			"recursive types `A` and `B` have infinite size"
 		);
+	}
+
+	#[test]
+	fn a_struct_cycle_through_a_pointer_resolves_in_any_order() {
+		for source in [
+			"struct Handler(s: state::*State); struct State(h: Handler);",
+			"struct State(h: Handler); struct Handler(s: state::*State);",
+			"type Store = state::*State; struct Handler(s: Store); struct State(h: Handler);",
+			"struct State(h: Handler); struct Handler(s: Store); type Store = state::*State;",
+		] {
+			let case = TestCase::new(&format!("memory state: u32; {source}"));
+			case.diagnostics().assert_none();
+		}
+	}
+
+	#[test]
+	fn a_struct_cycle_through_an_alias_has_infinite_size_in_any_order() {
+		for source in [
+			"type Store = State; struct Handler(s: Store); struct State(h: Handler);",
+			"struct State(h: Handler); struct Handler(s: Store); type Store = State;",
+			"struct Handler(s: Store); type Store = State; struct State(h: Handler);",
+		] {
+			let case = TestCase::new(source);
+			case.diagnostics().assert_codes(&[
+				DiagnosticCode::RecursiveTypeWithoutIndirection,
+			]);
+		}
 	}
 
 	#[test]
