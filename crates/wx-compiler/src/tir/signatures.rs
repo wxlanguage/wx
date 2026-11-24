@@ -5351,23 +5351,15 @@ impl<'ast> SemanticsBuilder<'ast> {
 	}
 
 	/// Builds the diagnostic for a cycle just detected while trying to
-	/// re-enter `query` (found `InProgress` somewhere on `query_stack`).
-	/// Mirrors rustc's E0391 structure: walks the stack from `query`'s own
-	/// frame to the top, and for hop `i` shows the span of the *next*
-	/// frame's `requested_at` — i.e. the reference inside hop `i`'s own body
-	/// that demanded the next item, the same "attach the span to the query
-	/// it justifies" shape `rustc_query_system::QueryInfo` uses. The one
-	/// edge with no frame of its own is the closing one (re-entering
-	/// `query`), since that call never got to push anything — the caller
-	/// already has that span in hand at the point it detects `Cycle`, so it
-	/// passes it in directly as `closing_reference`.
+	/// re-enter `query`, found in progress on `query_stack`. Each label sits
+	/// on a reference and names the item it requires: a frame's
+	/// `requested_at` for the steps inside the cycle, `closing_reference` for
+	/// the one that re-enters `query`. Labels render in source order, so each
+	/// must read correctly on its own.
 	///
-	/// Shared by every cycle kind (`CyclicTypeAlias`, `CyclicTraitBounds`,
-	/// `RecursiveTypeWithoutIndirection`, ...) — they differ only in which
-	/// diagnostic code applies and how to phrase "why `name` was needed"
-	/// (`describe`), e.g. `"expanding type alias \`A\`"` or `"computing the
-	/// supertraits of \`A\`"`. Callers append their own closing notes on top
-	/// of the returned diagnostic.
+	/// `describe` phrases what the caller was doing with `query` (e.g.
+	/// `"computing the supertraits of \`A\`"`); the steps in between are
+	/// described by their own kind.
 	fn report_cycle(
 		&self,
 		sema: &Semantics,
@@ -5385,45 +5377,61 @@ impl<'ast> SemanticsBuilder<'ast> {
 			);
 		let chain = &self.query_stack[position..];
 
-		let hop_span = |i: usize| -> SourceSpan {
-			chain
-				.get(i + 1)
-				.map(|frame| {
-					frame.requested_at.expect(
-						"a non-root frame always records why it was required",
-					)
-				})
-				.unwrap_or(closing_reference)
-		};
-
-		// What each step does: `describe` of its declaration's name, or for
-		// an impl, which has none, what its query resolves.
-		let step = |query: SignatureQuery| match Self::query_decl(sema, query) {
+		let root = match Self::query_decl(sema, query) {
 			Some(key) => {
 				let name = sema.decls.item(key).name.inner;
 				describe(self.strings.resolve(name).unwrap())
 			}
-			None => "resolving the header of this impl".to_owned(),
+			None => self.describe_cycle_step(sema, query),
 		};
-		let root = step(query);
 
 		let mut diagnostic = Diagnostic::error()
 			.with_code(code.code())
-			.with_message(format!("cycle detected when {root}"))
-			.with_label(hop_span(0).primary_label());
+			.with_message(format!("cycle detected when {root}"));
 
-		for (i, frame) in chain.iter().enumerate().skip(1) {
+		for frame in &chain[1..] {
+			let reference = frame
+				.requested_at
+				.expect("a non-root frame always records why it was required");
 			diagnostic = diagnostic.with_label(
-				hop_span(i).secondary_label().with_message(format!(
+				reference.secondary_label().with_message(format!(
 					"...which requires {}...",
-					step(frame.query)
+					self.describe_cycle_step(sema, frame.query)
 				)),
 			);
 		}
 
-		diagnostic.with_note(format!(
-			"...which again requires {root}, completing the cycle"
-		))
+		let closing = if chain.len() == 1 {
+			format!("...which immediately requires {root} again")
+		} else {
+			format!("...which again requires {root}, completing the cycle")
+		};
+		diagnostic
+			.with_label(closing_reference.primary_label().with_message(closing))
+	}
+
+	/// What computing `query`'s signature does, for a step inside a cycle.
+	fn describe_cycle_step(
+		&self,
+		sema: &Semantics,
+		query: SignatureQuery,
+	) -> String {
+		let Some(key) = Self::query_decl(sema, query) else {
+			return "resolving the header of this impl".to_owned();
+		};
+		let name = self
+			.strings
+			.resolve(sema.decls.item(key).name.inner)
+			.unwrap();
+		match query {
+			SignatureQuery::TypeAlias(_) => {
+				format!("expanding type alias `{name}`")
+			}
+			_ => format!(
+				"resolving {} `{name}`",
+				key.symbol_kind(&sema.decls).noun()
+			),
+		}
 	}
 
 	fn report_cyclic_type_alias(
@@ -9407,6 +9415,50 @@ pub(super) mod tests {
 			case.type_alias("B").target,
 			TypeIndex::ERROR,
 			"B must still finish, not get stuck, even though it's only reached transitively"
+		);
+	}
+
+	#[test]
+	fn each_cycle_label_names_the_item_its_reference_requires() {
+		let source = "type A = C;\ntype B = A;\ntype C = B;\n";
+		let case = TestCase::new(source);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicTypeAlias]);
+		let diagnostic = &case.sema.diagnostics[0];
+		assert_eq!(
+			diagnostic.message,
+			"cycle detected when expanding type alias `A`"
+		);
+		let mut labels: Vec<_> = diagnostic
+			.labels
+			.iter()
+			.map(|label| {
+				(
+					label.range.start,
+					&source[label.range.clone()],
+					label.message.as_str(),
+					label.style
+						== codespan_reporting::diagnostic::LabelStyle::Primary,
+				)
+			})
+			.collect();
+		labels.sort_by_key(|&(start, ..)| start);
+		let labels: Vec<_> = labels
+			.into_iter()
+			.map(|(_, text, message, primary)| (text, message, primary))
+			.collect();
+		// The cycle runs A -> C -> B -> A, against source order.
+		assert_eq!(
+			labels,
+			[
+				("C", "...which requires expanding type alias `C`...", false),
+				(
+					"A",
+					"...which again requires expanding type alias `A`, completing the cycle",
+					true
+				),
+				("B", "...which requires expanding type alias `B`...", false),
+			]
 		);
 	}
 
