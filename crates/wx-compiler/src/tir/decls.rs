@@ -1167,6 +1167,18 @@ impl AstNodeRef {
 			}
 		}
 	}
+
+	/// Every query this entry's declaration answers, in the order they are
+	/// written: a struct's type parameters before its fields.
+	pub(super) fn queries(&self) -> impl Iterator<Item = SignatureQuery> {
+		let params = match *self {
+			Self::Struct { struct_index, .. } => {
+				Some(SignatureQuery::StructParams(struct_index))
+			}
+			_ => None,
+		};
+		params.into_iter().chain([self.query()])
+	}
 }
 
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
@@ -1471,13 +1483,18 @@ impl Visibility {
 	}
 }
 
-/// A declaration: the arena it lives in and its index there (an enum
-/// variant is a constant). Assigned by the
-/// prescan, which is what decides what a declaration is; a generated one (a
-/// typeset's trait and impls, a memory's or global's impl) is built by the
-/// signature query of the declaration that generates it.
+/// A piece of signature resolution, named by the declaration's arena and its
+/// index there (an enum variant is a constant): one declaration's signature,
+/// except a struct's, which splits into its type parameters and its fields.
+/// Assigned by the prescan, which is what decides what a declaration is; a
+/// generated one (a typeset's trait and impls, a memory's or global's impl)
+/// is built by the signature query of the declaration that generates it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum SignatureQuery {
+	/// A struct's type parameters: all naming it needs, so a reference to a
+	/// struct never waits on its fields.
+	StructParams(StructIdx),
+	/// A struct's fields, after its type parameters.
 	Struct(StructIdx),
 	Enum(EnumIdx),
 	Trait(TraitIdx),

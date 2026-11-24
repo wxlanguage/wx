@@ -1660,15 +1660,18 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let query_state = entries
 			.iter()
 			.enumerate()
-			.map(|(index, entry)| {
-				(
-					entry.node.query(),
-					QueryEntry {
-						ast_index: u32::try_from(index).unwrap(),
-						state: QueryState::Pending,
-						obligations: 0..0,
-					},
-				)
+			.flat_map(|(index, entry)| {
+				let ast_index = u32::try_from(index).unwrap();
+				entry.node.queries().map(move |query| {
+					(
+						query,
+						QueryEntry {
+							ast_index,
+							state: QueryState::Pending,
+							obligations: 0..0,
+						},
+					)
+				})
 			})
 			.collect();
 		Self {
@@ -1722,13 +1725,15 @@ impl<'ast> SemanticsBuilder<'ast> {
 		// out for the sweep and put back unchanged.
 		let obligations = std::mem::take(&mut self.obligations);
 		for entry in self.entries {
-			let range =
-				self.query_state[&entry.node.query()].obligations.clone();
-			for obligation in
-				&obligations[range.start as usize..range.end as usize]
-			{
-				sema.check_obligation(self.strings, obligation)
-					.expect("every signature and every constant body exists");
+			for query in entry.node.queries() {
+				let range = self.query_state[&query].obligations.clone();
+				for obligation in
+					&obligations[range.start as usize..range.end as usize]
+				{
+					sema.check_obligation(self.strings, obligation).expect(
+						"every signature and every constant body exists",
+					);
+				}
 			}
 			if let SignatureQuery::TraitImpl(impl_index) = entry.node.query() {
 				let checked = self.check_conformance(sema, impl_index);
@@ -2224,7 +2229,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			}
 			return sema.impl_target_type(head.inner);
 		};
-		let query = SignatureQuery::Struct(struct_index);
+		let query = SignatureQuery::StructParams(struct_index);
 		if matches!(self.query_state[&query].state, QueryState::Pending) {
 			let _ = self.ensure_signature(
 				sema,
@@ -2348,13 +2353,24 @@ impl<'ast> SemanticsBuilder<'ast> {
 		// A nested query keeps its own list, so this one's obligations join
 		// the shared list as one run when it finishes.
 		let mut obligations = Vec::new();
-		let location = self.compute_signature(
-			sema,
-			&mut obligations,
-			entry.file_id,
-			entry.namespace,
-			entry.node,
-		);
+		let location = match request.query {
+			SignatureQuery::StructParams(struct_index) => self
+				.compute_struct_params(
+					sema,
+					&mut obligations,
+					entry.file_id,
+					entry.namespace,
+					entry.node,
+					struct_index,
+				),
+			_ => self.compute_signature(
+				sema,
+				&mut obligations,
+				entry.file_id,
+				entry.namespace,
+				entry.node,
+			),
+		};
 
 		self.query_stack.pop();
 		let start = u32::try_from(self.obligations.len()).unwrap();
@@ -2803,6 +2819,37 @@ impl<'ast> SemanticsBuilder<'ast> {
 				},
 			});
 		SignatureLocation::Memory(memory_index)
+	}
+
+	/// Resolves a struct's type parameters into its frame.
+	fn compute_struct_params(
+		&mut self,
+		sema: &mut Semantics,
+		obligations: &mut Vec<TypeObligation>,
+		file_id: FileId,
+		namespace: Scope,
+		ast_node: AstNodeRef,
+		struct_index: StructIdx,
+	) -> SignatureLocation {
+		let AstNodeRef::Struct { item, .. } = ast_node else {
+			unreachable!("a struct's parameters are read from its declaration")
+		};
+		let ast::Item::Struct { type_params, .. } =
+			self.ast(file_id).item(item)
+		else {
+			unreachable!()
+		};
+		let generic_env = self.resolve_generic_params(
+			sema,
+			obligations,
+			file_id,
+			namespace,
+			GenericEnvOwner::Struct(struct_index),
+			GenericEnvIdx::ROOT,
+			type_params,
+		);
+		sema.structs[usize::from(struct_index)].type_params = generic_env;
+		SignatureLocation::Struct(struct_index)
 	}
 
 	fn compute_signature(
@@ -3391,35 +3438,19 @@ impl<'ast> SemanticsBuilder<'ast> {
 				)
 			}
 			AstNodeRef::Struct { struct_index, item } => {
-				let item = &ast.item(item);
-				let ast::Item::Struct {
-					type_params: ast_type_params,
-					fields,
-					..
-				} = item
+				let ast::Item::Struct { name, fields, .. } = &ast.item(item)
 				else {
 					unreachable!()
 				};
-
-				let generic_env = self.resolve_generic_params(
+				let _ = self.ensure_signature(
 					sema,
-					obligations,
-					file_id,
-					namespace,
-					GenericEnvOwner::Struct(struct_index),
-					GenericEnvIdx::ROOT,
-					*ast_type_params,
+					QueryInfo {
+						query: SignatureQuery::StructParams(struct_index),
+						requested_at: Some(SourceSpan::new(file_id, name.span)),
+					},
 				);
-				// Written before fields are touched, not alongside
-				// `field_types` below, so a self-/mutually-referencing
-				// pointer field — `resolve_type` recursing back into this
-				// same struct via `resolve_type_args`, to validate its own
-				// written type arguments — reads this struct's real param
-				// bounds instead of the placeholder `ROOT` frame it started
-				// in. Same reasoning as `ast_node` already letting identity
-				// be read before a query finishes, just for one more fact.
-				sema.structs[usize::from(struct_index)].type_params =
-					generic_env;
+				let generic_env =
+					sema.structs[usize::from(struct_index)].type_params;
 
 				// One-to-one with `decls.structs[..].fields` — a duplicate
 				// name still gets its own slot resolved there, so it does
@@ -4669,15 +4700,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 				}
 			}
 			DeclKind::Struct(struct_index) => {
-				// Only forces resolution for a genuine forward
-				// reference (`Pending`); an in-progress struct
-				// is left alone so `check_struct_direct_recursion`
-				// downstream still gets to observe `Cycle`
-				// itself. Either way `type_params` (written
-				// before fields, see `RecordStruct`/
-				// `TupleStruct` above) is already valid to
-				// read by the time we get here.
-				let query = SignatureQuery::Struct(struct_index);
+				// Naming a struct needs only its type parameters, never
+				// its fields. A struct naming itself in its own
+				// parameters reads the frame they started in.
+				let query = SignatureQuery::StructParams(struct_index);
 				if matches!(self.query_state[&query].state, QueryState::Pending)
 				{
 					let _ = self.ensure_signature(
@@ -5334,7 +5360,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 	fn query_decl(sema: &Semantics, query: SignatureQuery) -> Option<ItemLoc> {
 		let decls = &sema.decls;
 		Some(match query {
-			SignatureQuery::Struct(index) => index.loc(decls),
+			SignatureQuery::StructParams(index)
+			| SignatureQuery::Struct(index) => index.loc(decls),
 			SignatureQuery::Enum(index) => index.loc(decls),
 			SignatureQuery::Trait(index) => index.loc(decls),
 			SignatureQuery::Typeset(index) => index.loc(decls),
@@ -5351,23 +5378,15 @@ impl<'ast> SemanticsBuilder<'ast> {
 	}
 
 	/// Builds the diagnostic for a cycle just detected while trying to
-	/// re-enter `query` (found `InProgress` somewhere on `query_stack`).
-	/// Mirrors rustc's E0391 structure: walks the stack from `query`'s own
-	/// frame to the top, and for hop `i` shows the span of the *next*
-	/// frame's `requested_at` — i.e. the reference inside hop `i`'s own body
-	/// that demanded the next item, the same "attach the span to the query
-	/// it justifies" shape `rustc_query_system::QueryInfo` uses. The one
-	/// edge with no frame of its own is the closing one (re-entering
-	/// `query`), since that call never got to push anything — the caller
-	/// already has that span in hand at the point it detects `Cycle`, so it
-	/// passes it in directly as `closing_reference`.
+	/// re-enter `query`, found in progress on `query_stack`. Each label sits
+	/// on a reference and names the item it requires: a frame's
+	/// `requested_at` for the steps inside the cycle, `closing_reference` for
+	/// the one that re-enters `query`. Labels render in source order, so each
+	/// must read correctly on its own.
 	///
-	/// Shared by every cycle kind (`CyclicTypeAlias`, `CyclicTraitBounds`,
-	/// `RecursiveTypeWithoutIndirection`, ...) — they differ only in which
-	/// diagnostic code applies and how to phrase "why `name` was needed"
-	/// (`describe`), e.g. `"expanding type alias \`A\`"` or `"computing the
-	/// supertraits of \`A\`"`. Callers append their own closing notes on top
-	/// of the returned diagnostic.
+	/// `describe` phrases what the caller was doing with `query` (e.g.
+	/// `"computing the supertraits of \`A\`"`); the steps in between are
+	/// described by their own kind.
 	fn report_cycle(
 		&self,
 		sema: &Semantics,
@@ -5385,45 +5404,64 @@ impl<'ast> SemanticsBuilder<'ast> {
 			);
 		let chain = &self.query_stack[position..];
 
-		let hop_span = |i: usize| -> SourceSpan {
-			chain
-				.get(i + 1)
-				.map(|frame| {
-					frame.requested_at.expect(
-						"a non-root frame always records why it was required",
-					)
-				})
-				.unwrap_or(closing_reference)
-		};
-
-		// What each step does: `describe` of its declaration's name, or for
-		// an impl, which has none, what its query resolves.
-		let step = |query: SignatureQuery| match Self::query_decl(sema, query) {
+		let root = match Self::query_decl(sema, query) {
 			Some(key) => {
 				let name = sema.decls.item(key).name.inner;
 				describe(self.strings.resolve(name).unwrap())
 			}
-			None => "resolving the header of this impl".to_owned(),
+			None => self.describe_cycle_step(sema, query),
 		};
-		let root = step(query);
 
 		let mut diagnostic = Diagnostic::error()
 			.with_code(code.code())
-			.with_message(format!("cycle detected when {root}"))
-			.with_label(hop_span(0).primary_label());
+			.with_message(format!("cycle detected when {root}"));
 
-		for (i, frame) in chain.iter().enumerate().skip(1) {
+		for frame in &chain[1..] {
+			let reference = frame
+				.requested_at
+				.expect("a non-root frame always records why it was required");
 			diagnostic = diagnostic.with_label(
-				hop_span(i).secondary_label().with_message(format!(
+				reference.secondary_label().with_message(format!(
 					"...which requires {}...",
-					step(frame.query)
+					self.describe_cycle_step(sema, frame.query)
 				)),
 			);
 		}
 
-		diagnostic.with_note(format!(
-			"...which again requires {root}, completing the cycle"
-		))
+		let closing = if chain.len() == 1 {
+			format!("...which immediately requires {root} again")
+		} else {
+			format!("...which again requires {root}, completing the cycle")
+		};
+		diagnostic
+			.with_label(closing_reference.primary_label().with_message(closing))
+	}
+
+	/// What computing `query`'s signature does, for a step inside a cycle.
+	fn describe_cycle_step(
+		&self,
+		sema: &Semantics,
+		query: SignatureQuery,
+	) -> String {
+		let Some(key) = Self::query_decl(sema, query) else {
+			return "resolving the header of this impl".to_owned();
+		};
+		let name = self
+			.strings
+			.resolve(sema.decls.item(key).name.inner)
+			.unwrap();
+		match query {
+			SignatureQuery::TypeAlias(_) => {
+				format!("expanding type alias `{name}`")
+			}
+			SignatureQuery::StructParams(_) => {
+				format!("resolving the type parameters of struct `{name}`")
+			}
+			_ => format!(
+				"resolving {} `{name}`",
+				key.symbol_kind(&sema.decls).noun()
+			),
+		}
 	}
 
 	fn report_cyclic_type_alias(
@@ -9411,6 +9449,50 @@ pub(super) mod tests {
 	}
 
 	#[test]
+	fn each_cycle_label_names_the_item_its_reference_requires() {
+		let source = "type A = C;\ntype B = A;\ntype C = B;\n";
+		let case = TestCase::new(source);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicTypeAlias]);
+		let diagnostic = &case.sema.diagnostics[0];
+		assert_eq!(
+			diagnostic.message,
+			"cycle detected when expanding type alias `A`"
+		);
+		let mut labels: Vec<_> = diagnostic
+			.labels
+			.iter()
+			.map(|label| {
+				(
+					label.range.start,
+					&source[label.range.clone()],
+					label.message.as_str(),
+					label.style
+						== codespan_reporting::diagnostic::LabelStyle::Primary,
+				)
+			})
+			.collect();
+		labels.sort_by_key(|&(start, ..)| start);
+		let labels: Vec<_> = labels
+			.into_iter()
+			.map(|(_, text, message, primary)| (text, message, primary))
+			.collect();
+		// The cycle runs A -> C -> B -> A, against source order.
+		assert_eq!(
+			labels,
+			[
+				("C", "...which requires expanding type alias `C`...", false),
+				(
+					"A",
+					"...which again requires expanding type alias `A`, completing the cycle",
+					true
+				),
+				("B", "...which requires expanding type alias `B`...", false),
+			]
+		);
+	}
+
+	#[test]
 	fn a_real_supertrait_resolves() {
 		let case = TestCase::new(indoc! {"
 			trait Y { }
@@ -9631,6 +9713,33 @@ pub(super) mod tests {
 			case.sema.diagnostics[0].message,
 			"recursive types `A` and `B` have infinite size"
 		);
+	}
+
+	#[test]
+	fn a_struct_cycle_through_a_pointer_resolves_in_any_order() {
+		for source in [
+			"struct Handler(s: state::*State); struct State(h: Handler);",
+			"struct State(h: Handler); struct Handler(s: state::*State);",
+			"type Store = state::*State; struct Handler(s: Store); struct State(h: Handler);",
+			"struct State(h: Handler); struct Handler(s: Store); type Store = state::*State;",
+		] {
+			let case = TestCase::new(&format!("memory state: u32; {source}"));
+			case.diagnostics().assert_none();
+		}
+	}
+
+	#[test]
+	fn a_struct_cycle_through_an_alias_has_infinite_size_in_any_order() {
+		for source in [
+			"type Store = State; struct Handler(s: Store); struct State(h: Handler);",
+			"struct State(h: Handler); struct Handler(s: Store); type Store = State;",
+			"struct Handler(s: Store); type Store = State; struct State(h: Handler);",
+		] {
+			let case = TestCase::new(source);
+			case.diagnostics().assert_codes(&[
+				DiagnosticCode::RecursiveTypeWithoutIndirection,
+			]);
+		}
 	}
 
 	#[test]
