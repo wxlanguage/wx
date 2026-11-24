@@ -107,7 +107,6 @@ define_text! {
 		Colon            => ":",
 		ColonColon       => "::",
 		ColonColonLt     => "::<",
-		ColonColonLBrace => "::{",
 		// spaced punctuation / keywords
 		Arrow            => " -> ",
 		FatArrow         => " => ",
@@ -244,6 +243,19 @@ enum Node {
 	FlatBelow {
 		body: NodeId,
 		fallback: NodeId,
+	},
+	/// Entries that share lines, as many as fit. `content` is flat when it
+	/// fits; the separator in `gap` is flat only when `content`, it, and the
+	/// next content fit flat together, so it breaks beside any content that
+	/// breaks.
+	Fill {
+		content: NodeId,
+		gap: Option<NodeId>,
+	},
+	/// The separator after a `Fill`'s content, and the `Fill` that follows.
+	FillGap {
+		separator: NodeId,
+		fill: NodeId,
 	},
 }
 
@@ -1059,23 +1071,26 @@ impl<'a> Builder<'a> {
 				self.arena.concat(&[segment, colons, rest])
 			}
 			ast::UseTree::Group {
-				segment, branches, ..
+				segment,
+				branches,
+				braces,
 			} => {
-				let mut items: Vec<NodeId> = vec![
-					self.symbol(segment.inner),
-					self.text(Text::ColonColonLBrace),
-				];
-				for (index, &element) in
-					self.ast.list(branches).iter().enumerate()
-				{
-					if index > 0 {
-						items.push(self.text(Text::CommaSp));
-					}
-					let element = self.build_use_tree(element);
-					items.push(element);
-				}
-				items.push(self.text(Text::RBrace));
-				self.arena.concat(&items)
+				let segment = self.symbol(segment.inner);
+				let colons = self.text(Text::ColonColon);
+				let entries: Vec<_> = self
+					.ast
+					.spanned(branches)
+					.map(|branch| {
+						(branch.span, self.build_use_tree(branch.inner))
+					})
+					.collect();
+				let group = self.build_filled_list(
+					braces,
+					Text::LBrace,
+					Text::RBrace,
+					&entries,
+				);
+				self.arena.concat(&[segment, colons, group])
 			}
 		}
 	}
@@ -1897,12 +1912,8 @@ impl<'a> Builder<'a> {
 		layout: ListLayout,
 		entries: Vec<(TextSpan, NodeId)>,
 	) -> NodeId {
-		let open = self.text(open);
 		let Some(&(last, _)) = entries.last() else {
-			let mut items = vec![open];
-			self.build_empty_braced_comments(&mut items, span);
-			items.push(self.text(close));
-			return self.arena.concat(&items);
+			return self.build_empty_list(span, open, close);
 		};
 		let (end_break, entry_break) = match layout {
 			ListLayout::Tight => (self.line(), self.soft_line()),
@@ -1932,10 +1943,89 @@ impl<'a> Builder<'a> {
 			});
 			previous_end = Some(entry_span.end);
 		}
-		// Comments before `close` end on a line of their own.
+		self.close_list(span, open, inner, last.end, close, end_break)
+	}
+
+	/// Like a `Tight` list, but broken entries share lines, as many as fit
+	/// (a `Fill`). A comment or blank line ends its line.
+	fn build_filled_list(
+		&mut self,
+		span: TextSpan,
+		open: Text,
+		close: Text,
+		entries: &[(TextSpan, NodeId)],
+	) -> NodeId {
+		let Some(&(first, _)) = entries.first() else {
+			return self.build_empty_list(span, open, close);
+		};
+		let &(last, last_node) = entries.last().unwrap();
+		let end_break = self.line();
+		let mut inner = Vec::new();
+		self.push_between_breaking(
+			&mut inner,
+			Before::Opener { from: span.start },
+			After::Entry { start: first.start },
+			end_break,
+		);
+		// Built from the back, since each `Fill` links to the one after it.
+		// A gap's comments depend only on the spans around it.
+		let mut fill = self.arena.alloc(Node::Fill {
+			content: last_node,
+			gap: None,
+		});
+		let mut gap = Vec::new();
+		for pair in entries.windows(2).rev() {
+			let &[(previous, node), (next, _)] = pair else {
+				unreachable!("a window of two entries");
+			};
+			gap.clear();
+			let entry_break = self.soft_line();
+			self.push_between_breaking(
+				&mut gap,
+				Before::Entry { end: previous.end },
+				After::Entry { start: next.start },
+				entry_break,
+			);
+			let separator = self.arena.concat(&gap);
+			let comma = self.text(Text::Comma);
+			let content = self.arena.concat(&[node, comma]);
+			let gap = self.arena.alloc(Node::FillGap { separator, fill });
+			fill = self.arena.alloc(Node::Fill {
+				content,
+				gap: Some(gap),
+			});
+		}
+		inner.push(fill);
+		inner.push(self.if_break_comma());
+		self.close_list(span, open, inner, last.end, close, end_break)
+	}
+
+	fn build_empty_list(
+		&mut self,
+		span: TextSpan,
+		open: Text,
+		close: Text,
+	) -> NodeId {
+		let mut items = vec![self.text(open)];
+		self.build_empty_braced_comments(&mut items, span);
+		items.push(self.text(close));
+		self.arena.concat(&items)
+	}
+
+	/// Indents a list's `inner` entries between its delimiters. Comments
+	/// after the last entry end on a line of their own before `close`.
+	fn close_list(
+		&mut self,
+		span: TextSpan,
+		open: Text,
+		mut inner: Vec<NodeId>,
+		last_end: TextOffset,
+		close: Text,
+		end_break: NodeId,
+	) -> NodeId {
 		let commented = self.push_between_breaking(
 			&mut inner,
-			Before::Entry { end: last.end },
+			Before::Entry { end: last_end },
 			After::End { at: span.end },
 			end_break,
 		);
@@ -1945,6 +2035,7 @@ impl<'a> Builder<'a> {
 			true => self.hard_line(),
 			false => end_break,
 		};
+		let open = self.text(open);
 		let close = self.text(close);
 		let list = self.arena.concat(&[open, inner, end, close]);
 		self.arena.group(list)
@@ -2339,7 +2430,8 @@ impl<'a> Builder<'a> {
 					ast::ArgumentList::Named(_) => true,
 				}
 			}
-			ast::Expression::NamedList { .. } => true,
+			ast::Expression::NamedList { .. }
+			| ast::Expression::ArrayList { .. } => true,
 			_ => false,
 		}
 	}
@@ -2753,7 +2845,15 @@ impl<'a> Builder<'a> {
 			}
 			_ => {
 				methods.reverse();
-				for method in &mut methods {
+				// A plain name keeps its first method, like `ui.button(..)`.
+				let detached = match self.ast.expr(base) {
+					ast::Expression::Path(path) => match self.ast.list(path) {
+						[segment] if segment.type_args.is_empty() => 1,
+						_ => 0,
+					},
+					_ => 0,
+				};
+				for method in &mut methods[detached..] {
 					let line = self.line();
 					let segment = self.arena.concat(&[line, *method]);
 					*method = self.arena.indent(segment);
@@ -2841,6 +2941,20 @@ impl<'a> Builder<'a> {
 			first,
 			Some(self.arena.prepend(first_continuation, continuation)),
 		)
+	}
+
+	fn is_number(&self, expression: ast::ExprId) -> bool {
+		match self.ast.expr(expression) {
+			ast::Expression::Int { .. } | ast::Expression::Float => true,
+			ast::Expression::Unary {
+				operator: ast::UnaryOp::InvertSign,
+				operand,
+			} => matches!(
+				self.ast.expr(operand),
+				ast::Expression::Int { .. } | ast::Expression::Float
+			),
+			_ => false,
+		}
 	}
 
 	fn build_expression_contents(&mut self, expression: ast::ExprId) -> NodeId {
@@ -3073,15 +3187,35 @@ impl<'a> Builder<'a> {
 				self.arena.concat(&[val_id, suffix])
 			}
 			ast::Expression::ArrayList { elements } => {
-				let mut items: Vec<NodeId> = vec![self.text(Text::LBracket)];
-				for (i, &element) in ast.list(elements).iter().enumerate() {
-					if i > 0 {
-						items.push(self.text(Text::CommaSp));
-					}
-					items.push(self.build_expression(element));
+				let span = ast.expr_span(expression);
+				let elements = ast.list(elements);
+				let entries: Vec<_> = elements
+					.iter()
+					.map(|&element| {
+						(
+							ast.expr_span(element),
+							self.build_expression_at(
+								element,
+								ExpressionPosition::ListElement,
+							),
+						)
+					})
+					.collect();
+				match elements.iter().all(|&element| self.is_number(element)) {
+					true => self.build_filled_list(
+						span,
+						Text::LBracket,
+						Text::RBracket,
+						&entries,
+					),
+					false => self.build_delimited_list(
+						span,
+						Text::LBracket,
+						Text::RBracket,
+						ListLayout::Tight,
+						entries,
+					),
 				}
-				items.push(self.text(Text::RBracket));
-				self.arena.concat(&items)
 			}
 			ast::Expression::ArrayRepeat { value, count } => {
 				let open = self.text(Text::LBracket);
@@ -3803,14 +3937,7 @@ impl<'a> Renderer<'a> {
 			Node::Group(inner) => {
 				let mode = match mode {
 					RenderMode::Flat => RenderMode::Flat,
-					RenderMode::Break => {
-						let width = (self.config.max_line_width as usize)
-							.saturating_sub(self.position);
-						match self.fits(inner, rest, width) {
-							true => RenderMode::Flat,
-							false => RenderMode::Break,
-						}
-					}
+					RenderMode::Break => self.fits_mode(&[inner], rest),
 				};
 				rest.push(Command {
 					id: inner,
@@ -3840,12 +3967,12 @@ impl<'a> Renderer<'a> {
 				};
 				if matches!(mode, RenderMode::Flat)
 					|| self.fits(
-						fallback,
+						&[fallback],
 						rest,
 						max.saturating_sub(self.position),
 					) {
 					rest.push(flat(fallback, indent));
-				} else if self.fits(body, rest, max.saturating_sub(below)) {
+				} else if self.fits(&[body], rest, max.saturating_sub(below)) {
 					self.indent = below;
 					self.newline_indented();
 					rest.push(flat(body, below));
@@ -3853,6 +3980,77 @@ impl<'a> Renderer<'a> {
 					rest.push(part(fallback));
 				}
 			}
+			Node::Fill { content, gap } => {
+				let Some(gap) =
+					gap.filter(|_| matches!(mode, RenderMode::Break))
+				else {
+					// Flat, or the last content: decided like a group, by
+					// what follows the fill.
+					if let Some(gap) = gap {
+						rest.push(part(gap));
+					}
+					let mode = match mode {
+						RenderMode::Flat => RenderMode::Flat,
+						RenderMode::Break => self.fits_mode(&[content], rest),
+					};
+					rest.push(Command {
+						id: content,
+						indent,
+						mode,
+					});
+					return;
+				};
+				let Node::FillGap { separator, fill } =
+					self.arena.nodes[gap.index()]
+				else {
+					unreachable!("a fill's gap is a `FillGap`");
+				};
+				let Node::Fill {
+					content: next,
+					gap: next_gap,
+				} = self.arena.nodes[fill.index()]
+				else {
+					unreachable!("a fill gap is followed by a `Fill`");
+				};
+				// Each content ends where its separator begins, at a break or a
+				// comment; the last one ends where the fill does.
+				let content_mode = self.fits_mode(&[content], &[]);
+				let after_next: &[Command] = match next_gap {
+					Some(_) => &[],
+					None => rest,
+				};
+				let separator_mode = match content_mode {
+					RenderMode::Flat => {
+						self.fits_mode(&[content, separator, next], after_next)
+					}
+					RenderMode::Break => RenderMode::Break,
+				};
+				rest.push(part(fill));
+				rest.push(Command {
+					id: separator,
+					indent,
+					mode: separator_mode,
+				});
+				rest.push(Command {
+					id: content,
+					indent,
+					mode: content_mode,
+				});
+			}
+			Node::FillGap { separator, fill } => {
+				rest.push(part(fill));
+				rest.push(part(separator));
+			}
+		}
+	}
+
+	/// `group` flat when it fits on the rest of the current line.
+	fn fits_mode(&mut self, group: &[NodeId], rest: &[Command]) -> RenderMode {
+		let width =
+			(self.config.max_line_width as usize).saturating_sub(self.position);
+		match self.fits(group, rest, width) {
+			true => RenderMode::Flat,
+			false => RenderMode::Break,
 		}
 	}
 
@@ -3862,13 +4060,19 @@ impl<'a> Renderer<'a> {
 	/// to be decided there counts as broken, so its first possible break ends
 	/// the line (it can always take it). A hard break, or source text over
 	/// several lines, inside `group` means it cannot be flat at all.
-	fn fits(&mut self, group: NodeId, rest: &[Command], width: usize) -> bool {
+	fn fits(
+		&mut self,
+		group: &[NodeId],
+		rest: &[Command],
+		width: usize,
+	) -> bool {
 		self.unmeasured.clear();
-		self.unmeasured.push(Unmeasured {
-			id: group,
-			mode: RenderMode::Flat,
-			follows: false,
-		});
+		self.unmeasured
+			.extend(group.iter().rev().map(|&id| Unmeasured {
+				id,
+				mode: RenderMode::Flat,
+				follows: false,
+			}));
 		let mut width = width as isize;
 		let mut next_rest = rest.len();
 		loop {
@@ -3944,6 +4148,22 @@ impl<'a> Renderer<'a> {
 					}),
 					RenderMode::Break => return true,
 				},
+				Node::Fill { content, gap } => {
+					if let Some(gap) = gap {
+						self.unmeasured.push(Unmeasured { id: gap, ..entry });
+					}
+					self.unmeasured.push(Unmeasured {
+						id: content,
+						..entry
+					});
+				}
+				Node::FillGap { separator, fill } => {
+					self.unmeasured.push(Unmeasured { id: fill, ..entry });
+					self.unmeasured.push(Unmeasured {
+						id: separator,
+						..entry
+					});
+				}
 			}
 			if width < 0 {
 				return false;

@@ -1327,8 +1327,7 @@ fn short_method_chains_stay_inline_and_long_chains_break_before_each_method() {
 		),
 		indoc! {"
 			func f() {
-			    local value = source
-			        .decode::<Packet>()
+			    local value = source.decode::<Packet>()
 			        .validate()
 			        .finish();
 			}
@@ -4888,6 +4887,252 @@ fn comments_in_type_lists_are_kept() {
 			        Size = u32, // a wasm32 address
 			    },
 			>() {}
+		"},
+	);
+}
+
+#[test]
+fn an_array_list_breaks_one_element_per_line_when_it_does_not_fit() {
+	assert_eq!(
+		checked_format(
+			"const C: heap::&[Command] = [Command(\"start\", \"greet and show this help\", Action::Start), Command(\"help\", \"show this help\", Action::Help)];",
+			80,
+			4,
+		),
+		indoc! {r#"
+            const C: heap::&[Command] = [
+                Command("start", "greet and show this help", Action::Start),
+                Command("help", "show this help", Action::Help),
+            ];
+        "#},
+	);
+	assert_eq!(
+		checked_format("func f() { local xs = [1, 2, 3,]; g([a, b]); }", 80, 4),
+		indoc! {"
+            func f() {
+                local xs = [1, 2, 3];
+                g([a, b]);
+            }
+        "},
+	);
+	assert_eq!(
+		checked_format(
+			"func f() { g([aaaaaaaaaaaaaaaaaaaa, bbbbbbbbbbbbbbbbbbbb, cccccccccccccccccccc, dddddddd]); }",
+			80,
+			4,
+		),
+		indoc! {"
+            func f() {
+                g([
+                    aaaaaaaaaaaaaaaaaaaa,
+                    bbbbbbbbbbbbbbbbbbbb,
+                    cccccccccccccccccccc,
+                    dddddddd,
+                ]);
+            }
+        "},
+	);
+}
+
+#[test]
+fn an_array_list_keeps_its_comments() {
+	assert_eq!(
+		checked_format(
+			"func f() { local xs = [\n// first\na,\nb, // two\n]; }",
+			80,
+			4,
+		),
+		indoc! {"
+            func f() {
+                local xs = [
+                    // first
+                    a,
+                    b, // two
+                ];
+            }
+        "},
+	);
+}
+
+#[test]
+fn a_broken_chain_keeps_its_first_method_on_a_plain_name_only() {
+	assert_eq!(
+		checked_format(
+			"func f() { ui.button(label).padding(10).width(72).rounded(8).bg(DARK).text_size(16); Builder::new().padding(10).width(72).rounded(8).bg(DARK).text_size(16); }",
+			48,
+			4,
+		),
+		indoc! {"
+			func f() {
+			    ui.button(label)
+			        .padding(10)
+			        .width(72)
+			        .rounded(8)
+			        .bg(DARK)
+			        .text_size(16);
+			    Builder::new()
+			        .padding(10)
+			        .width(72)
+			        .rounded(8)
+			        .bg(DARK)
+			        .text_size(16);
+			}
+		"},
+	);
+}
+
+#[test]
+fn a_number_table_fills_each_line() {
+	assert_eq!(
+		checked_format(
+			"const T: heap::&[i32] = [1, -2, 3]; const U: heap::&[u32] = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5];",
+			48,
+			4,
+		),
+		indoc! {"
+			const T: heap::&[i32] = [1, -2, 3];
+			const U: heap::&[u32] = [
+			    0x428a2f98, 0x71374491, 0xb5c0fbcf,
+			    0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+			    0x923f82a4, 0xab1c5ed5,
+			];
+		"},
+	);
+	// A comment or blank line ends its line; an empty `//` sets a row's
+	// length. A row too wide for the line still wraps within itself.
+	assert_eq!(
+		checked_format(
+			indoc! {"
+				const T: heap::&[u32] = [
+				    0, 0, 23, 0, // deny telnet
+				    6, 0, 80, 1, //
+				    // own line
+				    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, //
+
+				    1, 2,
+				];
+			"},
+			48,
+			4,
+		),
+		indoc! {"
+			const T: heap::&[u32] = [
+			    0, 0, 23, 0, // deny telnet
+			    6, 0, 80, 1, //
+			    // own line
+			    0x428a2f98, 0x71374491, 0xb5c0fbcf,
+			    0xe9b5dba5, //
+
+			    1, 2,
+			];
+		"},
+	);
+}
+
+#[test]
+fn a_use_group_fills_each_line_and_keeps_its_comments() {
+	assert_eq!(
+		checked_format(
+			indoc! {"
+				use super::{Alpha, Beta as B, c::{D, E}};
+				use super::{AlphaAlpha, BetaBeta, GammaGamma, DeltaDelta, Epsilon};
+				use super::{
+				    // sources
+				    Reader, Writer, //
+				    Codec, // the codec
+				    Packet};
+			"},
+			48,
+			4,
+		),
+		indoc! {"
+			use super::{Alpha, Beta as B, c::{D, E}};
+			use super::{
+			    AlphaAlpha, BetaBeta, GammaGamma,
+			    DeltaDelta, Epsilon,
+			};
+			use super::{
+			    // sources
+			    Reader, Writer, //
+			    Codec, // the codec
+			    Packet,
+			};
+		"},
+	);
+}
+
+/// A nested group packs like any entry while it fits on the line; once it
+/// breaks, it takes whole lines, and the names after it start a new one.
+#[test]
+fn a_nested_use_group_packs_until_it_breaks() {
+	let source = indoc! {"
+		use super::{Alpha, Beta as B, c::{D, E}};
+		use super::{Reader, Writer, codec::{Encoder, Decoder, Options, Error, Frame, Header, Payload, Checksum, Trailer}, Packet, Session};
+		use super::{Reader, Writer, Packet, Session, Stream, codec::{Encoder, Decoder, Options}, Socket};
+		use super::{codec::{Encoder, Decoder}, Reader, Writer, Packet, Session, Stream, Socket, Buffer};
+		use super::{Reader, Writer, Packet, Session, Stream, Socket, Buffer, codec::{Encoder, Decoder}};
+		use super::{Reader, Writer, Packet, Session, codec::{Encoder, Decoder}, io::{Read, Write}, Socket};
+		use super::{Reader, Writer, //
+		    codec::{Encoder, Decoder}, // codecs
+		    Packet, Session, Stream, Socket, Buffer, Channel, Context, Handler, Router};
+	"};
+	assert_eq!(
+		checked_format(source, 80, 4),
+		indoc! {"
+			use super::{Alpha, Beta as B, c::{D, E}};
+			use super::{
+			    Reader, Writer,
+			    codec::{
+			        Encoder, Decoder, Options, Error, Frame, Header, Payload, Checksum,
+			        Trailer,
+			    },
+			    Packet, Session,
+			};
+			use super::{
+			    Reader, Writer, Packet, Session, Stream, codec::{Encoder, Decoder, Options},
+			    Socket,
+			};
+			use super::{
+			    codec::{Encoder, Decoder}, Reader, Writer, Packet, Session, Stream, Socket,
+			    Buffer,
+			};
+			use super::{
+			    Reader, Writer, Packet, Session, Stream, Socket, Buffer,
+			    codec::{Encoder, Decoder},
+			};
+			use super::{
+			    Reader, Writer, Packet, Session, codec::{Encoder, Decoder},
+			    io::{Read, Write}, Socket,
+			};
+			use super::{
+			    Reader, Writer, //
+			    codec::{Encoder, Decoder}, // codecs
+			    Packet, Session, Stream, Socket, Buffer, Channel, Context, Handler, Router,
+			};
+		"},
+	);
+}
+
+/// The last number's trailing comma counts toward its line, exactly at the
+/// width.
+#[test]
+fn a_filled_line_counts_the_trailing_comma() {
+	let format = |source| checked_format(source, 24, 4);
+	assert_eq!(
+		format("const T: heap::&[u16] = [100, 200, 300, 4000];"),
+		indoc! {"
+			const T: heap::&[u16] = [
+			    100, 200, 300, 4000,
+			];
+		"},
+	);
+	assert_eq!(
+		format("const T: heap::&[u32] = [100, 200, 300, 40000];"),
+		indoc! {"
+			const T: heap::&[u32] = [
+			    100, 200, 300,
+			    40000,
+			];
 		"},
 	);
 }

@@ -89,8 +89,8 @@ func alloc_bytes(size: u32, align: u32) -> heap::*u8 {
     local end = start.add(size);
     local cur_end = heap.size_bytes();
     if (end.addr() > cur_end) {
-        local needed = (end.addr() - cur_end + heap::PAGE_SIZE - 1)
-            / heap::PAGE_SIZE;
+        local needed =
+            (end.addr() - cur_end + heap::PAGE_SIZE - 1) / heap::PAGE_SIZE;
         _ = heap.grow(needed);
     }
     bump.set(end.as_ptr());
@@ -108,8 +108,8 @@ func put_pixel(x: i32, y: i32, r: u8, g: u8, b: u8) {
     if (x < 0 || y < 0 || x >= SCREEN_W || y >= SCREEN_H) {
         return;
     }
-    local idx = transmute::<_, u32>(y) * transmute::<_, u32>(SCREEN_W)
-        + transmute(x);
+    local idx =
+        transmute::<_, u32>(y) * transmute::<_, u32>(SCREEN_W) + transmute(x);
     local rgba = transmute::<_, u32>(r)
         | (transmute::<_, u32>(g) << 8)
         | (transmute::<_, u32>(b) << 16)
@@ -195,14 +195,10 @@ pub func render() {
             line_height = (SCREEN_H.to_f64() / corrected).to_i32();
         }
 
-        local draw_start = (SCREEN_H / 2 - line_height / 2).clamp(
-            0,
-            SCREEN_H - 1,
-        );
-        local draw_end = (SCREEN_H / 2 + line_height / 2).clamp(
-            0,
-            SCREEN_H - 1,
-        );
+        local draw_start =
+            (SCREEN_H / 2 - line_height / 2).clamp(0, SCREEN_H - 1);
+        local draw_end =
+            (SCREEN_H / 2 + line_height / 2).clamp(0, SCREEN_H - 1);
 
         local mut shade: u8 = 200;
         if (hit.side == 1) { shade = 140 };
@@ -247,10 +243,10 @@ pub func update(dt_ms: i64) {
     local perp_x = -dir_y;
     local perp_y = dir_x;
 
-    local nx = player_x.get()
-        + (dir_x * forward + perp_x * strafe) * MOVE_SPEED * dt;
-    local ny = player_y.get()
-        + (dir_y * forward + perp_y * strafe) * MOVE_SPEED * dt;
+    local nx =
+        player_x.get() + (dir_x * forward + perp_x * strafe) * MOVE_SPEED * dt;
+    local ny =
+        player_y.get() + (dir_y * forward + perp_y * strafe) * MOVE_SPEED * dt;
 
     if (!is_wall(nx, player_y.get())) {
         player_x.set(nx);

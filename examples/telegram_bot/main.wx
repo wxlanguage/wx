@@ -67,51 +67,28 @@ enum Action(value: u32) {
 
 /// The declarative route table. The framework uses it for lookup and generated
 /// help; it never hardcodes a command name.
-const COMMANDS: telegram::text::&[Command<Action>] = [Command(
-    "start",
-    "greet and show this help",
-    Action::Start,
-), Command("help", "show this help", Action::Help), Command(
-    "ping",
-    "health check",
-    Action::Ping,
-), Command("echo", "<text> repeat text", Action::Echo), Command(
-    "upper",
-    "<text> ASCII uppercase",
-    Action::Upper,
-), Command("lower", "<text> ASCII lowercase", Action::Lower), Command(
-    "reverse",
-    "<text> reverse UTF-8 scalar values",
-    Action::Reverse,
-), Command("len", "<text> bytes, characters, validity", Action::Len), Command(
-    "codepoints",
-    "<text> U+ values, first 32",
-    Action::Codepoints,
-), Command("roll", "[NdM] dice, default 1d6", Action::Roll), Command(
-    "choose",
-    "a | b pick one option",
-    Action::Choose,
-), Command("8ball", "<question> the classic oracle", Action::Oracle), Command(
-    "id",
-    "this chat's id",
-    Action::Id,
-), Command("stats", "process and state stats", Action::Stats), Command(
-    "quiz",
-    "start a quiz",
-    Action::Quiz,
-), Command(
-    "answer",
-    "<1|2|3> answer the current question",
-    Action::Answer,
-), Command("skip", "next question, no score", Action::Skip), Command(
-    "score",
-    "current score",
-    Action::Score,
-), Command("reset", "clear this chat's score", Action::Reset), Command(
-    "quit",
-    "stop the quiz",
-    Action::Quit,
-)];
+const COMMANDS: telegram::text::&[Command<Action>] = [
+    Command("start", "greet and show this help", Action::Start),
+    Command("help", "show this help", Action::Help),
+    Command("ping", "health check", Action::Ping),
+    Command("echo", "<text> repeat text", Action::Echo),
+    Command("upper", "<text> ASCII uppercase", Action::Upper),
+    Command("lower", "<text> ASCII lowercase", Action::Lower),
+    Command("reverse", "<text> reverse UTF-8 scalar values", Action::Reverse),
+    Command("len", "<text> bytes, characters, validity", Action::Len),
+    Command("codepoints", "<text> U+ values, first 32", Action::Codepoints),
+    Command("roll", "[NdM] dice, default 1d6", Action::Roll),
+    Command("choose", "a | b pick one option", Action::Choose),
+    Command("8ball", "<question> the classic oracle", Action::Oracle),
+    Command("id", "this chat's id", Action::Id),
+    Command("stats", "process and state stats", Action::Stats),
+    Command("quiz", "start a quiz", Action::Quiz),
+    Command("answer", "<1|2|3> answer the current question", Action::Answer),
+    Command("skip", "next question, no score", Action::Skip),
+    Command("score", "current score", Action::Score),
+    Command("reset", "clear this chat's score", Action::Reset),
+    Command("quit", "stop the quiz", Action::Quit),
+];
 
 // ── state table ──────────────────────────────────────────────────────────────
 func chats() -> quiz::*[ChatSlot] {
@@ -212,8 +189,7 @@ func reverse_utf8(res: Response, text: Input) -> Response {
 
 func show_utf8(res: Response, text: Input) -> Response {
     local (valid, message) = utf8::Str::from_bytes(text);
-    local o = res
-        .text("bytes: ")
+    local o = res.text("bytes: ")
         .decimal(message.byte_len())
         .newline()
         .text("scalar values: ");
@@ -408,8 +384,7 @@ func next_question(current: u32) -> u32 {
 func ask(res: Response, index: u32) -> Response {
     local slot = chats()[index];
     local q = question_at(slot.question);
-    res
-        .text("Question: ")
+    res.text("Question: ")
         .text(q.prompt)
         .text("\n1) ")
         .text(q.one)
@@ -464,13 +439,11 @@ func answer_quiz(res: Response, chat_id: i64, answer: Input) -> Response {
     local o = if (correct) {
         res.text("Correct!")
     } else {
-        res
-            .text("Nope. The answer was ")
+        res.text("Nope. The answer was ")
             .decimal(transmute::<u8, u32>(q.answer))
             .text(".")
     };
-    local o = o
-        .text(" Score: ")
+    local o = o.text(" Score: ")
         .decimal(slots[index].score)
         .text("/")
         .decimal(slots[index].answered)
@@ -489,8 +462,7 @@ func skip_question(res: Response, chat_id: i64) -> Response {
         return res.text("No quiz is running. Send /quiz to start one.")
     }
     local q = question_at(slots[index].question);
-    local o = res
-        .text("Skipped. The answer was ")
+    local o = res.text("Skipped. The answer was ")
         .decimal(transmute::<u8, u32>(q.answer))
         .text(".\n\n");
     slots[index].question = next_question(slots[index].question);
@@ -503,8 +475,7 @@ func quit_quiz(res: Response, chat_id: i64) -> Response {
     local slots = chats();
     if (slots[index].active == 0) { return res.text("No quiz is running.") };
     slots[index].active = 0;
-    res
-        .text("Quiz stopped. Final score: ")
+    res.text("Quiz stopped. Final score: ")
         .decimal(slots[index].score)
         .text("/")
         .decimal(slots[index].answered)
@@ -526,8 +497,7 @@ func show_score(res: Response, chat_id: i64) -> Response {
         return res.text("No quiz yet. Send /quiz to start one.")
     }
     local slot = chats()[index];
-    local o = res
-        .text("Score: ")
+    local o = res.text("Score: ")
         .decimal(slot.score)
         .text(" correct out of ")
         .decimal(slot.answered)
