@@ -330,8 +330,7 @@ pub func updates() -> u64 {
 
 /// The framework's share of a `/stats` reply. Applications append their own.
 pub func stats(res: Response) -> Response {
-    res
-        .text("updates handled: ")
+    res.text("updates handled: ")
         .decimal64(handled.get())
         .newline()
         .text("text memory: ")
@@ -348,8 +347,7 @@ pub func help<A: StackValue>(
     local out = res.text("Commands:\n");
     loop (out = out, i: u32 = 0) {
         if (i == commands.len()) { break out };
-        local next = out
-            .text("/")
+        local next = out.text("/")
             .text(commands[i].name)
             .text(" ")
             .text(commands[i].description)

@@ -39,7 +39,9 @@ global mut dropped_count: u32 = 0;
 
 // The rules are a constant. Each use places the bytes in the memory its
 // context names, so the host never sees them.
-const RULES: policy::&[u8] = [0, 0, 23, 0, 6, 0, 80, 1, 6, 1, 187, 1, 17, 0, 53, 1];
+const RULES: policy::&[u8] = [
+    0, 0, 23, 0, 6, 0, 80, 1, 6, 1, 187, 1, 17, 0, 53, 1,
+];
 
 // One definition reads a big-endian u16 from any memory's bytes. `at` is that
 // memory's own address type, so the same code serves a 32-bit and a 64-bit

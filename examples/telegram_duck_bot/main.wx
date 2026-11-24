@@ -22,23 +22,15 @@ enum Action(value: u32) {
     Stats,
 }
 
-const COMMANDS: telegram::text::&[Command<Action>] = [Command(
-    "start",
-    "meet the duck",
-    Action::Start,
-), Command("help", "show this help", Action::Help), Command(
-    "quack",
-    "a random quack",
-    Action::Quack,
-), Command(
-    "shout",
-    "<text> ASCII uppercase, with feeling",
-    Action::Shout,
-), Command("repeat", "<n> <text> say it n times", Action::Repeat), Command(
-    "about",
-    "what this bot is",
-    Action::About,
-), Command("stats", "process stats", Action::Stats)];
+const COMMANDS: telegram::text::&[Command<Action>] = [
+    Command("start", "meet the duck", Action::Start),
+    Command("help", "show this help", Action::Help),
+    Command("quack", "a random quack", Action::Quack),
+    Command("shout", "<text> ASCII uppercase, with feeling", Action::Shout),
+    Command("repeat", "<n> <text> say it n times", Action::Repeat),
+    Command("about", "what this bot is", Action::About),
+    Command("stats", "process stats", Action::Stats),
+];
 
 func help_text(res: Response) -> Response {
     telegram::help(res, COMMANDS)
@@ -115,8 +107,9 @@ impl telegram::Bot for Duck {
                 }
             },
             Action::Repeat => show_repeat(res, text),
-            Action::About => res
-                .text("A minimal bot on the WX `telegram` framework: ")
+            Action::About => res.text(
+                "A minimal bot on the WX `telegram` framework: ",
+            )
                 .text("one table, one enum, one handler."),
             Action::Stats => telegram::stats(res)
                 .newline()
