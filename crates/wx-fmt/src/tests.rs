@@ -4938,7 +4938,7 @@ fn an_array_list_breaks_one_element_per_line_when_it_does_not_fit() {
 fn an_array_list_keeps_its_comments() {
 	assert_eq!(
 		checked_format(
-			"func f() { local xs = [\n// first\n1,\n2, // two\n]; }",
+			"func f() { local xs = [\n// first\na,\nb, // two\n]; }",
 			80,
 			4,
 		),
@@ -4946,8 +4946,8 @@ fn an_array_list_keeps_its_comments() {
             func f() {
                 local xs = [
                     // first
-                    1,
-                    2, // two
+                    a,
+                    b, // two
                 ];
             }
         "},
@@ -4998,14 +4998,140 @@ fn a_number_table_fills_each_line() {
 			];
 		"},
 	);
-	// A comment keeps one number per line, where it has a place to sit.
+	// A comment or blank line ends its line; an empty `//` sets a row's
+	// length. A row too wide for the line still wraps within itself.
 	assert_eq!(
-		checked_format("const T: heap::&[u8] = [1, 2, // pair\n3];", 48, 4),
+		checked_format(
+			indoc! {"
+				const T: heap::&[u32] = [
+				    0, 0, 23, 0, // deny telnet
+				    6, 0, 80, 1, //
+				    // own line
+				    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, //
+
+				    1, 2,
+				];
+			"},
+			48,
+			4,
+		),
 		indoc! {"
-			const T: heap::&[u8] = [
-			    1,
-			    2, // pair
-			    3,
+			const T: heap::&[u32] = [
+			    0, 0, 23, 0, // deny telnet
+			    6, 0, 80, 1, //
+			    // own line
+			    0x428a2f98, 0x71374491, 0xb5c0fbcf,
+			    0xe9b5dba5, //
+
+			    1, 2,
+			];
+		"},
+	);
+}
+
+#[test]
+fn a_use_group_fills_each_line_and_keeps_its_comments() {
+	assert_eq!(
+		checked_format(
+			indoc! {"
+				use super::{Alpha, Beta as B, c::{D, E}};
+				use super::{AlphaAlpha, BetaBeta, GammaGamma, DeltaDelta, Epsilon};
+				use super::{
+				    // sources
+				    Reader, Writer, //
+				    Codec, // the codec
+				    Packet};
+			"},
+			48,
+			4,
+		),
+		indoc! {"
+			use super::{Alpha, Beta as B, c::{D, E}};
+			use super::{
+			    AlphaAlpha, BetaBeta, GammaGamma,
+			    DeltaDelta, Epsilon,
+			};
+			use super::{
+			    // sources
+			    Reader, Writer, //
+			    Codec, // the codec
+			    Packet,
+			};
+		"},
+	);
+}
+
+/// A nested group packs like any entry while it fits on the line; once it
+/// breaks, it takes whole lines, and the names after it start a new one.
+#[test]
+fn a_nested_use_group_packs_until_it_breaks() {
+	let source = indoc! {"
+		use super::{Alpha, Beta as B, c::{D, E}};
+		use super::{Reader, Writer, codec::{Encoder, Decoder, Options, Error, Frame, Header, Payload, Checksum, Trailer}, Packet, Session};
+		use super::{Reader, Writer, Packet, Session, Stream, codec::{Encoder, Decoder, Options}, Socket};
+		use super::{codec::{Encoder, Decoder}, Reader, Writer, Packet, Session, Stream, Socket, Buffer};
+		use super::{Reader, Writer, Packet, Session, Stream, Socket, Buffer, codec::{Encoder, Decoder}};
+		use super::{Reader, Writer, Packet, Session, codec::{Encoder, Decoder}, io::{Read, Write}, Socket};
+		use super::{Reader, Writer, //
+		    codec::{Encoder, Decoder}, // codecs
+		    Packet, Session, Stream, Socket, Buffer, Channel, Context, Handler, Router};
+	"};
+	assert_eq!(
+		checked_format(source, 80, 4),
+		indoc! {"
+			use super::{Alpha, Beta as B, c::{D, E}};
+			use super::{
+			    Reader, Writer,
+			    codec::{
+			        Encoder, Decoder, Options, Error, Frame, Header, Payload, Checksum,
+			        Trailer,
+			    },
+			    Packet, Session,
+			};
+			use super::{
+			    Reader, Writer, Packet, Session, Stream, codec::{Encoder, Decoder, Options},
+			    Socket,
+			};
+			use super::{
+			    codec::{Encoder, Decoder}, Reader, Writer, Packet, Session, Stream, Socket,
+			    Buffer,
+			};
+			use super::{
+			    Reader, Writer, Packet, Session, Stream, Socket, Buffer,
+			    codec::{Encoder, Decoder},
+			};
+			use super::{
+			    Reader, Writer, Packet, Session, codec::{Encoder, Decoder},
+			    io::{Read, Write}, Socket,
+			};
+			use super::{
+			    Reader, Writer, //
+			    codec::{Encoder, Decoder}, // codecs
+			    Packet, Session, Stream, Socket, Buffer, Channel, Context, Handler, Router,
+			};
+		"},
+	);
+}
+
+/// The last number's trailing comma counts toward its line, exactly at the
+/// width.
+#[test]
+fn a_filled_line_counts_the_trailing_comma() {
+	let format = |source| checked_format(source, 24, 4);
+	assert_eq!(
+		format("const T: heap::&[u16] = [100, 200, 300, 4000];"),
+		indoc! {"
+			const T: heap::&[u16] = [
+			    100, 200, 300, 4000,
+			];
+		"},
+	);
+	assert_eq!(
+		format("const T: heap::&[u32] = [100, 200, 300, 40000];"),
+		indoc! {"
+			const T: heap::&[u32] = [
+			    100, 200, 300,
+			    40000,
 			];
 		"},
 	);
