@@ -1327,8 +1327,7 @@ fn short_method_chains_stay_inline_and_long_chains_break_before_each_method() {
 		),
 		indoc! {"
 			func f() {
-			    local value = source
-			        .decode::<Packet>()
+			    local value = source.decode::<Packet>()
 			        .validate()
 			        .finish();
 			}
@@ -4888,6 +4887,126 @@ fn comments_in_type_lists_are_kept() {
 			        Size = u32, // a wasm32 address
 			    },
 			>() {}
+		"},
+	);
+}
+
+#[test]
+fn an_array_list_breaks_one_element_per_line_when_it_does_not_fit() {
+	assert_eq!(
+		checked_format(
+			"const C: heap::&[Command] = [Command(\"start\", \"greet and show this help\", Action::Start), Command(\"help\", \"show this help\", Action::Help)];",
+			80,
+			4,
+		),
+		indoc! {r#"
+            const C: heap::&[Command] = [
+                Command("start", "greet and show this help", Action::Start),
+                Command("help", "show this help", Action::Help),
+            ];
+        "#},
+	);
+	assert_eq!(
+		checked_format("func f() { local xs = [1, 2, 3,]; g([a, b]); }", 80, 4),
+		indoc! {"
+            func f() {
+                local xs = [1, 2, 3];
+                g([a, b]);
+            }
+        "},
+	);
+	assert_eq!(
+		checked_format(
+			"func f() { g([aaaaaaaaaaaaaaaaaaaa, bbbbbbbbbbbbbbbbbbbb, cccccccccccccccccccc, dddddddd]); }",
+			80,
+			4,
+		),
+		indoc! {"
+            func f() {
+                g([
+                    aaaaaaaaaaaaaaaaaaaa,
+                    bbbbbbbbbbbbbbbbbbbb,
+                    cccccccccccccccccccc,
+                    dddddddd,
+                ]);
+            }
+        "},
+	);
+}
+
+#[test]
+fn an_array_list_keeps_its_comments() {
+	assert_eq!(
+		checked_format(
+			"func f() { local xs = [\n// first\n1,\n2, // two\n]; }",
+			80,
+			4,
+		),
+		indoc! {"
+            func f() {
+                local xs = [
+                    // first
+                    1,
+                    2, // two
+                ];
+            }
+        "},
+	);
+}
+
+#[test]
+fn a_broken_chain_keeps_its_first_method_on_a_plain_name_only() {
+	assert_eq!(
+		checked_format(
+			"func f() { ui.button(label).padding(10).width(72).rounded(8).bg(DARK).text_size(16); Builder::new().padding(10).width(72).rounded(8).bg(DARK).text_size(16); }",
+			48,
+			4,
+		),
+		indoc! {"
+			func f() {
+			    ui.button(label)
+			        .padding(10)
+			        .width(72)
+			        .rounded(8)
+			        .bg(DARK)
+			        .text_size(16);
+			    Builder::new()
+			        .padding(10)
+			        .width(72)
+			        .rounded(8)
+			        .bg(DARK)
+			        .text_size(16);
+			}
+		"},
+	);
+}
+
+#[test]
+fn a_number_table_fills_each_line() {
+	assert_eq!(
+		checked_format(
+			"const T: heap::&[i32] = [1, -2, 3]; const U: heap::&[u32] = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5];",
+			48,
+			4,
+		),
+		indoc! {"
+			const T: heap::&[i32] = [1, -2, 3];
+			const U: heap::&[u32] = [
+			    0x428a2f98, 0x71374491, 0xb5c0fbcf,
+			    0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+			    0x923f82a4, 0xab1c5ed5,
+			];
+		"},
+	);
+	// A comment keeps one number per line, where it has a place to sit.
+	assert_eq!(
+		checked_format("const T: heap::&[u8] = [1, 2, // pair\n3];", 48, 4),
+		indoc! {"
+			const T: heap::&[u8] = [
+			    1,
+			    2, // pair
+			    3,
+			];
 		"},
 	);
 }

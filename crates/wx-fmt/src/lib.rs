@@ -2339,7 +2339,8 @@ impl<'a> Builder<'a> {
 					ast::ArgumentList::Named(_) => true,
 				}
 			}
-			ast::Expression::NamedList { .. } => true,
+			ast::Expression::NamedList { .. }
+			| ast::Expression::ArrayList { .. } => true,
 			_ => false,
 		}
 	}
@@ -2753,7 +2754,15 @@ impl<'a> Builder<'a> {
 			}
 			_ => {
 				methods.reverse();
-				for method in &mut methods {
+				// A plain name keeps its first method, like `ui.button(..)`.
+				let detached = match self.ast.expr(base) {
+					ast::Expression::Path(path) => match self.ast.list(path) {
+						[segment] if segment.type_args.is_empty() => 1,
+						_ => 0,
+					},
+					_ => 0,
+				};
+				for method in &mut methods[detached..] {
 					let line = self.line();
 					let segment = self.arena.concat(&[line, *method]);
 					*method = self.arena.indent(segment);
@@ -2841,6 +2850,49 @@ impl<'a> Builder<'a> {
 			first,
 			Some(self.arena.prepend(first_continuation, continuation)),
 		)
+	}
+
+	fn is_number(&self, expression: ast::ExprId) -> bool {
+		match self.ast.expr(expression) {
+			ast::Expression::Int { .. } | ast::Expression::Float => true,
+			ast::Expression::Unary {
+				operator: ast::UnaryOp::InvertSign,
+				operand,
+			} => matches!(
+				self.ast.expr(operand),
+				ast::Expression::Int { .. } | ast::Expression::Float
+			),
+			_ => false,
+		}
+	}
+
+	/// Numbers fill each line: every separator owns a group, so it breaks
+	/// only when the next number and its comma no longer fit.
+	fn build_number_table(&mut self, elements: &[ast::ExprId]) -> NodeId {
+		let mut nodes = Vec::with_capacity(3 * elements.len() + 1);
+		nodes.push(self.line());
+		for (index, &element) in elements.iter().enumerate() {
+			let number = self.build_expression(element);
+			nodes.push(match index {
+				0 => number,
+				_ => {
+					let gap = self.soft_line();
+					let entry = self.arena.concat(&[gap, number]);
+					self.arena.group(entry)
+				}
+			});
+			nodes.push(match index + 1 < elements.len() {
+				true => self.text(Text::Comma),
+				false => self.if_break_comma(),
+			});
+		}
+		let numbers = self.arena.concat(&nodes);
+		let numbers = self.arena.indent(numbers);
+		let open = self.text(Text::LBracket);
+		let line = self.line();
+		let close = self.text(Text::RBracket);
+		let table = self.arena.concat(&[open, numbers, line, close]);
+		self.arena.group(table)
 	}
 
 	fn build_expression_contents(&mut self, expression: ast::ExprId) -> NodeId {
@@ -3073,15 +3125,33 @@ impl<'a> Builder<'a> {
 				self.arena.concat(&[val_id, suffix])
 			}
 			ast::Expression::ArrayList { elements } => {
-				let mut items: Vec<NodeId> = vec![self.text(Text::LBracket)];
-				for (i, &element) in ast.list(elements).iter().enumerate() {
-					if i > 0 {
-						items.push(self.text(Text::CommaSp));
-					}
-					items.push(self.build_expression(element));
+				let span = ast.expr_span(expression);
+				let elements = ast.list(elements);
+				if !elements.is_empty()
+					&& elements.iter().all(|&element| self.is_number(element))
+					&& self.comments.between(span.start, span.end).is_empty()
+				{
+					return self.build_number_table(elements);
 				}
-				items.push(self.text(Text::RBracket));
-				self.arena.concat(&items)
+				let entries = elements
+					.iter()
+					.map(|&element| {
+						(
+							ast.expr_span(element),
+							self.build_expression_at(
+								element,
+								ExpressionPosition::ListElement,
+							),
+						)
+					})
+					.collect();
+				self.build_delimited_list(
+					span,
+					Text::LBracket,
+					Text::RBracket,
+					ListLayout::Tight,
+					entries,
+				)
 			}
 			ast::Expression::ArrayRepeat { value, count } => {
 				let open = self.text(Text::LBracket);
