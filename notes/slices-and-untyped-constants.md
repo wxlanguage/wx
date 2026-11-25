@@ -462,6 +462,10 @@ inside the compiler as `<T as Pointee>::Metadata<M::Size>`, which also
 makes the two rigid forms above one type; the `Pointer` API does not
 change.
 
+Revisited 2026-11-25 (`pointee-and-sized.md`): metadata moves to a
+`Pointee` trait with `type Metadata<Size: PointerSize>`, `Sized: Pointee`,
+and `Pointer`'s metadata is derived from it.
+
 What the trait does not change yet:
 
 - `len()` on a slice reads the first count, as it does now.
