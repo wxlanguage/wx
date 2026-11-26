@@ -678,9 +678,8 @@ superseded by the steps above.
 
 ## Order of work
 
-0. Finiteness, steps 1–4 of "Implementation steps" under "Infinite
-   types": done 2026-11-26; step 5 when convenient. Independent of the
-   traits below.
+0. Finiteness, steps 1–5 of "Implementation steps" under "Infinite
+   types": done 2026-11-26. Independent of the traits below.
 1. `Sized`, as in "Sized" of `slices-and-untyped-constants.md`: replaces
    `size_of`/`align_of` and gives array elements their stride; its layout
    runs inside constant evaluation ("Layout cycles are not infinite
