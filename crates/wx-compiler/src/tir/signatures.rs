@@ -15,7 +15,7 @@
 //!
 //! A type parameter's *identity* lives in `GenericEnvArena` (addressed by the
 //! `GenericEnvIdx` each signature carries); what a scope's bounds state is a
-//! resolved-signature fact in `assumption_envs` (`bounds::AssumptionEnvArena`), clauses
+//! resolved-signature fact in `assumption_envs` (`clauses::AssumptionEnvArena`), clauses
 //! about any subject rather than one parameter's. Parameters are not
 //! `decls.rs` citizens: nobody writes `foo::T`, so a parameter is only ever
 //! reachable from the item that declares it.
@@ -37,7 +37,7 @@ use crate::vfs::{FileId, Files};
 use super::body::{
 	Body, BodyIdx, BodyOwner, ConstBody, FunctionImplementation, Obligations,
 };
-use super::bounds::{
+use super::clauses::{
 	AssumptionEnvArena, AssumptionEnvIdx, BindingRequirement, BoundArena,
 	BoundClauses, BoundId, Clause, ClauseArena, SourceAssocBinding,
 	SourceTraitBound, TraitClause, push_trait_clause,
@@ -571,7 +571,7 @@ pub struct Semantics {
 	/// (`BoundClauses`).
 	pub(super) clauses: ClauseArena,
 	pub generic_envs: GenericEnvArena,
-	/// What each scope's bounds state (`bounds::AssumptionEnvArena`), kept apart
+	/// What each scope's bounds state (`clauses::AssumptionEnvArena`), kept apart
 	/// from the frames' identities in `generic_envs`. Grown once per frame,
 	/// right after `push_param_frame` created it.
 	pub(super) assumption_envs: AssumptionEnvArena,
@@ -7356,7 +7356,7 @@ pub(super) mod tests {
 
 	mod assumption_context {
 		use super::*;
-		use crate::tir::bounds::Readiness;
+		use crate::tir::clauses::Readiness;
 		use crate::tir::types::Substitution;
 
 		fn memberships(
@@ -15514,7 +15514,7 @@ pub(super) mod tests {
 	/// = u64> {}`, `func f<T: B + C>() {}`): rejected immediately with
 	/// `E0284`, zero uses of `T` anywhere past the bound list — bound
 	/// well-formedness is checked once at declaration, not deferred to
-	/// first use. wx matches that here (see `bounds::AssumptionEnv`);
+	/// first use. wx matches that here (see `clauses::AssumptionEnv`);
 	/// `a_functions_unused_bound_combination_with_conflicting_assoc_type_bindings_is_still_diagnosed`
 	/// below re-checks the fully-unused case, which the old
 	/// lazy-on-first-projection design let compile silently.
@@ -16424,7 +16424,7 @@ pub(super) mod tests {
 
 	mod sweep_complete {
 		use super::*;
-		use crate::tir::bounds::Readiness;
+		use crate::tir::clauses::Readiness;
 
 		#[test]
 		fn swept_context_preserves_evidence_for_a_normalized_parameter() {

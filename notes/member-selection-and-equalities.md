@@ -438,7 +438,7 @@ one normalized list per item with its parents' predicates in it.
 3. `RewriteFlags` becomes normalization with or without values: nothing
    normalizes with `EQUALITIES` alone once source 3 is gone.
 
-**Stage 1 as built** (`tir/completion.rs`). What implementing it settled:
+**Stage 1 as built** (`tir/clauses/normalization.rs`). What implementing it settled:
 
 - An equality of the frame's own about the frame's own parameters keeps
   its projection as written: the parent knows nothing about them, and the

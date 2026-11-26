@@ -3,7 +3,7 @@ use std::fmt;
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::bounds::{AssumptionEnvIdx, BindingRef, Readiness};
+use super::clauses::{AssumptionEnvIdx, BindingRef, Readiness};
 use super::decls::{ConstIdx, TypesetIdx};
 use super::eval::ResolvedConstant;
 use super::numbers::{DecimalFloat, FloatRangeError};

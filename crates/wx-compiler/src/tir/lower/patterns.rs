@@ -28,7 +28,7 @@ use crate::diagnostics::TextSpan;
 use crate::tir::body::{
 	Arm, ArmRange, ExprKind, PatIdx, PatternKind, PatternRange,
 };
-use crate::tir::bounds::AssumptionEnvIdx;
+use crate::tir::clauses::AssumptionEnvIdx;
 use crate::tir::decls::{ConstIdx, FieldIdx, MemberKind};
 use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
 use crate::tir::types::Primitive;

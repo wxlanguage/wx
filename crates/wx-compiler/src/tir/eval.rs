@@ -38,7 +38,7 @@ use super::body::{
 	Body, ConstBody, ElementOrder, ExprIdx, ExprKind, ExprRange,
 	FunctionImplementation,
 };
-use super::bounds::AssumptionEnvIdx;
+use super::clauses::AssumptionEnvIdx;
 use super::decls::{
 	ConstIdx, EnumIdx, FunctionIdx, GlobalIdx, MemberKind, MemberOwner,
 	MemoryIdx,

@@ -8,7 +8,7 @@ use codespan_reporting::diagnostic::{Diagnostic, Label};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use super::bounds::AssumptionEnvIdx;
+use super::clauses::AssumptionEnvIdx;
 use super::decls::{FieldIdx, StructIdx};
 use super::signatures::Semantics;
 use super::solver::{NormalizationDepth, RewriteFlags, SolverError};

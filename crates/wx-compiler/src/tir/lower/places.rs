@@ -20,7 +20,7 @@ use super::{
 use crate::ast::BinaryOp;
 use crate::diagnostics::TextSpan;
 use crate::tir::body::{ExprIdx, Place, PlaceIdx, PlaceKind};
-use crate::tir::bounds::AssumptionEnvIdx;
+use crate::tir::clauses::AssumptionEnvIdx;
 use crate::tir::decls::FunctionIdx;
 use crate::tir::layout::MemoryForm;
 use crate::tir::types::Primitive;

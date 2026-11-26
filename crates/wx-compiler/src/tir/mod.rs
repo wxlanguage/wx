@@ -1,6 +1,5 @@
 mod body;
-mod bounds;
-mod completion;
+mod clauses;
 mod conformance;
 mod decls;
 mod eval;

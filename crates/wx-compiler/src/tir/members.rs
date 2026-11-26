@@ -17,7 +17,9 @@ use crate::vfs::FileId;
 use smallvec::SmallVec;
 
 use super::body::BodyOwner;
-use super::bounds::{AssumptionEnvIdx, Readiness, report_not_a_binding_member};
+use super::clauses::{
+	AssumptionEnvIdx, Readiness, report_not_a_binding_member,
+};
 use super::decls::{
 	AssocTypeIdx, AstNodeRef, BindingKey, ConstIdx, DeclKind, Declarations,
 	Declared, FieldIdx, FieldOwner, FunctionIdx, InherentImplIdx, MemberKind,

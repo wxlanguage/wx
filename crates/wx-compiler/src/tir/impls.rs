@@ -15,7 +15,7 @@ use crate::{
 };
 
 use super::{
-	bounds::report_not_a_trait_bound,
+	clauses::report_not_a_trait_bound,
 	decls::{
 		AstEntry, AstNodeRef, BindingKey, DeclKind, Declarations,
 		DuplicateDefinitionDiagnostic, InherentImplIdx, IntrinsicDefs,

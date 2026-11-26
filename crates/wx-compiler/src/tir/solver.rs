@@ -15,7 +15,7 @@ use crate::ast::{Ownership, StringInterner};
 #[cfg(test)]
 use crate::diagnostics::SourceSpan;
 
-use super::bounds::{
+use super::clauses::{
 	AssumptionEnvIdx, BindingRef, BoundClauses, BoundId, Clause, Readiness,
 	SelfSubstitution, known_distinct,
 };

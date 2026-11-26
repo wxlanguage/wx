@@ -14,7 +14,7 @@
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::bounds::{
+use super::clauses::{
 	AssumptionEnvIdx, BoundClauses, BoundId, Clause, EqualityClause,
 	RepresentableClause, TraitClause,
 };
@@ -31,7 +31,7 @@ use super::solver::{
 use super::types::{GenericArgs, GenericEnvIdx, Type, TypeIndex};
 use crate::ast::{self, Keyword, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
-use crate::tir::bounds::{BindingRef, BindingRequirement};
+use crate::tir::clauses::{BindingRef, BindingRequirement};
 use crate::tir::types::GenericEnvOwner;
 use crate::vfs::FileId;
 

@@ -47,7 +47,7 @@ use super::body::{
 	ExprRange, JumpTarget, LocalIdx, Obligations, ScopeIdx, ScopeKind,
 	TargetIdx, TargetKind,
 };
-use super::bounds::AssumptionEnvIdx;
+use super::clauses::AssumptionEnvIdx;
 use super::decls::{
 	BindingTarget, ConstIdx, DeclKind, FunctionIdx, ItemLoc, MemberKind,
 	StructIdx, Tier, Visibility,

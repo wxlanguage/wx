@@ -49,7 +49,7 @@ use super::body::{
 	Body, ElementOrder, ExprIdx, ExprKind, FunctionImplementation, PatIdx,
 	ScopeIdx,
 };
-use super::bounds::AssumptionEnvIdx;
+use super::clauses::AssumptionEnvIdx;
 use super::decls::{
 	Attributes, Declared, FieldIdx, FunctionIdx, GlobalIdx, MemoryIdx,
 	PackageMemberItem, Scope,

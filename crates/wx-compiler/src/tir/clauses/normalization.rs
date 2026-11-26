@@ -1,18 +1,18 @@
-//! Each frame's completed env: its clauses, and the clauses in scope around
-//! it, rewritten by the equalities in scope once every signature exists
-//! (`notes/member-selection-and-equalities.md`, decision 2). Construction and
-//! path selection read the written env; everything after construction reads
-//! this one.
-
-use super::bounds::{
+//! Normalizing a frame's assumption env: its written env, the clauses in
+//! scope as construction made them, rewritten by the equalities in scope into
+//! its completed env, once every signature exists
+//! (`notes/member-selection-and-equalities.md`, decision 2). Path selection
+//! reads the written env; everything after construction reads the completed
+//! one.
+use super::{
 	AssumptionEnvIdx, BoundClauses, Clause, ClauseRange, EqualityClause,
 	FrameCompletion, RepresentableClause, TraitClause, push_trait_clause,
 };
-use super::signatures::Semantics;
-use super::solver::{NormalizationDepth, RewriteFlags, SolverError};
-use super::types::{GenericEnvIdx, Type, TypeIndex};
 use crate::ast::StringInterner;
 use crate::diagnostics::SourceSpan;
+use crate::tir::signatures::Semantics;
+use crate::tir::solver::{NormalizationDepth, RewriteFlags, SolverError};
+use crate::tir::types::{GenericEnvIdx, Type, TypeIndex};
 
 /// The clauses a completed env holds, and the written clauses it proves
 /// instead of assuming.
@@ -58,7 +58,7 @@ impl Semantics {
 	/// what `frame` states, once; a frame read again later gets the same env.
 	/// Asked once every signature exists, so nothing it normalizes is
 	/// `Pending`.
-	pub(super) fn completed_env(
+	pub(in crate::tir) fn completed_env(
 		&mut self,
 		strings: &StringInterner,
 		frame: GenericEnvIdx,
@@ -81,7 +81,10 @@ impl Semantics {
 
 	/// Completes every frame not asked for yet, so readers that run after
 	/// declarations are checked find each complete.
-	pub(super) fn complete_every_frame(&mut self, strings: &StringInterner) {
+	pub(in crate::tir) fn complete_every_frame(
+		&mut self,
+		strings: &StringInterner,
+	) {
 		for frame in 0..self.assumption_envs.frame_count() {
 			let frame = GenericEnvIdx::new(u32::try_from(frame).unwrap());
 			self.completed_env(strings, frame);

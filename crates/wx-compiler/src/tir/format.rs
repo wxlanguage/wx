@@ -19,7 +19,7 @@ use std::fmt::Write as _;
 
 use crate::ast::{Ownership, StringInterner};
 
-use super::bounds::{
+use super::clauses::{
 	BindingRequirement, BoundArena, BoundId, SourceTraitBound,
 };
 use super::decls::{

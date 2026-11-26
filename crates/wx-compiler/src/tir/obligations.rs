@@ -16,7 +16,7 @@
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::bounds::AssumptionEnvIdx;
+use super::clauses::AssumptionEnvIdx;
 use super::decls::{AssocTypeIdx, BindingKey, TraitIdx};
 use super::literals::ConcreteType;
 use super::members::report_type_does_not_implement_trait;

@@ -33,7 +33,7 @@ use std::hash::BuildHasher;
 use hashbrown::HashTable;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
-use super::bounds::AssumptionEnvIdx;
+use super::clauses::AssumptionEnvIdx;
 use super::decls::{FieldIdx, FieldOrder, StructIdx};
 use super::finiteness::FiniteType;
 use super::signatures::Semantics;

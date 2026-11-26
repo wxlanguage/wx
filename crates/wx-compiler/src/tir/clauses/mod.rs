@@ -1,4 +1,5 @@
-//! Trait bounds: as written, as clauses, and as read.
+//! Clauses: as written (bounds), as statements about types, and as what
+//! each scope assumes.
 //!
 //! A clause is one statement a bound makes about types: `T: Tr` (a
 //! `TraitClause`) or `<T as Tr>::A == X` (an `EqualityClause`). Its
@@ -28,6 +29,16 @@
 //!   there rather than expanded into a parameter's: a recursive trait
 //!   describes infinitely many paths.
 //!
+//! An assumption env is the clauses a scope may assume: its own, then,
+//! through `parent`, those of the scopes around it. Each frame (an item's
+//! generic parameter list, `GenericEnvIdx`) is read in one: its own when the
+//! item writes clauses, else its parent's. Construction makes the frame's
+//! written env, its clauses as written, which path selection reads. Once
+//! every signature exists, `normalization` rewrites it by the equalities in
+//! scope into its completed env, which everything after construction reads.
+//! A frame's requirements are the same clauses in the other role: proved at
+//! each use, as written, never rewritten.
+//!
 //! A query's assumptions are named by an `AssumptionEnvIdx` called
 //! `assumption_context`: the assumption env of the declaration whose bounds
 //! (and enclosing declarations' bounds) apply. It is not the environment a
@@ -52,6 +63,8 @@ use super::signatures::{
 	AssocTypeSignature, QueryInfo, Semantics, SemanticsBuilder,
 	SignatureStatus, TraitSignature,
 };
+mod normalization;
+
 use super::types::{
 	GenericEnvArena, GenericEnvIdx, GenericEnvOwner, Substitution, Type,
 	TypeIndex, TypeInterner,

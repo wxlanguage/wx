@@ -27,7 +27,7 @@
 //! parameters. Its own clauses are proved there, and its signature is
 //! compared there.
 
-use super::bounds::{
+use super::clauses::{
 	AssumptionEnvIdx, BoundClauses, BoundId, Clause, EqualityClause,
 	RepresentableClause, TraitClause,
 };
