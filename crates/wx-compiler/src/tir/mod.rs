@@ -3,6 +3,7 @@ mod bounds;
 mod conformance;
 mod decls;
 mod eval;
+mod finiteness;
 mod format;
 mod impls;
 mod imports;

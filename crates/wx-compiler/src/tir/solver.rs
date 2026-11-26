@@ -26,6 +26,7 @@ use super::eval::{
 	Allocation, ConstValue, ConstValueState, Instance, ResolvedConstant,
 	StaticInstance,
 };
+use super::finiteness::Finiteness;
 use super::impls::ImplTarget;
 use super::layout::Layouts;
 use super::literals::UntypedValue;
@@ -345,6 +346,10 @@ pub(super) enum Verdict {
 	/// The definition requires itself through definitions only, and owns the
 	/// loop. Its check reports it.
 	Cyclic(Box<ProjectionCycle>),
+	/// A member's value normalizes but stores itself directly, through a
+	/// projection the member picks. The member owns this; finiteness
+	/// reported it where the cycle closed (`finiteness.rs`).
+	Infinite,
 }
 
 /// What the facts in scope establish for a trait requirement, without impl
@@ -488,6 +493,7 @@ pub(super) struct Solver {
 	pub(super) verdicts: FxHashMap<Definition, Verdict>,
 	/// Every aggregate layout asked for, by its concrete type.
 	pub(super) layouts: Layouts,
+	pub(super) finiteness: Finiteness,
 	/// Each constant's value query state, by `ConstIdx` (`eval.rs`); for one
 	/// with parameters, its check's only.
 	pub(super) const_values: Vec<ConstValueState>,
@@ -502,7 +508,7 @@ pub(super) struct Solver {
 }
 
 impl Solver {
-	pub(super) fn new(constant_count: usize) -> Self {
+	pub(super) fn new(constant_count: usize, struct_count: usize) -> Self {
 		let recursion_limit = 128;
 		Self {
 			recursion_limit,
@@ -515,6 +521,7 @@ impl Solver {
 			normalized: FxHashMap::default(),
 			verdicts: FxHashMap::default(),
 			layouts: Layouts::default(),
+			finiteness: Finiteness::new(struct_count),
 			const_values: vec![ConstValueState::Unchecked; constant_count],
 			instance_values: FxHashMap::default(),
 			allocations: Vec::new(),
@@ -559,7 +566,10 @@ impl Semantics {
 				return self.reenter_judgement(member, requested_by);
 			}
 			Verdict::Resolved => return self.impl_member_value(member),
-			Verdict::Poisoned | Verdict::Overflowed | Verdict::Cyclic(_) => {
+			Verdict::Poisoned
+			| Verdict::Overflowed
+			| Verdict::Cyclic(_)
+			| Verdict::Infinite => {
 				return Err(SolverError::Poisoned);
 			}
 		}
@@ -645,7 +655,35 @@ impl Semantics {
 		self.solver
 			.verdicts
 			.insert(Definition::Member(member), verdict);
-		answer
+		answer?;
+		// Judged with the verdict already `Resolved`: an instance walk that
+		// normalizes through this member again reads its value, and finiteness
+		// sees the repeat on its own stack.
+		match self.type_is_finite(
+			strings,
+			self.assumption_envs.of_frame(scope),
+			value,
+		) {
+			Ok(true) => Ok(value),
+			Ok(false) => {
+				self.solver
+					.verdicts
+					.insert(Definition::Member(member), Verdict::Infinite);
+				Err(SolverError::Poisoned)
+			}
+			// Reached through normalization from an owner in progress, which
+			// owns that loop; the value itself is meaningful.
+			Err(SolverError::Poisoned) => Ok(value),
+			Err(SolverError::Pending) => {
+				self.solver
+					.verdicts
+					.insert(Definition::Member(member), Verdict::Unchecked);
+				Err(SolverError::Pending)
+			}
+			Err(SolverError::Overflow | SolverError::Cycle(_)) => {
+				unreachable!("finiteness answers only `Pending` or `Poisoned`")
+			}
+		}
 	}
 
 	/// `member` was reached again while its judgement is on the stack. An
@@ -1863,9 +1901,10 @@ impl Semantics {
 		if visiting.len() > self.solver.state.recursion_budget {
 			return Err(SolverError::Overflow);
 		}
-		if visiting.contains(&ty) {
-			return Err(SolverError::Poisoned);
-		}
+		assert!(
+			!visiting.contains(&ty),
+			"finiteness rejects a type storing itself directly"
+		);
 		visiting.push(ty);
 		let result = (|| {
 			let ty = self.normalize(
@@ -1880,6 +1919,9 @@ impl Semantics {
 					struct_index,
 					type_args,
 				} => {
+					if !self.type_is_finite(strings, assumption_context, ty)? {
+						return Err(SolverError::Poisoned);
+					}
 					let signature = &self.structs[usize::from(struct_index)];
 					let (env, fields) =
 						(signature.type_params, signature.field_types);
@@ -2227,10 +2269,13 @@ impl Semantics {
 				struct_index,
 				type_args,
 			} => {
-				// A struct containing itself is reported where it is declared.
-				if visiting.contains(&ty) {
+				if !self.type_is_finite(strings, assumption_context, ty)? {
 					return Err(SolverError::Poisoned);
 				}
+				assert!(
+					!visiting.contains(&ty),
+					"finiteness rejects a type storing itself directly"
+				);
 				visiting.push(ty);
 				let signature = &self.structs[usize::from(struct_index)];
 				let (env, fields) =
@@ -2724,6 +2769,9 @@ impl Semantics {
 			}
 			Verdict::Poisoned | Verdict::Overflowed | Verdict::Cyclic(_) => {
 				return Err(SolverError::Poisoned);
+			}
+			Verdict::Infinite => {
+				unreachable!("only a member's value is judged finite")
 			}
 		}
 		let impl_env = match impl_kind {

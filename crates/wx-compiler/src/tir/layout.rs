@@ -283,9 +283,8 @@ impl Semantics {
 	/// compiler does not know its bytes: some part of it is abstract (a
 	/// parameter, a projection that does not reduce, an address into a memory
 	/// not known yet), or it is a reference, which Wasm keeps out of linear
-	/// memory. A struct containing itself is `Poisoned` (it is reported on
-	/// the struct), and one growing without end through its type arguments
-	/// overflows.
+	/// memory. An infinite type is `Poisoned`: finiteness reported it where
+	/// its cycle closed.
 	pub(super) fn memory_layout(
 		&mut self,
 		strings: &StringInterner,
@@ -402,8 +401,8 @@ impl Semantics {
 		}))
 	}
 
-	/// `visiting` holds the aggregates being laid out, normalized: reaching
-	/// one again is a struct containing itself.
+	/// `visiting` holds the aggregates being laid out, normalized, for the
+	/// depth: finiteness has rejected any that holds itself.
 	fn piece(
 		&mut self,
 		strings: &StringInterner,
@@ -544,14 +543,18 @@ impl Semantics {
 		if concrete && let Some(&index) = self.solver.layouts.keys.get(&key) {
 			return Ok(Some(Piece::Aggregate(index)));
 		}
-		if visiting.contains(&ty) {
-			return Err(SolverError::Poisoned);
-		}
+		assert!(
+			!visiting.contains(&ty),
+			"finiteness rejects a type storing itself directly"
+		);
 		if visiting.len() > self.solver.state.recursion_budget {
 			return Err(SolverError::Overflow);
 		}
 		let (order, fields) = match key {
 			AggregateKey::Struct(struct_index, type_args) => {
+				if !self.type_is_finite(strings, assumption_context, ty)? {
+					return Err(SolverError::Poisoned);
+				}
 				let signature = &self.structs[usize::from(struct_index)];
 				let (env, field_types) =
 					(signature.type_params, signature.field_types);

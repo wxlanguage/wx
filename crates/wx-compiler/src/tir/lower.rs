@@ -2320,6 +2320,17 @@ impl<'a> Lowerer<'a> {
 				struct_index,
 				type_args,
 			} => {
+				assert!(
+					matches!(
+						self.sema.type_is_finite(
+							self.strings,
+							AssumptionEnvIdx::ROOT,
+							ty,
+						),
+						Ok(true)
+					),
+					"checking reports every infinite struct"
+				);
 				let (signature_env, field_list) = {
 					let signature =
 						&self.sema.structs[usize::from(struct_index)];

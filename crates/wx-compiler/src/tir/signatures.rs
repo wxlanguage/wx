@@ -673,7 +673,7 @@ impl Semantics {
 			diagnostics,
 			resolutions,
 			operators,
-			solver: Solver::new(decls.constants.len()),
+			solver: Solver::new(decls.constants.len(), decls.structs.len()),
 			types: TypeInterner::new(
 				decls.intrinsics.bool.expect("core declares `Bool`"),
 				decls.intrinsics.char.expect("core declares `Char`"),
@@ -1734,6 +1734,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 						"every signature and every constant body exists",
 					);
 				}
+			}
+			if let AstNodeRef::Struct { struct_index, .. } = entry.node {
+				let judged = sema.struct_is_finite(self.strings, struct_index);
+				assert!(judged.is_ok(), "every signature exists");
 			}
 			if let SignatureQuery::TraitImpl(impl_index) = entry.node.query() {
 				let checked = self.check_conformance(sema, impl_index);
@@ -3490,12 +3494,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 						},
 						ty_expr,
 						policy,
-					);
-					self.check_struct_direct_recursion(
-						sema,
-						file_id,
-						self.ast(file_id).type_span(ty_expr),
-						ty,
 					);
 					field_types.push(ty);
 				}
@@ -5531,139 +5529,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 			DiagnosticCode::CyclicTraitBounds,
 			|name| format!("computing the bound of associated type `{name}`"),
 		)
-	}
-
-	/// Renders the rustc-E0072-style diagnostic: every struct in the cycle
-	/// gets its own primary label (at its own declaration name) plus a
-	/// secondary label at the specific field that continues the cycle,
-	/// rather than the single-root "cycle detected when..." chain
-	/// `report_cycle` renders for `CyclicTypeAlias`/`CyclicTraitBounds`. The
-	/// full chain is already sitting in `query_stack[position..]` — built up
-	/// by the ordinary recursive `ensure_signature` forcing that got us
-	/// here — so there's nothing to separately collect first.
-	fn report_recursive_struct_cycle(
-		&self,
-		sema: &Semantics,
-		query: SignatureQuery,
-		closing_reference: SourceSpan,
-	) -> Diagnostic<FileId> {
-		let position = self
-			.query_stack
-			.iter()
-			.position(|frame| frame.query == query)
-			.expect(
-				"Cycle is only ever returned for a query currently in progress",
-			);
-		let chain = &self.query_stack[position..];
-
-		let hop_span = |i: usize| -> SourceSpan {
-			chain
-				.get(i + 1)
-				.map(|frame| {
-					frame.requested_at.expect(
-						"a non-root frame always records why it was required",
-					)
-				})
-				.unwrap_or(closing_reference)
-		};
-
-		let mut diagnostic = Diagnostic::error()
-			.with_code(DiagnosticCode::RecursiveTypeWithoutIndirection.code());
-		let mut names = Vec::with_capacity(chain.len());
-		for (i, frame) in chain.iter().enumerate() {
-			// An impl has no name to list or point at; its step is the
-			// span below.
-			if let Some(key) = Self::query_decl(sema, frame.query) {
-				let name = sema.decls.item(key).name.inner;
-				names.push(self.strings.resolve(name).unwrap());
-				diagnostic = diagnostic.with_label(
-					sema.decls.declaration_span(key).primary_label(),
-				);
-			}
-			diagnostic = diagnostic.with_label(
-				hop_span(i)
-					.secondary_label()
-					.with_message("recursive without indirection"),
-			);
-		}
-
-		let message = match names.as_slice() {
-			[] => unreachable!("the cycle starts at the struct being forced"),
-			[only] => format!("recursive type `{only}` has infinite size"),
-			[rest @ .., last] => {
-				let joined = rest
-					.iter()
-					.map(|n| format!("`{n}`"))
-					.collect::<Vec<_>>()
-					.join(", ");
-				format!(
-					"recursive types {joined} and `{last}` have infinite size"
-				)
-			}
-		};
-
-		diagnostic
-			.with_message(message)
-			.with_note("insert a pointer or slice field to break the cycle")
-	}
-
-	/// Walks `ty` for directly-embedded (non-indirected) struct references —
-	/// `Type::Struct`/`Type::Tuple` embed inline and are followed;
-	/// `Type::Pointer`/`Slice`/`Array` always carry their own memory +
-	/// ownership sigil and live out-of-line, so the walk stops there. Each
-	/// struct reference found is *forced* via `ensure_signature` — reusing
-	/// the exact same demand-driven cycle detection every other kind in this
-	/// file already has, rather than a separate visited-set walk: if that
-	/// forcing call returns `Cycle`, this reports it via
-	/// `report_recursive_struct_cycle`, which reads the full chain straight
-	/// out of `query_stack`.
-	///
-	/// `args` is ignored entirely — a generic struct's own type arguments
-	/// are never substituted into its fields here, so
-	/// `struct Wrapper<T> { v: T } struct A { w: Wrapper<A> }` isn't
-	/// caught. That's sound, not just incomplete: ignoring substitution can
-	/// only remove edges from the graph being walked, never invent one, so
-	/// this can under-detect but never falsely flag a cycle. Catching that
-	/// case needs `params_in_repr`-style type-parameter substitution
-	/// utilities that don't exist yet — deliberately deferred, not
-	/// forgotten.
-	fn check_struct_direct_recursion(
-		&mut self,
-		sema: &mut Semantics,
-		file_id: FileId,
-		field_span: TextSpan,
-		ty: TypeIndex,
-	) {
-		match *sema.types.resolve(ty) {
-			Type::Struct { struct_index, .. } => {
-				let embedded_decl_id = SignatureQuery::Struct(struct_index);
-				let reference = SourceSpan::new(file_id, field_span);
-				let status = self.ensure_signature(
-					sema,
-					QueryInfo {
-						query: embedded_decl_id,
-						requested_at: Some(reference),
-					},
-				);
-				if let SignatureStatus::Cycle = status {
-					let diagnostic = self.report_recursive_struct_cycle(
-						sema,
-						embedded_decl_id,
-						reference,
-					);
-					sema.diagnostics.push(diagnostic);
-				}
-			}
-			Type::Tuple { elements } => {
-				for i in 0..elements.len() {
-					let element = sema.types.list(elements)[i];
-					self.check_struct_direct_recursion(
-						sema, file_id, field_span, element,
-					);
-				}
-			}
-			_ => {}
-		}
 	}
 
 	fn resolve_subject_bounds(
@@ -9657,92 +9522,6 @@ pub(super) mod tests {
 	}
 
 	#[test]
-	fn a_directly_self_recursive_struct_is_rejected() {
-		let case = TestCase::new("struct A( a: A );");
-
-		assert_eq!(
-			case.sema.diagnostics.len(),
-			1,
-			"{:?}",
-			case.sema.diagnostics
-		);
-		assert_eq!(
-			case.sema.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::RecursiveTypeWithoutIndirection.code())
-		);
-		assert_eq!(
-			case.sema.diagnostics[0].message,
-			"recursive type `A` has infinite size"
-		);
-	}
-
-	#[test]
-	fn a_tuple_field_embedding_the_struct_directly_is_rejected() {
-		let case = TestCase::new("struct A( a: (A, A) );");
-
-		assert_eq!(
-			case.sema.diagnostics.len(),
-			1,
-			"{:?}",
-			case.sema.diagnostics
-		);
-		assert_eq!(
-			case.sema.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::RecursiveTypeWithoutIndirection.code())
-		);
-	}
-
-	#[test]
-	fn a_mutually_recursive_struct_pair_is_rejected_once() {
-		let case = TestCase::new(indoc! {"
-			struct A( b: B );
-			struct B( a: A );
-		"});
-
-		assert_eq!(
-			case.sema.diagnostics.len(),
-			1,
-			"{:?}",
-			case.sema.diagnostics
-		);
-		assert_eq!(
-			case.sema.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::RecursiveTypeWithoutIndirection.code())
-		);
-		assert_eq!(
-			case.sema.diagnostics[0].message,
-			"recursive types `A` and `B` have infinite size"
-		);
-	}
-
-	#[test]
-	fn a_struct_cycle_through_a_pointer_resolves_in_any_order() {
-		for source in [
-			"struct Handler(s: state::*State); struct State(h: Handler);",
-			"struct State(h: Handler); struct Handler(s: state::*State);",
-			"type Store = state::*State; struct Handler(s: Store); struct State(h: Handler);",
-			"struct State(h: Handler); struct Handler(s: Store); type Store = state::*State;",
-		] {
-			let case = TestCase::new(&format!("memory state: u32; {source}"));
-			case.diagnostics().assert_none();
-		}
-	}
-
-	#[test]
-	fn a_struct_cycle_through_an_alias_has_infinite_size_in_any_order() {
-		for source in [
-			"type Store = State; struct Handler(s: Store); struct State(h: Handler);",
-			"struct State(h: Handler); struct Handler(s: Store); type Store = State;",
-			"struct Handler(s: Store); type Store = State; struct State(h: Handler);",
-		] {
-			let case = TestCase::new(source);
-			case.diagnostics().assert_codes(&[
-				DiagnosticCode::RecursiveTypeWithoutIndirection,
-			]);
-		}
-	}
-
-	#[test]
 	fn a_struct_reference_with_a_satisfying_type_argument_resolves() {
 		let case = TestCase::new(indoc! {"
 			struct Wrapper<T>( value: T );
@@ -10185,29 +9964,6 @@ pub(super) mod tests {
 			panic!("expected the argument to resolve to `S`");
 		};
 		assert_eq!(*arg_struct_index, case.struct_index("S"));
-	}
-
-	#[test]
-	fn a_struct_cyclic_via_two_different_fields_is_reported_once() {
-		// Same double-report shape as the supertrait regression test above,
-		// but for structs: `A` has two fields (`b`, `c`) that each
-		// independently lead back to `A`.
-		let case = TestCase::new(indoc! {"
-			struct A( b: B, c: C );
-			struct B( a: A );
-			struct C( a: A );
-		"});
-
-		assert_eq!(
-			case.sema.diagnostics.len(),
-			1,
-			"{:?}",
-			case.sema.diagnostics
-		);
-		assert_eq!(
-			case.sema.diagnostics[0].code.as_deref(),
-			Some(DiagnosticCode::RecursiveTypeWithoutIndirection.code())
-		);
 	}
 
 	#[test]
@@ -11129,6 +10885,7 @@ pub(super) mod tests {
 					Verdict::Poisoned
 						| Verdict::Overflowed
 						| Verdict::Cyclic(_)
+						| Verdict::Infinite
 				)),
 				"{source}"
 			);

@@ -2022,9 +2022,9 @@ impl Semantics {
 	/// final state of a constant of a type the evaluator holds no values of:
 	/// no value (`!`, a function reference, an abstract type, an address into
 	/// a memory not known), or poisoned when the type, or a field's, failed to
-	/// resolve, which was reported where it is written. A struct reached
-	/// again through `visiting`, the structs being looked through as
-	/// instantiated, contains itself, which is reported on the struct.
+	/// resolve, which was reported where it is written, or an infinite type,
+	/// reported where its cycle closed. `visiting` holds the structs being
+	/// looked through as instantiated, for the depth.
 	fn push_scalars(
 		&mut self,
 		strings: &StringInterner,
@@ -2090,9 +2090,15 @@ impl Semantics {
 				struct_index,
 				type_args,
 			} => {
-				if visiting.contains(&ty)
-					|| visiting.len() > self.solver.state.recursion_budget
+				if !matches!(self.type_is_finite(strings, scope, ty), Ok(true))
 				{
+					return Err(ConstValueState::Poisoned);
+				}
+				assert!(
+					!visiting.contains(&ty),
+					"finiteness rejects a type storing itself directly"
+				);
+				if visiting.len() > self.solver.state.recursion_budget {
 					return Err(ConstValueState::Poisoned);
 				}
 				let env = self.structs[usize::from(struct_index)].type_params;

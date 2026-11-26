@@ -68,6 +68,8 @@ After it:
   and a qualified path's root (`<[u8; 4] as Array>::LEN`) need nothing. See
   "Values are `StackValue`s".
 - `[T]` and `[T; N]` will be well-formed only when `T: Sized` (see "Sized").
+  Superseded 2026-11-25 (`pointee-and-sized.md`, "Infinite types"): elements
+  need only be well-formed and finite; `[[u8]; 4]` is runtime sized.
 - One place rule covers fields and elements: each place step goes through at
   most one pointer, so `p.field` is `p.*.field` and `s[i]` is `s.*[i]`.
 
@@ -755,7 +757,9 @@ Where it is required:
   `func get<M: Memory, T>(p: M::&T) -> T { p.* }` needs `T: Sized`, which says
   that a `funcref` cannot be loaded from memory.
 - An element of an array is `Sized` by its well-formedness; an element of a
-  slice only needs a layout, so `[[u8]]` is well-formed. `Slice::Value`
+  slice only needs a layout, so `[[u8]]` is well-formed. (Superseded
+  2026-11-25, `pointee-and-sized.md`: an array's element need not be
+  `Sized` either, so `[[u8]; 4]` is well-formed and runtime sized.) `Slice::Value`
   carries no bound (`[[u8]]`'s is `[u8]`); generic code that loads elements
   states `Value: Sized`.
 

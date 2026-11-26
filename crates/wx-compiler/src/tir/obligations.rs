@@ -368,6 +368,8 @@ impl Semantics {
 					Err(_) => {
 						match self.solver.verdict(Definition::Member(member)) {
 							Verdict::Resolved => Ok(()),
+							// Reported by finiteness, where the cycle closed.
+							Verdict::Infinite => Ok(()),
 							Verdict::Overflowed => {
 								self.diagnostics
 									.push(self.overflow_diagnostic(reference));
@@ -425,6 +427,11 @@ impl Semantics {
 								Ok(())
 							}
 							Verdict::Poisoned => Ok(()),
+							Verdict::Infinite => {
+								unreachable!(
+									"only a member's value is judged finite"
+								)
+							}
 							Verdict::Unchecked | Verdict::InProgress => {
 								unreachable!(
 									"a finished judgement has a verdict"
