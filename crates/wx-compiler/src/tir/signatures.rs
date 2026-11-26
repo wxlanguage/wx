@@ -17236,7 +17236,9 @@ pub(super) mod tests {
 		use super::*;
 
 		#[test]
-		fn repr_queries_share_the_normalization_cache_and_retry_overflow() {
+		/// Walking a finite type's fields needs no budget, so a tuple nested
+		/// deeper than the limit has a representation.
+		fn repr_queries_share_the_normalization_cache() {
 			let mut case = TestCase::checked("");
 			case.diagnostics().assert_none();
 			let mut ty = TypeIndex::F64;
@@ -17244,20 +17246,11 @@ pub(super) mod tests {
 				ty = case.sema.types.intern_tuple(&[TypeIndex::U8, ty]);
 			}
 			let env = AssumptionEnvIdx::ROOT;
-			let entries = case.sema.solver.normalized.len();
 			case.sema.solver.set_limit_for_test(3);
-			assert_eq!(
-				case.sema.stack_value_repr(&case.strings, env, ty),
-				Err(SolverError::Overflow)
-			);
-			assert_eq!(case.sema.solver.normalized.len(), entries);
-			assert!(case.sema.solver.state.frames.is_empty());
-			assert!(case.sema.solver.state.blocked_at.is_none());
-			assert_eq!(case.sema.solver.state.recursion_budget, 3);
-
-			case.sema.solver.set_limit_for_test(128);
 			let repr =
 				case.sema.stack_value_repr(&case.strings, env, ty).unwrap();
+			assert!(case.sema.solver.state.frames.is_empty());
+			assert_eq!(case.sema.solver.state.recursion_budget, 3);
 			let projection = case.sema.types.intern(Type::TypeProjection {
 				base: ty,
 				trait_index: case.sema.decls.intrinsics.stack_value.unwrap(),

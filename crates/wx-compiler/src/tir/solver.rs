@@ -26,7 +26,7 @@ use super::eval::{
 	Allocation, ConstValue, ConstValueState, Instance, ResolvedConstant,
 	StaticInstance,
 };
-use super::finiteness::Finiteness;
+use super::finiteness::{FiniteType, Finiteness};
 use super::impls::ImplTarget;
 use super::layout::Layouts;
 use super::literals::UntypedValue;
@@ -1847,14 +1847,8 @@ impl Semantics {
 		ty: TypeIndex,
 	) -> Result<Option<Vec<TypeIndex>>, SolverError> {
 		let mut elements = Vec::new();
-		if !self.push_stack_elements(
-			strings,
-			assumption_context,
-			ty,
-			&mut elements,
-			&mut Vec::new(),
-			0,
-		)? {
+		let ty = self.finite(strings, assumption_context, ty)?;
+		if !self.push_stack_elements(strings, ty, &mut elements)? {
 			return Ok(None);
 		}
 		if elements.contains(&TypeIndex::NEVER) {
@@ -1874,150 +1868,74 @@ impl Semantics {
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<TypeIndex>, SolverError> {
-		self.explain_non_stack_value_inner(
-			strings,
-			assumption_context,
-			ty,
-			&mut Vec::new(),
-		)
+		let ty = self.finite(strings, assumption_context, ty)?;
+		self.explain_parts(strings, ty)
 	}
 
-	fn explain_non_stack_value_inner(
+	/// A part of a type whose representation failed: one with its own
+	/// representation is fine, and only the rest is looked through.
+	fn explain_part(
 		&mut self,
 		strings: &StringInterner,
-		assumption_context: AssumptionEnvIdx,
-		ty: TypeIndex,
-		visiting: &mut Vec<TypeIndex>,
+		ty: FiniteType,
 	) -> Result<Option<TypeIndex>, SolverError> {
-		// The root query already failed. For children, reuse successful
-		// representations before descending into their structure.
-		if !visiting.is_empty() {
-			match self.stack_value_repr(strings, assumption_context, ty) {
-				Ok(_) => return Ok(None),
-				Err(SolverError::Poisoned) => {}
-				Err(error) => return Err(error),
-			}
+		match self.stack_value_repr(strings, ty.env(), ty.ty()) {
+			Ok(_) => Ok(None),
+			Err(SolverError::Poisoned) => self.explain_parts(strings, ty),
+			Err(error) => Err(error),
 		}
-		if visiting.len() > self.solver.state.recursion_budget {
-			return Err(SolverError::Overflow);
-		}
-		assert!(
-			!visiting.contains(&ty),
-			"finiteness rejects a type storing itself directly"
-		);
-		visiting.push(ty);
-		let result = (|| {
-			let ty = self.normalize(
-				strings,
-				assumption_context,
-				ty,
-				NormalizationDepth::Deep,
-				RewriteFlags::ALL,
-			)?;
-			match *self.types.resolve(ty) {
-				Type::Struct {
-					struct_index,
-					type_args,
-				} => {
-					if !self.type_is_finite(strings, assumption_context, ty)? {
-						return Err(SolverError::Poisoned);
-					}
-					let signature = &self.structs[usize::from(struct_index)];
-					let (env, fields) =
-						(signature.type_params, signature.field_types);
-					let args: Box<[TypeIndex]> =
-						self.types.list(type_args).into();
-					for at in 0..fields.len() {
-						let field = self.types.list(fields)[at];
-						let field = self.types.substitute(
-							field,
-							Substitution {
-								envs: &self.generic_envs,
-								env,
-								args: &args,
-							},
-						);
-						if let Some(part) = self.explain_non_stack_value_inner(
-							strings,
-							assumption_context,
-							field,
-							visiting,
-						)? {
-							return Ok(Some(part));
-						}
+	}
+
+	fn explain_parts(
+		&mut self,
+		strings: &StringInterner,
+		ty: FiniteType,
+	) -> Result<Option<TypeIndex>, SolverError> {
+		let ty =
+			self.normalize_finite(strings, ty, NormalizationDepth::Deep)?;
+		let env = ty.env();
+		match *self.types.resolve(ty.ty()) {
+			Type::Enum { .. } | Type::Tuple { .. } | Type::Struct { .. } => {
+				for part in self.parts(ty) {
+					if let Some(part) = self.explain_part(strings, part)? {
+						return Ok(Some(part));
 					}
 				}
-				Type::Tuple { elements } => {
-					for at in 0..elements.len() {
-						let element = self.types.list(elements)[at];
-						if let Some(part) = self.explain_non_stack_value_inner(
-							strings,
-							assumption_context,
-							element,
-							visiting,
-						)? {
-							return Ok(Some(part));
-						}
-					}
-				}
-				Type::Pointer { to, memory, .. } => {
-					let size =
-						self.address_size(strings, assumption_context, memory)?;
-					let metadata = self.pointer_metadata_value(
-						strings,
-						assumption_context,
-						to,
-						memory,
-					)?;
-					for part in [size, metadata] {
-						if let Some(part) = self.explain_non_stack_value_inner(
-							strings,
-							assumption_context,
-							part,
-							visiting,
-						)? {
-							return Ok(Some(part));
-						}
-					}
-				}
-				Type::Enum { enum_index } => {
-					let repr = self.enums[usize::from(enum_index)].repr;
-					return self.explain_non_stack_value_inner(
-						strings,
-						assumption_context,
-						repr,
-						visiting,
-					);
-				}
-				Type::Slice { .. } | Type::Array { .. } => return Ok(Some(ty)),
-				Type::TypeParam { .. } | Type::TypeProjection { .. } => {
-					let stack_value = self
-						.decls
-						.intrinsics
-						.stack_value
-						.expect("core declares `StackValue`");
-					if !self.assumes(
-						strings,
-						assumption_context,
-						ty,
-						stack_value,
-					)? {
-						return Ok(Some(ty));
-					}
-				}
-				Type::Error
-				| Type::Infer
-				| Type::ConstInt
-				| Type::ConstFloat
-				| Type::ConstChar
-				| Type::Value { .. }
-				| Type::ConstRef { .. } => return Err(SolverError::Poisoned),
-				_ => {}
 			}
-			Ok(None)
-		})();
-		visiting.pop();
-		result
+			Type::Pointer { to, memory, .. } => {
+				let size = self.address_size(strings, env, memory)?;
+				let metadata =
+					self.pointer_metadata_value(strings, env, to, memory)?;
+				for part in [size, metadata] {
+					let part = self.finite(strings, env, part)?;
+					if let Some(part) = self.explain_part(strings, part)? {
+						return Ok(Some(part));
+					}
+				}
+			}
+			Type::Slice { .. } | Type::Array { .. } => {
+				return Ok(Some(ty.ty()));
+			}
+			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
+				let stack_value = self
+					.decls
+					.intrinsics
+					.stack_value
+					.expect("core declares `StackValue`");
+				if !self.assumes(strings, env, ty.ty(), stack_value)? {
+					return Ok(Some(ty.ty()));
+				}
+			}
+			Type::Error
+			| Type::Infer
+			| Type::ConstInt
+			| Type::ConstFloat
+			| Type::ConstChar
+			| Type::Value { .. }
+			| Type::ConstRef { .. } => return Err(SolverError::Poisoned),
+			_ => {}
+		}
+		Ok(None)
 	}
 
 	/// Proves and computes `<ty as StackValue>::Repr`. An abstract receiver
@@ -2147,25 +2065,15 @@ impl Semantics {
 	fn push_stack_elements(
 		&mut self,
 		strings: &StringInterner,
-		assumption_context: AssumptionEnvIdx,
-		ty: TypeIndex,
+		ty: FiniteType,
 		out: &mut Vec<TypeIndex>,
-		visiting: &mut Vec<TypeIndex>,
-		depth: usize,
 	) -> Result<bool, SolverError> {
-		if depth > self.solver.state.recursion_budget {
-			return Err(SolverError::Overflow);
-		}
 		// Deep, as a declaration's other checks read it: a loop through an
 		// equality stays the projection it is, not unfolded a step at a time.
-		let ty = self.normalize(
-			strings,
-			assumption_context,
-			ty,
-			NormalizationDepth::Deep,
-			RewriteFlags::ALL,
-		)?;
-		match *self.types.resolve(ty) {
+		let ty =
+			self.normalize_finite(strings, ty, NormalizationDepth::Deep)?;
+		let env = ty.env();
+		match *self.types.resolve(ty.ty()) {
 			// A constant is no value's type; lowering puts one only where a
 			// constant is expected.
 			Type::Error
@@ -2198,113 +2106,35 @@ impl Semantics {
 				Ok(true)
 			}
 			Type::F32 | Type::F64 | Type::Funcref => {
-				out.push(ty);
+				out.push(ty.ty());
 				Ok(true)
 			}
 			Type::TypedFuncref { .. } => {
 				out.push(TypeIndex::FUNCREF);
 				Ok(true)
 			}
-			Type::Enum { enum_index } => {
-				let repr = self.enums[usize::from(enum_index)].repr;
-				self.push_stack_elements(
-					strings,
-					assumption_context,
-					repr,
-					out,
-					visiting,
-					depth + 1,
-				)
-			}
 			// An address, as wide as its memory's `Size`, then the pointee's
 			// counts, each as wide again (`Pointer::Metadata`).
 			Type::Pointer { to, memory, .. } => {
-				let size =
-					self.address_size(strings, assumption_context, memory)?;
-				let metadata = self.pointer_metadata_value(
-					strings,
-					assumption_context,
-					to,
-					memory,
-				)?;
-				if !self.push_stack_elements(
-					strings,
-					assumption_context,
-					size,
-					out,
-					visiting,
-					depth + 1,
-				)? {
-					return Ok(false);
-				}
-				self.push_stack_elements(
-					strings,
-					assumption_context,
-					metadata,
-					out,
-					visiting,
-					depth + 1,
-				)
-			}
-			// A slice or an array is never a value: only a pointer holds one.
-			Type::Slice { .. } | Type::Array { .. } => Ok(false),
-			Type::Tuple { elements } => {
-				// Read one element at a time: normalizing may store more lists.
-				for at in 0..elements.len() {
-					let element = self.types.list(elements)[at];
-					if !self.push_stack_elements(
-						strings,
-						assumption_context,
-						element,
-						out,
-						visiting,
-						depth + 1,
-					)? {
+				let size = self.address_size(strings, env, memory)?;
+				let metadata =
+					self.pointer_metadata_value(strings, env, to, memory)?;
+				for part in [size, metadata] {
+					let part = self.finite(strings, env, part)?;
+					if !self.push_stack_elements(strings, part, out)? {
 						return Ok(false);
 					}
 				}
 				Ok(true)
 			}
-			Type::Struct {
-				struct_index,
-				type_args,
-			} => {
-				if !self.type_is_finite(strings, assumption_context, ty)? {
-					return Err(SolverError::Poisoned);
-				}
-				assert!(
-					!visiting.contains(&ty),
-					"finiteness rejects a type storing itself directly"
-				);
-				visiting.push(ty);
-				let signature = &self.structs[usize::from(struct_index)];
-				let (env, fields) =
-					(signature.type_params, signature.field_types);
-				let args: Box<[TypeIndex]> = self.types.list(type_args).into();
-				// Read one field at a time: substituting may store more lists.
-				for at in 0..fields.len() {
-					let field = self.types.list(fields)[at];
-					let field = self.types.substitute(
-						field,
-						Substitution {
-							envs: &self.generic_envs,
-							env,
-							args: &args,
-						},
-					);
-					if !self.push_stack_elements(
-						strings,
-						assumption_context,
-						field,
-						out,
-						visiting,
-						depth + 1,
-					)? {
-						visiting.pop();
+			// A slice or an array is never a value: only a pointer holds one.
+			Type::Slice { .. } | Type::Array { .. } => Ok(false),
+			Type::Enum { .. } | Type::Tuple { .. } | Type::Struct { .. } => {
+				for part in self.parts(ty) {
+					if !self.push_stack_elements(strings, part, out)? {
 						return Ok(false);
 					}
 				}
-				visiting.pop();
 				Ok(true)
 			}
 			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
@@ -2313,8 +2143,8 @@ impl Semantics {
 					.intrinsics
 					.stack_value
 					.expect("core declares `StackValue`");
-				if self.assumes(strings, assumption_context, ty, stack_value)? {
-					out.push(ty);
+				if self.assumes(strings, env, ty.ty(), stack_value)? {
+					out.push(ty.ty());
 					Ok(true)
 				} else {
 					Ok(false)

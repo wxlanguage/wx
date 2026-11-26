@@ -569,9 +569,9 @@ also a build test.
 
 ### Implementation steps
 
-Steps 1–4 are implemented (2026-11-26), with the cases above written first
-as tests in `tir/finiteness.rs`; they fix the three crashes in "State of the
-code".
+Steps 1–5 are implemented (2026-11-26), with the cases above written first
+as tests in `tir/finiteness.rs`; steps 1–4 fix the three crashes in "State
+of the code".
 
 1. **The struct query**: `Finiteness` with the state column, `direct_deps`
    and the stack; the report at closure, from the stack.
@@ -579,15 +579,26 @@ code".
    map, the depth limit; an impl member's judgement judges its value.
 3. **Checking calls**: `check_declarations` asks for each struct entry;
    `check_struct_direct_recursion` and its query-stack chain are removed.
-4. **The walks rely on it**: `push_stack_elements`,
-   `explain_non_stack_value_inner`, `aggregate_piece` and `push_scalars`
-   (`eval.rs`) ask `type_is_finite` on entering a struct, and their own
-   `visiting` checks are assertions; lowering asserts finiteness before
-   expanding a struct's fields.
-5. **Later, structural only**: `FiniteType`, a token only finiteness
-   constructs, and `shape(FiniteType)`, one expansion step whose children
-   are `FiniteType`s; the walks recurse over `shape` and drop their own
-   visiting stacks and budgets.
+4. **The walks rely on it**: `push_stack_elements`, its diagnostic
+   (`explain_parts`), layout (`finite_form`/`aggregate_form`, which
+   returned a `Piece`, now `MemoryForm`) and `push_scalars` (`eval.rs`)
+   rely on finiteness (step 5 replaced how); lowering asserts finiteness
+   before expanding a struct's fields.
+5. **Structural**: `FiniteType { env, ty }`, a type whose direct contents
+   expand finitely under `env`, which only finiteness constructs.
+   `finite(env, ty)` judges a walk's root once (`Poisoned` when infinite);
+   `normalize_finite` normalizes under the type's own facts, with every
+   rewrite (constant values change only lengths and named constants, never
+   what is stored directly); `parts` is one expansion step (a struct's
+   fields substituted, a tuple's elements, an array's or slice's element,
+   an enum's repr), each a `FiniteType`. A list rather than a `Shape` enum:
+   the walks keep their own matches for leaves, pointers and lengths. The
+   four walks take `FiniteType` and dropped their visiting stacks, depth
+   budgets and per-struct questions; a pointer's address size and metadata
+   are judged as roots of their own. The diagnostic walk's "root or part"
+   test became two functions (`explain_parts`, `explain_part`). Lowering
+   keeps `TypeIndex` and its one cached assertion: threading the token
+   through it would change much for little.
 
 ### Interim
 

@@ -43,6 +43,7 @@ use super::decls::{
 	ConstIdx, EnumIdx, FunctionIdx, GlobalIdx, MemberKind, MemberOwner,
 	MemoryIdx,
 };
+use super::finiteness::FiniteType;
 use super::literals::ConcreteType;
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::numbers::DecimalFloat;
@@ -396,13 +397,7 @@ impl Semantics {
 		// A value type of other than one Wasm value is reported by the type's
 		// check (`Global::Value`'s bounds).
 		if self
-			.push_scalars(
-				strings,
-				AssumptionEnvIdx::ROOT,
-				ty,
-				&mut scalars,
-				&mut Vec::new(),
-			)
+			.root_scalars(strings, AssumptionEnvIdx::ROOT, ty, &mut scalars)
 			.is_err()
 			|| scalars.len() != 1
 		{
@@ -2005,12 +2000,11 @@ impl Semantics {
 		let (ty, scope) = (signature.ty, signature.env);
 		let ty = self.instance_type(strings, owner, ty);
 		let mut scalars = Vec::new();
-		self.push_scalars(
+		self.root_scalars(
 			strings,
 			self.assumption_envs.of_frame(scope),
 			ty,
 			&mut scalars,
-			&mut Vec::new(),
 		)?;
 		Ok(scalars)
 	}
@@ -2023,40 +2017,41 @@ impl Semantics {
 	/// no value (`!`, a function reference, an abstract type, an address into
 	/// a memory not known), or poisoned when the type, or a field's, failed to
 	/// resolve, which was reported where it is written, or an infinite type,
-	/// reported where its cycle closed. `visiting` holds the structs being
-	/// looked through as instantiated, for the depth.
-	fn push_scalars(
+	/// reported where its cycle closed.
+	fn root_scalars(
 		&mut self,
 		strings: &StringInterner,
 		scope: AssumptionEnvIdx,
 		ty: TypeIndex,
 		out: &mut Vec<Primitive>,
-		visiting: &mut Vec<TypeIndex>,
 	) -> Result<(), ConstValueState> {
 		let ty = self
-			.normalize(
-				strings,
-				scope,
-				ty,
-				NormalizationDepth::Deep,
-				RewriteFlags::ALL,
-			)
+			.finite(strings, scope, ty)
+			.map_err(|_| ConstValueState::Poisoned)?;
+		self.push_scalars(strings, ty, out)
+	}
+
+	fn push_scalars(
+		&mut self,
+		strings: &StringInterner,
+		ty: FiniteType,
+		out: &mut Vec<Primitive>,
+	) -> Result<(), ConstValueState> {
+		let ty = self
+			.normalize_finite(strings, ty, NormalizationDepth::Deep)
 			.unwrap_or(ty);
-		if ty == TypeIndex::ERROR {
+		let scope = ty.env();
+		if ty.ty() == TypeIndex::ERROR {
 			return Err(ConstValueState::Poisoned);
 		}
-		if let Some(scalar) = Primitive::of(ty) {
+		if let Some(scalar) = Primitive::of(ty.ty()) {
 			out.push(scalar);
 			return Ok(());
 		}
-		match *self.types.resolve(ty) {
+		match *self.types.resolve(ty.ty()) {
 			Type::Function { .. }
 			| Type::Memory { .. }
 			| Type::Global { .. } => Ok(()),
-			Type::Enum { enum_index } => {
-				let repr = self.enums[usize::from(enum_index)].repr;
-				self.push_scalars(strings, scope, repr, out, visiting)
-			}
 			// An address, then the pointee's counts.
 			Type::Pointer { to, memory, .. } => {
 				let scalar = self.address_scalar(strings, scope, memory)?;
@@ -2070,64 +2065,14 @@ impl Semantics {
 				out.extend(std::iter::repeat_n(scalar, 1 + count));
 				Ok(())
 			}
-			Type::Tuple { elements } => {
+			Type::Enum { .. } | Type::Tuple { .. } | Type::Struct { .. } => {
 				let mut held = Ok(());
-				for at in 0..self.types.list(elements).len() {
-					let element = self.types.list(elements)[at];
-					held = merge(
-						held,
-						self.push_scalars(
-							strings, scope, element, out, visiting,
-						),
-					);
+				for part in self.parts(ty) {
+					held = merge(held, self.push_scalars(strings, part, out));
 					if held == Err(ConstValueState::Poisoned) {
 						break;
 					}
 				}
-				held
-			}
-			Type::Struct {
-				struct_index,
-				type_args,
-			} => {
-				if !matches!(self.type_is_finite(strings, scope, ty), Ok(true))
-				{
-					return Err(ConstValueState::Poisoned);
-				}
-				assert!(
-					!visiting.contains(&ty),
-					"finiteness rejects a type storing itself directly"
-				);
-				if visiting.len() > self.solver.state.recursion_budget {
-					return Err(ConstValueState::Poisoned);
-				}
-				let env = self.structs[usize::from(struct_index)].type_params;
-				visiting.push(ty);
-				let args: Box<[TypeIndex]> = self.types.list(type_args).into();
-				let mut held = Ok(());
-				let count =
-					self.structs[usize::from(struct_index)].field_types.len();
-				for at in 0..count {
-					let fields =
-						self.structs[usize::from(struct_index)].field_types;
-					let field = self.types.list(fields)[at];
-					let field = self.types.substitute(
-						field,
-						Substitution {
-							envs: &self.generic_envs,
-							env,
-							args: &args,
-						},
-					);
-					held = merge(
-						held,
-						self.push_scalars(strings, scope, field, out, visiting),
-					);
-					if held == Err(ConstValueState::Poisoned) {
-						break;
-					}
-				}
-				visiting.pop();
 				held
 			}
 			_ => Err(ConstValueState::NoValue),

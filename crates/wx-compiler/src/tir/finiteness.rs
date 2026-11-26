@@ -17,6 +17,25 @@ use crate::ast::StringInterner;
 use crate::diagnostics::{DiagnosticCode, SourceSpan};
 use crate::vfs::FileId;
 
+/// A type whose direct contents expand finitely under `env`. Only
+/// finiteness constructs one, and every part of one is one, so a walk over
+/// fields that starts from one terminates without guarding itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct FiniteType {
+	env: AssumptionEnvIdx,
+	ty: TypeIndex,
+}
+
+impl FiniteType {
+	pub(super) fn ty(self) -> TypeIndex {
+		self.ty
+	}
+
+	pub(super) fn env(self) -> AssumptionEnvIdx {
+		self.env
+	}
+}
+
 pub(super) struct Finiteness {
 	/// `None` until judged.
 	structs: Vec<Option<Expansion>>,
@@ -173,6 +192,93 @@ impl Semantics {
 			self.solver.finiteness.stack.truncate(start);
 		}
 		finite.map(|expansion| matches!(expansion, Expansion::Finite { .. }))
+	}
+
+	/// `ty` as a finite type under `env`, the root of a walk over fields;
+	/// `Poisoned` when infinite, which finiteness reported.
+	pub(super) fn finite(
+		&mut self,
+		strings: &StringInterner,
+		env: AssumptionEnvIdx,
+		ty: TypeIndex,
+	) -> Result<FiniteType, SolverError> {
+		if self.type_is_finite(strings, env, ty)? {
+			Ok(FiniteType { env, ty })
+		} else {
+			Err(SolverError::Poisoned)
+		}
+	}
+
+	/// `ty` normalized under its own facts, with every rewrite. Finiteness
+	/// normalizes without constant values, which change only array lengths
+	/// and constants named in types, never what is stored directly, so the
+	/// result is finite too.
+	pub(super) fn normalize_finite(
+		&mut self,
+		strings: &StringInterner,
+		ty: FiniteType,
+		depth: NormalizationDepth,
+	) -> Result<FiniteType, SolverError> {
+		let normalized =
+			self.normalize(strings, ty.env, ty.ty, depth, RewriteFlags::ALL)?;
+		Ok(FiniteType {
+			env: ty.env,
+			ty: normalized,
+		})
+	}
+
+	/// One expansion step of `ty`: a struct's fields with its arguments
+	/// substituted, a tuple's elements, an array's or a slice's element, an
+	/// enum's repr; nothing for anything else, a type to normalize first
+	/// included.
+	pub(super) fn parts(
+		&mut self,
+		ty: FiniteType,
+	) -> SmallVec<[FiniteType; 4]> {
+		let part = |part| FiniteType {
+			env: ty.env,
+			ty: part,
+		};
+		match *self.types.resolve(ty.ty) {
+			Type::Struct {
+				struct_index,
+				type_args,
+			} => {
+				let signature = &self.structs[usize::from(struct_index)];
+				let (env, fields) =
+					(signature.type_params, signature.field_types);
+				let args: Box<[TypeIndex]> = self.types.list(type_args).into();
+				// Read one field at a time: substituting may store more lists.
+				(0..fields.len())
+					.map(|at| {
+						let field = self.types.list(fields)[at];
+						part(self.types.substitute(
+							field,
+							Substitution {
+								envs: &self.generic_envs,
+								env,
+								args: &args,
+							},
+						))
+					})
+					.collect()
+			}
+			Type::Tuple { elements } => self
+				.types
+				.list(elements)
+				.iter()
+				.copied()
+				.map(part)
+				.collect(),
+			Type::Array { of, .. } | Type::Slice { of } => {
+				SmallVec::from_elem(part(of), 1)
+			}
+			Type::Enum { enum_index } => SmallVec::from_elem(
+				part(self.enums[usize::from(enum_index)].repr),
+				1,
+			),
+			_ => SmallVec::new(),
+		}
 	}
 
 	/// Whether expanding what `ty` stores directly terminates under `env`,

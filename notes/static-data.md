@@ -217,7 +217,7 @@ Each slice ends with execution tests (inlining off and on) and a CLI run.
 - Whether `Memory::INDEX` should exist at all (not planned).
 - Low-memory reservation (null, niches).
 - Arrays inside aggregates and arrays of arrays: done (2026-11-04) for a
-  sized array. `layout.rs` `Piece::Array` (bytes, no values; `memory_values`
+  sized array. `layout.rs` `MemoryForm::Array` (bytes, no values; `memory_values`
   of an array repeats its element's); the checker indexes a place of array
   type in place (`h.data[i]`, as `p.field`; `build_index`), and
   `lower_element` starts from that place's address and offset; the
