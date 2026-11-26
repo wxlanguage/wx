@@ -25,11 +25,11 @@ use super::signatures::{LexicalScope, Semantics};
 use super::solver::{
 	NormalizationDepth, RewriteFlags, SolverError, Subjects, UnsatisfiedClause,
 };
-use super::types::{GenericArgs, GenericEnvIdx, Type, TypeIndex};
+use super::types::{GenericArgs, GenericFrameIdx, Type, TypeIndex};
 use crate::ast::{self, Keyword, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
 use crate::tir::clauses::{BindingRef, BindingRequirement};
-use crate::tir::types::GenericEnvOwner;
+use crate::tir::types::GenericFrameOwner;
 use crate::vfs::FileId;
 
 impl Semantics {
@@ -40,10 +40,10 @@ impl Semantics {
 	pub(super) fn record_bounds_check(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		requirements: BoundRequirements,
 		reference: SourceSpan,
-		owner: GenericEnvOwner,
+		owner: GenericFrameOwner,
 	) {
 		obligations.push(TypeObligation::Bounds {
 			frame,
@@ -53,7 +53,7 @@ impl Semantics {
 		});
 	}
 
-	/// Resolves a written type-argument list against `params_env`, `owner`'s
+	/// Resolves a written type-argument list against `params_frame`, `owner`'s
 	/// own frame (`ROOT` when it declares no parameters). Always returns as
 	/// many arguments as the frame declares. A wrong count is reported and makes every one `ERROR`:
 	/// there is no sensible pairing to salvage, and the caller still sees a
@@ -61,7 +61,7 @@ impl Semantics {
 	/// are kept as written, and the frame's bounds are recorded, each failure
 	/// reported at the argument it is about, so `T: A + B` is two reports
 	/// when an argument satisfies neither. `parent_args` are the arguments of
-	/// the frames around `params_env`, outer first, which a bound may name;
+	/// the frames around `params_frame`, outer first, which a bound may name;
 	/// a failure about one is reported at the segment.
 	pub(super) fn resolve_type_args(
 		&mut self,
@@ -70,23 +70,28 @@ impl Semantics {
 		scope: LexicalScope,
 		asts: &[ast::AST],
 		segment: &ast::PathSegment,
-		params_env: GenericEnvIdx,
+		params_frame: GenericFrameIdx,
 		parent_args: &[TypeIndex],
 		args: &[TypeIndex],
-		owner: GenericEnvOwner,
+		owner: GenericFrameOwner,
 	) -> Box<[TypeIndex]> {
 		if !self.check_type_arg_count(
-			strings, scope, asts, segment, params_env, owner,
+			strings,
+			scope,
+			asts,
+			segment,
+			params_frame,
+			owner,
 		) {
-			let expected = self.generic_envs.param_names(params_env).len();
+			let expected = self.generic_frames.param_names(params_frame).len();
 			return vec![TypeIndex::ERROR; expected].into_boxed_slice();
 		}
-		if params_env == GenericEnvIdx::ROOT {
+		if params_frame == GenericFrameIdx::ROOT {
 			return Box::new([]);
 		}
 		debug_assert_eq!(
 			parent_args.len(),
-			self.generic_envs.parent_count(params_env),
+			self.generic_frames.parent_count(params_frame),
 			"a bound is substituted over the frame's whole chain"
 		);
 		let parents = parent_args.iter().map(|&ty| (ty, segment.ident.span));
@@ -100,9 +105,9 @@ impl Semantics {
 			.push(parents.chain(args.iter().copied().zip(written)));
 		self.record_bounds_check(
 			obligations,
-			scope.generic_env,
+			scope.generic_frame,
 			BoundRequirements::Frame {
-				env: params_env,
+				frame: params_frame,
 				args: generic_args,
 			},
 			SourceSpan::new(scope.file_id, segment.ident.span),
@@ -111,7 +116,7 @@ impl Semantics {
 		args.into()
 	}
 
-	/// Whether `segment` writes as many type arguments as `params_env`
+	/// Whether `segment` writes as many type arguments as `params_frame`
 	/// declares; reports the mismatch when it does not.
 	pub(super) fn check_type_arg_count(
 		&mut self,
@@ -119,10 +124,10 @@ impl Semantics {
 		scope: LexicalScope,
 		asts: &[ast::AST],
 		segment: &ast::PathSegment,
-		params_env: GenericEnvIdx,
-		owner: GenericEnvOwner,
+		params_frame: GenericFrameIdx,
+		owner: GenericFrameOwner,
 	) -> bool {
-		let expected = self.generic_envs.param_names(params_env).len();
+		let expected = self.generic_frames.param_names(params_frame).len();
 		if segment.type_args.len() == expected {
 			return true;
 		}
@@ -133,7 +138,7 @@ impl Semantics {
 			&asts[scope.file_id.as_usize()],
 			segment,
 			owner,
-			self.generic_envs.param_names(params_env),
+			self.generic_frames.param_names(params_frame),
 		));
 		false
 	}
@@ -150,12 +155,12 @@ impl Semantics {
 	pub(super) fn prove_clauses_at_their_bounds(
 		&mut self,
 		strings: &StringInterner,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		env: AssumptionEnvIdx,
 		proved: PublishedClauses,
 	) -> Result<(), SolverError> {
 		let arguments: Box<[TypeIndex]> =
-			self.generic_envs.identity_args(frame).into();
+			self.generic_frames.identity_args(frame).into();
 		let mut failures = Vec::new();
 		self.satisfies_clauses(
 			strings,
@@ -166,7 +171,7 @@ impl Semantics {
 			Some(&mut failures),
 			None,
 		)?;
-		let owner = self.generic_envs.owner(frame);
+		let owner = self.generic_frames.owner(frame);
 		for failure in failures {
 			let diagnostic = match failure {
 				UnsatisfiedClause::Trait {
@@ -323,17 +328,17 @@ impl Semantics {
 		assumption_context: AssumptionEnvIdx,
 		requirements: BoundRequirements,
 		reference: SourceSpan,
-		owner: GenericEnvOwner,
+		owner: GenericFrameOwner,
 	) -> Result<(), SolverError> {
 		// The clauses are written in the declaration's frame, about its own
 		// subject; the use supplies that frame's arguments and the subject.
 		// The arguments are owned: the proof interns while it reads them.
 		let (clauses, subjects, frame, arguments): (_, _, _, Box<[TypeIndex]>) =
 			match requirements {
-				BoundRequirements::Frame { env, args } => (
-					self.assumption_envs.requirements(env),
+				BoundRequirements::Frame { frame, args } => (
+					self.assumption_envs.requirements(frame),
 					Subjects::All,
-					env,
+					frame,
 					self.generic_args.types(args).into(),
 				),
 				BoundRequirements::AssociatedType {
@@ -347,9 +352,10 @@ impl Semantics {
 					else {
 						return Err(SolverError::Pending);
 					};
-					let env = self.traits[usize::from(trait_index)].env;
+					let frame =
+						self.traits[usize::from(trait_index)].generic_params;
 					let root = self.types.intern(Type::TypeProjection {
-						base: self.generic_envs.param_types(env)[0],
+						base: self.generic_frames.param_types(frame)[0],
 						trait_index,
 						assoc_type_index: declaration,
 					});
@@ -359,7 +365,7 @@ impl Semantics {
 							root,
 							subject: value,
 						},
-						env,
+						frame,
 						Box::new([receiver]),
 					)
 				}
@@ -447,16 +453,17 @@ impl Semantics {
 		args: GenericArgs,
 		mut written: TypeIndex,
 	) -> Option<TextSpan> {
-		let (env, param_index) = loop {
+		let (frame, param_index) = loop {
 			match *self.types.resolve(written) {
-				Type::TypeParam { env, param_index } => {
-					break (env, param_index);
+				Type::TypeParam { frame, param_index } => {
+					break (frame, param_index);
 				}
 				Type::TypeProjection { base, .. } => written = base,
 				_ => return None,
 			}
 		};
-		let slot = self.generic_envs.parent_count(env) + param_index as usize;
+		let slot =
+			self.generic_frames.parent_count(frame) + param_index as usize;
 		Some(self.generic_args.spans(args)[slot])
 	}
 
@@ -616,7 +623,7 @@ impl Semantics {
 		argument: Spanned<(TypeIndex, TypeIndex)>,
 		trait_index: TraitIdx,
 		bound_id: SourceClauseId,
-		owner: GenericEnvOwner,
+		owner: GenericFrameOwner,
 	) -> Diagnostic<FileId> {
 		let formatter = self.type_formatter(strings);
 		let (subject, reduced) = argument.inner;
@@ -667,7 +674,7 @@ impl Semantics {
 		found: TypeIndex,
 		expected: TypeIndex,
 		source: BindingRef,
-		owner: GenericEnvOwner,
+		owner: GenericFrameOwner,
 	) -> Diagnostic<FileId> {
 		let formatter = self.type_formatter(strings);
 		let (projection, required, found, expected) = (
@@ -720,7 +727,7 @@ pub(super) enum TypeArgsNotAllowedOn<'a> {
 	/// A generic parameter or a trait's `Self`, and the declaration whose
 	/// frame declares it.
 	TypeParam {
-		owner: GenericEnvOwner,
+		owner: GenericFrameOwner,
 		name: &'a Spanned<SymbolU32>,
 	},
 }
@@ -790,7 +797,7 @@ fn report_type_arg_count_mismatch(
 	file_id: FileId,
 	ast: &ast::AST,
 	segment: &ast::PathSegment,
-	owner: GenericEnvOwner,
+	owner: GenericFrameOwner,
 	params: &[Spanned<SymbolU32>],
 ) -> Diagnostic<FileId> {
 	let (noun, name) = (owner.noun(), segment.ident.inner);
@@ -973,11 +980,13 @@ mod tests {
 			else {
 				panic!("expected `{function_path}` to be a function");
 			};
-			let env =
-				self.sema.functions[usize::from(function_index)].type_params;
-			let param =
-				self.sema.types.intern(Type::TypeParam { env, param_index });
-			(param, self.sema.assumption_envs.normalized(env))
+			let frame =
+				self.sema.functions[usize::from(function_index)].generic_params;
+			let param = self
+				.sema
+				.types
+				.intern(Type::TypeParam { frame, param_index });
+			(param, self.sema.assumption_envs.normalized(frame))
 		}
 
 		/// Whether `receiver` implements `required_trait` under `env`.

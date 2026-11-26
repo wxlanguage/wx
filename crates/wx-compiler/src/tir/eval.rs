@@ -53,7 +53,7 @@ use super::solver::{
 	metadata_len,
 };
 use super::types::{
-	GenericEnvIdx, Primitive, Substitution, Type, TypeIndex, TypeList,
+	GenericFrameIdx, Primitive, Substitution, Type, TypeIndex, TypeList,
 };
 use crate::ast::{BinaryOp, StringInterner, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, Diagnostics, SourceSpan, TextSpan};
@@ -318,14 +318,14 @@ fn body_of<'a>(sema: &'a Semantics, owner: Owner<'_>) -> &'a Body {
 }
 
 /// The type scope `owner`'s body is checked in: a global's is the root.
-fn body_env(sema: &Semantics, owner: Owner<'_>) -> GenericEnvIdx {
+fn body_frame(sema: &Semantics, owner: Owner<'_>) -> GenericFrameIdx {
 	match owner.body {
 		Evaluated::Constant(const_index) => {
-			sema.constants[usize::from(const_index)].env
+			sema.constants[usize::from(const_index)].generic_params
 		}
-		Evaluated::Global(_) => GenericEnvIdx::ROOT,
+		Evaluated::Global(_) => GenericFrameIdx::ROOT,
 		Evaluated::Function(function_index) => {
-			sema.functions[usize::from(function_index)].type_params
+			sema.functions[usize::from(function_index)].generic_params
 		}
 	}
 }
@@ -354,8 +354,8 @@ impl Semantics {
 		strings: &StringInterner,
 		const_index: ConstIdx,
 	) {
-		let env = self.constants[usize::from(const_index)].env;
-		if self.generic_envs.generic_count(env) > 0 {
+		let frame = self.constants[usize::from(const_index)].generic_params;
+		if self.generic_frames.generic_count(frame) > 0 {
 			if self.solver.const_values[usize::from(const_index)]
 				== ConstValueState::Unchecked
 			{
@@ -1596,7 +1596,8 @@ impl Semantics {
 		};
 		// Elements whose bytes are not known yet (of an abstract type) cannot
 		// be written.
-		let normalized_env = self.normalize_env(strings, body_env(self, owner));
+		let normalized_env =
+			self.normalize_env(strings, body_frame(self, owner));
 		let (layout, places) =
 			match self.memory_values(strings, normalized_env, of) {
 				Ok(Some(layout)) => layout,
@@ -1666,11 +1667,14 @@ impl Semantics {
 		ty: TypeIndex,
 		span: TextSpan,
 	) -> Result<(MemoryIdx, Primitive), Halt> {
-		let scope = self.normalize_env(strings, body_env(self, owner));
+		let normalized_env =
+			self.normalize_env(strings, body_frame(self, owner));
 		let Type::Pointer { memory, .. } = *self.types.resolve(ty) else {
 			unreachable!("static data is behind a pointer")
 		};
-		let Some(memory_index) = self.memory_of(strings, scope, memory) else {
+		let Some(memory_index) =
+			self.memory_of(strings, normalized_env, memory)
+		else {
 			return Err(Halt::Own(EvalError {
 				span,
 				kind: EvalErrorKind::NotConst,
@@ -1678,7 +1682,7 @@ impl Semantics {
 		};
 		// The memory is known, so its `Size` is: a failure was reported.
 		let width = self
-			.address_scalar(strings, scope, memory)
+			.address_scalar(strings, normalized_env, memory)
 			.map_err(|_| Halt::Silent)?;
 		Ok((memory_index, width))
 	}
@@ -1719,8 +1723,8 @@ impl Semantics {
 		owner: Owner<'_>,
 		length: TypeIndex,
 	) -> Result<u64, Halt> {
-		let env = body_env(self, owner);
-		let normalized_env = self.normalize_env(strings, env);
+		let frame = body_frame(self, owner);
+		let normalized_env = self.normalize_env(strings, frame);
 		match self.normalize(
 			strings,
 			normalized_env,
@@ -1746,16 +1750,16 @@ impl Semantics {
 		if owner.args.is_empty() {
 			return ty;
 		}
-		let env = body_env(self, owner);
+		let frame = body_frame(self, owner);
 		let ty = self.types.substitute(
 			ty,
 			Substitution {
-				envs: &self.generic_envs,
-				env,
+				frames: &self.generic_frames,
+				frame,
 				args: owner.args,
 			},
 		);
-		let normalized_env = self.normalize_env(strings, env);
+		let normalized_env = self.normalize_env(strings, frame);
 		self.normalize(
 			strings,
 			normalized_env,
@@ -1997,10 +2001,10 @@ impl Semantics {
 		owner: Owner<'_>,
 	) -> Result<Vec<Primitive>, ConstValueState> {
 		let signature = &self.constants[usize::from(const_index)];
-		let (ty, scope) = (signature.ty, signature.env);
+		let (ty, frame) = (signature.ty, signature.generic_params);
 		let ty = self.instance_type(strings, owner, ty);
 		let mut scalars = Vec::new();
-		let normalized_env = self.normalize_env(strings, scope);
+		let normalized_env = self.normalize_env(strings, frame);
 		self.root_scalars(strings, normalized_env, ty, &mut scalars)?;
 		Ok(scalars)
 	}

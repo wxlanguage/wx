@@ -37,7 +37,8 @@ use super::solver::{
 	Assumption, NormalizationDepth, RewriteFlags, SolverError,
 };
 use super::types::{
-	GenericEnvIdx, GenericEnvOwner, Substitution, Type, TypeIndex, TypeInterner,
+	GenericFrameIdx, GenericFrameOwner, Substitution, Type, TypeIndex,
+	TypeInterner,
 };
 
 /// What type-relative member applicability found.
@@ -459,7 +460,7 @@ impl Semantics {
 				) =>
 			{
 				obligations.push(TypeObligation::ProjectionMember {
-					frame: scope.generic_env,
+					frame: scope.generic_frame,
 					projection: current,
 					key,
 					reference,
@@ -502,7 +503,7 @@ impl Semantics {
 			.resolve_trait_qualified_type_member(
 				strings,
 				obligations,
-				scope.generic_env,
+				scope.generic_frame,
 				receiver,
 				required_trait,
 				BindingKey::value(segment.ident.inner),
@@ -539,7 +540,7 @@ impl Semantics {
 		&mut self,
 		strings: &StringInterner,
 		obligations: &mut Vec<TypeObligation>,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 		key: BindingKey,
@@ -575,7 +576,7 @@ impl Semantics {
 		&mut self,
 		strings: &StringInterner,
 		obligations: &mut Vec<TypeObligation>,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 		name: Spanned<SymbolU32>,
@@ -667,7 +668,7 @@ impl Semantics {
 		&mut self,
 		strings: &StringInterner,
 		obligations: &mut Vec<TypeObligation>,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 		file_id: FileId,
@@ -1225,13 +1226,13 @@ impl Semantics {
 			else {
 				continue;
 			};
-			let (env, pattern) = (header.type_params, header.target.inner);
-			let count = self.generic_envs.generic_count(env);
+			let (frame, pattern) = (header.generic_params, header.target.inner);
+			let count = self.generic_frames.generic_count(frame);
 			let mut impl_args =
 				vec![TypeIndex::INFER; count].into_boxed_slice();
 			self.types.learn(
-				&self.generic_envs,
-				env,
+				&self.generic_frames,
+				frame,
 				&mut impl_args,
 				pattern,
 				receiver,
@@ -1239,8 +1240,8 @@ impl Semantics {
 			let instantiated = self.types.substitute(
 				pattern,
 				Substitution {
-					envs: &self.generic_envs,
-					env,
+					frames: &self.generic_frames,
+					frame,
 					args: &impl_args,
 				},
 			);
@@ -1343,8 +1344,9 @@ impl Semantics {
 		Some(match definition {
 			Definition::Item(loc) => match self.declaration_kind(loc) {
 				DeclKind::Struct(index) => {
-					let params = self.structs[usize::from(index)].type_params;
-					let count = self.generic_envs.param_names(params).len();
+					let params =
+						self.structs[usize::from(index)].generic_params;
+					let count = self.generic_frames.param_names(params).len();
 					self.types
 						.intern_struct(index, &vec![TypeIndex::INFER; count])
 				}
@@ -1357,8 +1359,8 @@ impl Semantics {
 						None => {
 							let alias = &self.type_aliases[usize::from(index)];
 							if !self
-								.generic_envs
-								.param_names(alias.type_params)
+								.generic_frames
+								.param_names(alias.generic_params)
 								.is_empty()
 							{
 								return None;
@@ -1369,8 +1371,8 @@ impl Semantics {
 				}
 				_ => return None,
 			},
-			Definition::TypeParam { env, index } => {
-				self.generic_envs.param_types(env)[index as usize]
+			Definition::TypeParam { frame, index } => {
+				self.generic_frames.param_types(frame)[index as usize]
 			}
 			Definition::InherentImplTarget(index) => {
 				self.inherent_impls[usize::from(index)]
@@ -1549,13 +1551,13 @@ impl Semantics {
 				let signature = &self.structs[usize::from(struct_index)];
 				let declared =
 					self.types.list(signature.field_types)[usize::from(field)];
-				let env = signature.type_params;
+				let frame = signature.generic_params;
 				let args = self.types.list(type_args).to_vec();
 				Some(self.types.substitute(
 					declared,
 					Substitution {
-						envs: &self.generic_envs,
-						env,
+						frames: &self.generic_frames,
+						frame,
 						args: &args,
 					},
 				))
@@ -1783,7 +1785,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			}
 			let key = BindingKey::ty(segment.ident.inner);
 			// Selection matches clauses as written, in a body too.
-			let written = sema.assumption_envs.written(scope.generic_env);
+			let written = sema.assumption_envs.written(scope.generic_frame);
 			let lookup = self.select_associated_type(
 				sema,
 				written,
@@ -1814,7 +1816,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			// Selection named the trait without matching an impl; that
 			// the receiver implements it is the declaration check's question.
 			obligations.push(TypeObligation::TraitMembership {
-				frame: scope.generic_env,
+				frame: scope.generic_frame,
 				subject: current,
 				required: trait_index,
 				reference: SourceSpan::new(scope.file_id, segment.ident.span),
@@ -1901,7 +1903,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			return Some((constant, impl_args));
 		}
 		let reference = SourceSpan::new(scope.file_id, segment.ident.span);
-		let written = sema.assumption_envs.written(scope.generic_env);
+		let written = sema.assumption_envs.written(scope.generic_frame);
 		let lookup = self
 			.select_associated_type(sema, written, receiver, key, reference);
 		let ApplicableMember::AbstractTraitMember {
@@ -1931,7 +1933,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			return None;
 		};
 		obligations.push(TypeObligation::TraitMembership {
-			frame: scope.generic_env,
+			frame: scope.generic_frame,
 			subject: receiver,
 			required: trait_index,
 			reference,
@@ -2026,12 +2028,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 			else {
 				continue;
 			};
-			let env = header.type_params;
+			let frame = header.generic_params;
 			let Some(impl_args) = sema.types.match_impl_target(
 				header.target.inner,
 				receiver,
-				&sema.generic_envs,
-				env,
+				&sema.generic_frames,
+				frame,
 			) else {
 				continue;
 			};
@@ -2040,10 +2042,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 				.push(impl_args.iter().map(|&ty| (ty, segment.ident.span)));
 			sema.record_bounds_check(
 				obligations,
-				scope.generic_env,
-				BoundRequirements::Frame { env, args },
+				scope.generic_frame,
+				BoundRequirements::Frame { frame, args },
 				reference,
-				GenericEnvOwner::InherentImpl(impl_index),
+				GenericFrameOwner::InherentImpl(impl_index),
 			);
 			sema.resolutions.record(
 				Site::new(key.tier, reference),

@@ -285,10 +285,10 @@ pub(crate) fn definitions(
 			});
 		}
 	}
-	for env in sema.generic_envs.frames() {
-		for index in 0..sema.generic_envs.param_names(env).len() {
+	for frame in sema.generic_frames.frames() {
+		for index in 0..sema.generic_frames.param_names(frame).len() {
 			add(Definition::TypeParam {
-				env,
+				frame,
 				index: index as u32,
 			});
 		}

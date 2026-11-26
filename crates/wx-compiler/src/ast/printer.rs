@@ -196,7 +196,7 @@ impl<'a> Printer<'a> {
 				pub_at,
 				attributes,
 				name,
-				type_params,
+				generic_params,
 				..
 			} => Sexp::head(
 				"package-type",
@@ -204,7 +204,7 @@ impl<'a> Printer<'a> {
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(self.attributes(attributes))
-					.chain(self.type_params(type_params)),
+					.chain(self.generic_params(generic_params)),
 			),
 			Item::Global {
 				pub_at,
@@ -291,7 +291,7 @@ impl<'a> Printer<'a> {
 					})),
 			),
 			Item::InherentImpl {
-				type_params,
+				generic_params,
 				target,
 				items,
 				..
@@ -299,7 +299,7 @@ impl<'a> Printer<'a> {
 				"impl",
 				[Sexp::atom(self.type_path(target.segments))]
 					.into_iter()
-					.chain(self.type_params(type_params))
+					.chain(self.generic_params(generic_params))
 					.chain(
 						self.ast
 							.list(items)
@@ -308,7 +308,7 @@ impl<'a> Printer<'a> {
 					),
 			),
 			Item::TraitImpl {
-				type_params,
+				generic_params,
 				trait_name,
 				target,
 				items,
@@ -321,7 +321,7 @@ impl<'a> Printer<'a> {
 					Sexp::atom(self.type_path(target.segments)),
 				]
 				.into_iter()
-				.chain(self.type_params(type_params))
+				.chain(self.generic_params(generic_params))
 				.chain(
 					self.ast
 						.list(items)
@@ -333,7 +333,7 @@ impl<'a> Printer<'a> {
 				pub_at,
 				attributes,
 				name,
-				type_params,
+				generic_params,
 				fields,
 				..
 			} => Sexp::head(
@@ -342,7 +342,7 @@ impl<'a> Printer<'a> {
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(self.attributes(attributes))
-					.chain(self.type_params(type_params))
+					.chain(self.generic_params(generic_params))
 					.chain(self.ast.list(fields).iter().map(|field| {
 						Sexp::head(
 							"field",
@@ -464,7 +464,7 @@ impl<'a> Printer<'a> {
 			Item::TypeAlias {
 				pub_at,
 				name,
-				type_params,
+				generic_params,
 				body,
 				attributes,
 				..
@@ -474,7 +474,7 @@ impl<'a> Printer<'a> {
 					.into_iter()
 					.chain([Sexp::atom(self.name(name.inner))])
 					.chain(self.attributes(attributes))
-					.chain(self.type_params(type_params))
+					.chain(self.generic_params(generic_params))
 					.chain(body.map(|body| Sexp::atom(self.ty(body)))),
 			),
 		}
@@ -603,7 +603,7 @@ impl<'a> Printer<'a> {
 		[Sexp::atom(self.name(signature.name.inner))]
 			.into_iter()
 			.chain(self.attributes(attributes))
-			.chain(self.type_params(signature.type_params))
+			.chain(self.generic_params(signature.generic_params))
 			.chain([Sexp::head("params", params)])
 			.chain(signature.result.map(|result| {
 				Sexp::head("result", [Sexp::atom(self.ty(result))])
@@ -644,23 +644,23 @@ impl<'a> Printer<'a> {
 	}
 
 	/// `(type-params T (U Bound) (const N u32))`, when any is written.
-	fn type_params(&self, params: List<TypeParam>) -> Option<Sexp> {
+	fn generic_params(&self, params: List<GenericParam>) -> Option<Sexp> {
 		let params = self.ast.list(params);
 		(!params.is_empty()).then(|| {
 			Sexp::head(
-				"type-params",
+				"generic-params",
 				params.iter().map(|param| match *param {
-					TypeParam::Type { name, bounds: None } => {
+					GenericParam::Type { name, bounds: None } => {
 						Sexp::atom(self.name(name.inner))
 					}
-					TypeParam::Type {
+					GenericParam::Type {
 						name,
 						bounds: Some(bounds),
 					} => Sexp::List(vec![
 						Sexp::atom(self.name(name.inner)),
 						Sexp::atom(self.bound(bounds)),
 					]),
-					TypeParam::Const { name, ty, .. } => Sexp::head(
+					GenericParam::Const { name, ty, .. } => Sexp::head(
 						"const",
 						[
 							Sexp::atom(self.name(name.inner)),

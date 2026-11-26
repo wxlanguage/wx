@@ -503,7 +503,7 @@ impl Expression {
 /// a constant, `const N: Type`.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(debug_assertions, test), derive(Debug, serde::Serialize))]
-pub enum TypeParam {
+pub enum GenericParam {
 	/// A type, with its trait bounds. `None` = unconstrained.
 	Type {
 		name: Spanned<SymbolU32>,
@@ -517,7 +517,7 @@ pub enum TypeParam {
 	},
 }
 
-impl TypeParam {
+impl GenericParam {
 	pub fn name(&self) -> Spanned<SymbolU32> {
 		match self {
 			Self::Type { name, .. } | Self::Const { name, .. } => *name,
@@ -974,9 +974,9 @@ pub struct FunctionSignature {
 	pub func_at: TextOffset,
 	pub name: Spanned<SymbolU32>,
 	/// Generic type parameters `<T, U: Bound>`. Empty = monomorphic.
-	pub type_params: List<TypeParam>,
+	pub generic_params: List<GenericParam>,
 	/// `<` through `>`, when written.
-	pub type_params_span: Option<TextSpan>,
+	pub generic_params_span: Option<TextSpan>,
 	pub params: List<FunctionParam>,
 	/// The parentheses, `(` through `)`.
 	pub params_span: TextSpan,
@@ -1107,9 +1107,9 @@ pub enum Item {
 		package_at: TextOffset,
 		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
-		type_params: List<TypeParam>,
+		generic_params: List<GenericParam>,
 		/// `<` through `>`, when written.
-		type_params_span: Option<TextSpan>,
+		generic_params_span: Option<TextSpan>,
 	},
 	Global {
 		pub_at: Option<TextOffset>,
@@ -1146,17 +1146,17 @@ pub enum Item {
 	},
 	/// `impl Type { ... }`
 	InherentImpl {
-		type_params: List<TypeParam>,
+		generic_params: List<GenericParam>,
 		/// `<` through `>`, when written.
-		type_params_span: Option<TextSpan>,
+		generic_params_span: Option<TextSpan>,
 		target: Path,
 		items: List<ImplItem>,
 	},
 	/// `impl Trait for Type { ... }` / `impl<T> Trait for Type<T> { ... }`
 	TraitImpl {
-		type_params: List<TypeParam>,
+		generic_params: List<GenericParam>,
 		/// `<` through `>`, when written.
-		type_params_span: Option<TextSpan>,
+		generic_params_span: Option<TextSpan>,
 		/// Plain path to the trait, e.g. `module::Trait`.
 		trait_name: Path,
 		target: Path,
@@ -1170,9 +1170,9 @@ pub enum Item {
 		pub_at: Option<TextOffset>,
 		attributes: List<Attribute>,
 		name: Spanned<SymbolU32>,
-		type_params: List<TypeParam>,
+		generic_params: List<GenericParam>,
 		/// `<` through `>`, when written.
-		type_params_span: Option<TextSpan>,
+		generic_params_span: Option<TextSpan>,
 		fields: List<StructField>,
 	},
 	Memory {
@@ -1240,9 +1240,9 @@ pub enum Item {
 	TypeAlias {
 		pub_at: Option<TextOffset>,
 		name: Spanned<SymbolU32>,
-		type_params: List<TypeParam>,
+		generic_params: List<GenericParam>,
 		/// `<` through `>`, when written.
-		type_params_span: Option<TextSpan>,
+		generic_params_span: Option<TextSpan>,
 		body: Option<TypeId>,
 		attributes: List<Attribute>,
 	},
@@ -1556,7 +1556,7 @@ columns! {
 	ImplItem => impl_items,
 	TraitItem => trait_items,
 	UseTree => use_trees,
-	TypeParam => type_params,
+	GenericParam => generic_params,
 	FunctionParam => function_params,
 	StructField => struct_fields,
 	EnumVariant => enum_variants,
@@ -1646,7 +1646,7 @@ pub struct AST {
 	impl_items: Column<ImplItem>,
 	trait_items: Column<TraitItem>,
 	use_trees: Column<UseTree>,
-	type_params: Column<TypeParam>,
+	generic_params: Column<GenericParam>,
 	function_params: Column<FunctionParam>,
 	struct_fields: Column<StructField>,
 	enum_variants: Column<EnumVariant>,
@@ -1686,7 +1686,7 @@ struct AstBuilder {
 	impl_items: ColumnBuilder<ImplItem>,
 	trait_items: ColumnBuilder<TraitItem>,
 	use_trees: ColumnBuilder<UseTree>,
-	type_params: ColumnBuilder<TypeParam>,
+	generic_params: ColumnBuilder<GenericParam>,
 	function_params: ColumnBuilder<FunctionParam>,
 	struct_fields: ColumnBuilder<StructField>,
 	enum_variants: ColumnBuilder<EnumVariant>,
@@ -1727,7 +1727,7 @@ impl AstBuilder {
 			impl_items: self.impl_items.finish(),
 			trait_items: self.trait_items.finish(),
 			use_trees: self.use_trees.finish(),
-			type_params: self.type_params.finish(),
+			generic_params: self.generic_params.finish(),
 			function_params: self.function_params.finish(),
 			struct_fields: self.struct_fields.finish(),
 			enum_variants: self.enum_variants.finish(),

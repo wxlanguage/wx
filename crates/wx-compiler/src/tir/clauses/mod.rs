@@ -38,7 +38,7 @@
 //!
 //! An assumption env is the clauses a scope may assume: its own, then,
 //! through `parent`, those of the scopes around it. Each frame (an item's
-//! generic parameter list, `GenericEnvIdx`) is read in one: its own when the
+//! generic parameter list, `GenericFrameIdx`) is read in one: its own when the
 //! item writes clauses, else its parent's. Construction makes the frame's
 //! written env, its clauses as written, which path selection reads. Once
 //! every signature exists, `normalization` rewrites it by the equalities in
@@ -53,7 +53,7 @@
 //! facts from an inner declaration's context, and outside a parameter's
 //! declaration its bounds are not assumed. Where both meet
 //! (`match_impl_target_and_bounds`) the `assumption_context` is the caller's
-//! and `impl_env` the candidate impl's generic env: requirements are proved
+//! and `impl_frame` the candidate impl's generic frame: requirements are proved
 //! in the caller's context.
 
 use codespan_reporting::diagnostic::Diagnostic;
@@ -71,7 +71,7 @@ use super::signatures::{
 	SignatureStatus, TraitSignature,
 };
 use super::types::{
-	GenericEnvArena, GenericEnvIdx, GenericEnvOwner, Substitution, Type,
+	GenericFrameArena, GenericFrameIdx, GenericFrameOwner, Substitution, Type,
 	TypeIndex, TypeInterner,
 };
 
@@ -464,7 +464,7 @@ impl AssumptionEnvArena {
 	/// it requiring nothing.
 	pub(super) fn bind_frame(
 		&mut self,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		env: AssumptionEnvIdx,
 		own: bool,
 	) {
@@ -483,14 +483,17 @@ impl AssumptionEnvArena {
 	/// The env construction made for `frame`'s item, its clauses as
 	/// written: its own, or the one it shares. Construction and path
 	/// selection read it.
-	pub(super) fn written(&self, frame: GenericEnvIdx) -> AssumptionEnvIdx {
+	pub(super) fn written(&self, frame: GenericFrameIdx) -> AssumptionEnvIdx {
 		self.frames[usize::from(frame)].written
 	}
 
 	/// `frame`'s normalized env, for a reader that runs once every frame is
 	/// normalized (bodies, lowering); any other asks
 	/// `Semantics::normalize_env`.
-	pub(super) fn normalized(&self, frame: GenericEnvIdx) -> AssumptionEnvIdx {
+	pub(super) fn normalized(
+		&self,
+		frame: GenericFrameIdx,
+	) -> AssumptionEnvIdx {
 		match self.frames[usize::from(frame)].normalization {
 			EnvNormalization::Normalized(env) => env,
 			EnvNormalization::Unasked | EnvNormalization::Rewriting { .. } => {
@@ -503,14 +506,14 @@ impl AssumptionEnvArena {
 
 	pub(super) fn normalization(
 		&self,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 	) -> EnvNormalization {
 		self.frames[usize::from(frame)].normalization
 	}
 
 	pub(super) fn set_normalization(
 		&mut self,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		normalization: EnvNormalization,
 	) {
 		self.frames[usize::from(frame)].normalization = normalization;
@@ -525,7 +528,7 @@ impl AssumptionEnvArena {
 	/// proves. `PublishedClauses::NONE` for an item that writes no bound.
 	pub(super) fn requirements(
 		&self,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 	) -> PublishedClauses {
 		self.frames[usize::from(frame)].requirements
 	}
@@ -534,7 +537,7 @@ impl AssumptionEnvArena {
 	/// env assumes.
 	pub(super) fn publish(
 		&mut self,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		clauses: PublishedClauses,
 	) {
 		self.set_requirements(frame, clauses);
@@ -546,7 +549,7 @@ impl AssumptionEnvArena {
 	/// its env assumes.
 	pub(super) fn set_requirements(
 		&mut self,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		clauses: PublishedClauses,
 	) {
 		let entry = &mut self.frames[usize::from(frame)];
@@ -712,7 +715,7 @@ impl Semantics {
 			clauses: &self.clauses,
 			assumption_envs: &self.assumption_envs,
 			traits: &self.traits,
-			generic_envs: &self.generic_envs,
+			generic_frames: &self.generic_frames,
 			types: &mut self.types,
 			equalities: Vec::new(),
 			representable: Vec::new(),
@@ -758,7 +761,7 @@ struct ValueClauseBuilder<'a> {
 	clauses: &'a ClauseArena,
 	assumption_envs: &'a AssumptionEnvArena,
 	traits: &'a [TraitSignature],
-	generic_envs: &'a GenericEnvArena,
+	generic_frames: &'a GenericFrameArena,
 	types: &'a mut TypeInterner,
 	equalities: Vec<EqualityClause>,
 	representable: Vec<RepresentableClause>,
@@ -816,15 +819,16 @@ impl ValueClauseBuilder<'_> {
 				}
 			}
 		}
-		let env = self.traits[usize::from(bound.trait_index)].env;
-		let Some(range) = self.assumption_envs.requirements(env).final_range()
+		let frame = self.traits[usize::from(bound.trait_index)].generic_params;
+		let Some(range) =
+			self.assumption_envs.requirements(frame).final_range()
 		else {
 			return;
 		};
 		let inherited_since = self.equalities.len();
 		let substitution = Substitution {
-			envs: self.generic_envs,
-			env,
+			frames: self.generic_frames,
+			frame,
 			args: &[subject],
 		};
 		for clause in self.clauses.get(range) {
@@ -921,7 +925,7 @@ fn push_equality_clause(
 /// requirements.
 #[derive(Clone, Copy)]
 pub(super) struct ClauseTables<'a> {
-	pub(super) generic_envs: &'a GenericEnvArena,
+	pub(super) generic_frames: &'a GenericFrameArena,
 	pub(super) assumption_envs: &'a AssumptionEnvArena,
 	pub(super) traits: &'a [TraitSignature],
 	pub(super) assoc_types: &'a [Option<AssocTypeSignature>],
@@ -930,14 +934,14 @@ pub(super) struct ClauseTables<'a> {
 
 impl<'a> ClauseTables<'a> {
 	pub(super) fn new(
-		generic_envs: &'a GenericEnvArena,
+		generic_frames: &'a GenericFrameArena,
 		assumption_envs: &'a AssumptionEnvArena,
 		traits: &'a [TraitSignature],
 		assoc_types: &'a [Option<AssocTypeSignature>],
 		clauses: &'a ClauseArena,
 	) -> Self {
 		Self {
-			generic_envs,
+			generic_frames,
 			assumption_envs,
 			traits,
 			assoc_types,
@@ -1005,10 +1009,12 @@ impl<'a> ClauseTables<'a> {
 		recursion_budget: usize,
 	) -> DeclarationSources<'a, 't> {
 		let reflexive_trait = match *types.resolve(receiver) {
-			Type::TypeParam { env, .. } => match self.generic_envs.owner(env) {
-				GenericEnvOwner::Trait(index) => Some(index),
-				_ => None,
-			},
+			Type::TypeParam { frame, .. } => {
+				match self.generic_frames.owner(frame) {
+					GenericFrameOwner::Trait(index) => Some(index),
+					_ => None,
+				}
+			}
 			_ => None,
 		};
 		let mut sources = DeclarationSources {
@@ -1076,14 +1082,14 @@ impl DeclarationSource {
 	pub(super) fn names(
 		self,
 		types: &TypeInterner,
-		generic_envs: &GenericEnvArena,
+		generic_frames: &GenericFrameArena,
 		mut subject: TypeIndex,
 		mut receiver: TypeIndex,
 	) -> bool {
 		let Some(context) = self.context else {
 			return subject == receiver;
 		};
-		let self_type = generic_envs.param_types(context.env)[0];
+		let self_type = generic_frames.param_types(context.frame)[0];
 		loop {
 			if subject == self_type {
 				return receiver == context.receiver;
@@ -1168,7 +1174,8 @@ impl Iterator for DeclarationSources<'_, '_> {
 						signature.clauses
 					}),
 					context: Some(SelfSubstitution {
-						env: self.tables.traits[usize::from(trait_index)].env,
+						frame: self.tables.traits[usize::from(trait_index)]
+							.generic_params,
 						receiver: base,
 					}),
 				})
@@ -1201,7 +1208,7 @@ impl Iterator for DeclaredTraits<'_, '_> {
 					Clause::Trait(clause)
 						if source.names(
 							types,
-							tables.generic_envs,
+							tables.generic_frames,
 							clause.subject,
 							receiver,
 						) =>
@@ -1222,10 +1229,10 @@ impl Iterator for DeclaredTraits<'_, '_> {
 }
 
 /// How an associated declaration's clauses are read on a projection path:
-/// its trait's `Self`, the frame `env` declares, is the projection's base.
+/// its trait's `Self`, the one `frame` declares, is the projection's base.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct SelfSubstitution {
-	pub(super) env: GenericEnvIdx,
+	pub(super) frame: GenericFrameIdx,
 	pub(super) receiver: TypeIndex,
 }
 
@@ -1272,7 +1279,7 @@ impl From<PublishedClauses> for Readiness {
 impl Semantics {
 	pub(super) fn clause_tables(&self) -> ClauseTables<'_> {
 		ClauseTables::new(
-			&self.generic_envs,
+			&self.generic_frames,
 			&self.assumption_envs,
 			&self.traits,
 			&self.assoc_types,
@@ -1457,23 +1464,23 @@ impl<'ast> SemanticsBuilder<'ast> {
 	/// The frame whose `Self` clauses are the trait `bound` names, once its
 	/// signature is available. While it is being built the bound closes a
 	/// cycle, reported here at `bound`, and expands to nothing.
-	fn trait_clause_env(
+	fn trait_clause_frame(
 		&mut self,
 		sema: &mut Semantics,
 		bound: SourceClauseId,
-	) -> Option<GenericEnvIdx> {
+	) -> Option<GenericFrameIdx> {
 		let trait_index = sema.source_clauses.trait_index(bound);
-		self.trait_env(sema, trait_index, sema.source_clauses.span(bound))
+		self.trait_frame(sema, trait_index, sema.source_clauses.span(bound))
 	}
 
 	/// The frame of `trait_index`, once its signature is available. While it
 	/// is being built, `reference` closes a cycle, reported here once.
-	pub(super) fn trait_env(
+	pub(super) fn trait_frame(
 		&mut self,
 		sema: &mut Semantics,
 		trait_index: TraitIdx,
 		reference: SourceSpan,
-	) -> Option<GenericEnvIdx> {
+	) -> Option<GenericFrameIdx> {
 		let query = sema.trait_query(trait_index);
 		match self.ensure_signature(
 			sema,
@@ -1483,7 +1490,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			},
 		) {
 			SignatureStatus::Available(_) => {
-				Some(sema.traits[usize::from(trait_index)].env)
+				Some(sema.traits[usize::from(trait_index)].generic_params)
 			}
 			SignatureStatus::Cycle => {
 				let diagnostic = self
@@ -1505,16 +1512,16 @@ impl<'ast> SemanticsBuilder<'ast> {
 		bound: SourceClauseId,
 		origin: SourceClauseId,
 	) {
-		let Some(env) = self.trait_clause_env(sema, bound) else {
+		let Some(frame) = self.trait_clause_frame(sema, bound) else {
 			return;
 		};
-		let range = sema.assumption_envs.requirements(env).range();
+		let range = sema.assumption_envs.requirements(frame).range();
 		for clause in sema.clauses.traits(range) {
 			let subject = sema.types.substitute(
 				clause.subject,
 				Substitution {
-					envs: &sema.generic_envs,
-					env,
+					frames: &sema.generic_frames,
+					frame,
 					args: &[subject],
 				},
 			);

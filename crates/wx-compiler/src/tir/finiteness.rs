@@ -245,8 +245,8 @@ impl Semantics {
 				type_args,
 			} => {
 				let signature = &self.structs[usize::from(struct_index)];
-				let (env, fields) =
-					(signature.type_params, signature.field_types);
+				let (frame, fields) =
+					(signature.generic_params, signature.field_types);
 				let args: Box<[TypeIndex]> = self.types.list(type_args).into();
 				// Read one field at a time: substituting may store more lists.
 				(0..fields.len())
@@ -255,8 +255,8 @@ impl Semantics {
 						part(self.types.substitute(
 							field,
 							Substitution {
-								envs: &self.generic_envs,
-								env,
+								frames: &self.generic_frames,
+								frame,
 								args: &args,
 							},
 						))
@@ -317,7 +317,7 @@ impl Semantics {
 		}
 		let env = self.normalize_env(
 			strings,
-			self.structs[usize::from(struct_index)].type_params,
+			self.structs[usize::from(struct_index)].generic_params,
 		);
 		self.judge(strings, StepOwner::Definition(struct_index), env, start)
 	}
@@ -451,15 +451,15 @@ impl Semantics {
 				else {
 					return Ok(false);
 				};
-				let decl_env =
-					self.structs[usize::from(struct_index)].type_params;
+				let decl_frame =
+					self.structs[usize::from(struct_index)].generic_params;
 				let args: Box<[TypeIndex]> = self.types.list(type_args).into();
 				let substitution = |sema: &mut Self, dep| {
 					sema.types.substitute(
 						dep,
 						Substitution {
-							envs: &sema.generic_envs,
-							env: decl_env,
+							frames: &sema.generic_frames,
+							frame: decl_frame,
 							args: &args,
 						},
 					)
@@ -725,7 +725,7 @@ impl Semantics {
 		match owner {
 			StepOwner::Definition(struct_index) => {
 				self.assumption_envs.normalized(
-					self.structs[usize::from(struct_index)].type_params,
+					self.structs[usize::from(struct_index)].generic_params,
 				)
 			}
 			StepOwner::Instance(key) => key.env,
@@ -748,7 +748,8 @@ impl Semantics {
 	fn step_field_type(&mut self, step: Step) -> TypeIndex {
 		let signature =
 			&self.structs[usize::from(self.step_struct(step.owner))];
-		let (decl_env, fields) = (signature.type_params, signature.field_types);
+		let (decl_frame, fields) =
+			(signature.generic_params, signature.field_types);
 		let field = self.types.list(fields)[usize::from(step.field)];
 		let StepOwner::Instance(key) = step.owner else {
 			return field;
@@ -760,8 +761,8 @@ impl Semantics {
 		self.types.substitute(
 			field,
 			Substitution {
-				envs: &self.generic_envs,
-				env: decl_env,
+				frames: &self.generic_frames,
+				frame: decl_frame,
 				args: &args,
 			},
 		)

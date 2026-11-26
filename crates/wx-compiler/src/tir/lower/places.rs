@@ -80,7 +80,7 @@ impl Lowerer<'_> {
 			PlaceKind::Deref { pointer, .. } => {
 				let pointer = self.lower_expr(body, state, pointer)?;
 				let memory =
-					self.substitute(data.memory, state.env, &state.args);
+					self.substitute(data.memory, state.frame, &state.args);
 				Ok(Address {
 					pointer,
 					offset: 0,
@@ -91,7 +91,7 @@ impl Lowerer<'_> {
 				let address = self.lower_place(body, state, object)?;
 				let object_ty = body.place(object).ty;
 				let object_ty =
-					self.substitute(object_ty, state.env, &state.args);
+					self.substitute(object_ty, state.frame, &state.args);
 				let object_ty =
 					self.normalize_type(object_ty, state.file_id, data.span)?;
 				let offset = match self.sema.field_offset(
@@ -141,11 +141,12 @@ impl Lowerer<'_> {
 	) -> Result<Address, ()> {
 		let (file_id, span) = (state.file_id, element.span);
 		let sequence = *body.place(object);
-		let memory = self.substitute(sequence.memory, state.env, &state.args);
+		let memory = self.substitute(sequence.memory, state.frame, &state.args);
 		let memory = self.memory_of_type(memory);
-		let sequence_ty = self.substitute(sequence.ty, state.env, &state.args);
+		let sequence_ty =
+			self.substitute(sequence.ty, state.frame, &state.args);
 		let sequence_ty = self.normalize_type(sequence_ty, file_id, span)?;
-		let element_ty = self.substitute(element.ty, state.env, &state.args);
+		let element_ty = self.substitute(element.ty, state.frame, &state.args);
 		let element_ty = self.normalize_type(element_ty, file_id, span)?;
 		let stride = match self.sema.memory_layout(
 			self.strings,
@@ -371,7 +372,7 @@ impl Lowerer<'_> {
 		place: PlaceIdx,
 	) -> Result<PlaceValue, ()> {
 		let data = *body.place(place);
-		let ty = self.substitute(data.ty, state.env, &state.args);
+		let ty = self.substitute(data.ty, state.frame, &state.args);
 		let ty = self.normalize_type(ty, state.file_id, data.span)?;
 		let lowered = self.lower_type(ty, state.file_id, data.span)?;
 		let form = match lowered {

@@ -62,7 +62,7 @@ use super::signatures::Semantics;
 use super::solver::{NormalizationDepth, RewriteFlags};
 use super::types::Primitive;
 use super::types::{
-	GenericArgs, GenericEnvIdx, Substitution, Type, TypeIndex, TypeList,
+	GenericArgs, GenericFrameIdx, Substitution, Type, TypeIndex, TypeList,
 };
 use crate::ast::{BinaryOp, Spanned, StringInterner, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, TextSpan};
@@ -149,7 +149,7 @@ struct FunctionState {
 	/// in, and the instance's arguments for its parameters. A body type is
 	/// made concrete with both where it is read (`Lowerer::expr_ty`); every
 	/// type past that point has no parameter.
-	env: GenericEnvIdx,
+	frame: GenericFrameIdx,
 	args: Box<[TypeIndex]>,
 	/// The instance being lowered, which a call in its body records as the
 	/// callee's caller.
@@ -427,7 +427,7 @@ impl<'a> Lowerer<'a> {
 		let args = written
 			.into_iter()
 			.map(|arg| {
-				let arg = self.substitute(arg, state.env, &state.args);
+				let arg = self.substitute(arg, state.frame, &state.args);
 				self.normalize_type(arg, state.file_id, span)
 			})
 			.collect::<Result<Vec<TypeIndex>, ()>>()?;
@@ -576,7 +576,7 @@ impl<'a> Lowerer<'a> {
 		}
 		let (signature, param_types, result_type) =
 			self.lower_signature(instance)?;
-		let env = self.sema.functions[usize::from(function)].type_params;
+		let frame = self.sema.functions[usize::from(function)].generic_params;
 		let args: Box<[TypeIndex]> = self.sema.types.list(instance.args).into();
 
 		// The evaluator reads the body, which lowering holds: the instance's
@@ -592,7 +592,7 @@ impl<'a> Lowerer<'a> {
 		let lowered = self.lower_body(
 			instance,
 			file_id,
-			env,
+			frame,
 			args,
 			&body,
 			&param_types,
@@ -656,8 +656,8 @@ impl<'a> Lowerer<'a> {
 			self.lower_signature(instance)?;
 		let mut state = FunctionState {
 			file_id,
-			env: self.sema.functions[usize::from(instance.function)]
-				.type_params,
+			frame: self.sema.functions[usize::from(instance.function)]
+				.generic_params,
 			args: Box::default(),
 			instance,
 			bindings: Vec::new(),
@@ -909,10 +909,10 @@ impl<'a> Lowerer<'a> {
 	) -> Result<(mir::SignatureIndex, Vec<mir::ValueType>, mir::ValueType), ()>
 	{
 		let function = instance.function;
-		let (type_params, param_list, return_type) = {
+		let (generic_params, param_list, return_type) = {
 			let signature = &self.sema.functions[usize::from(function)];
 			(
-				signature.type_params,
+				signature.generic_params,
 				signature.param_types,
 				signature.return_type,
 			)
@@ -927,7 +927,7 @@ impl<'a> Lowerer<'a> {
 		// checked call, and the checker refuses to export a generic function
 		// (E2018), so a missing argument is a broken invariant.
 		assert_eq!(
-			self.sema.generic_envs.identity_args(type_params).len(),
+			self.sema.generic_frames.identity_args(generic_params).len(),
 			instance.args.len(),
 			"an instance has an argument for every parameter in its chain"
 		);
@@ -937,10 +937,10 @@ impl<'a> Lowerer<'a> {
 		let params: Vec<TypeIndex> = self.sema.types.list(param_list).to_vec();
 		let mut param_types = Vec::with_capacity(params.len());
 		for ty in params {
-			let ty = self.substitute(ty, type_params, &args);
+			let ty = self.substitute(ty, generic_params, &args);
 			param_types.push(self.lower_type(ty, file_id, name_span)?);
 		}
-		let return_type = self.substitute(return_type, type_params, &args);
+		let return_type = self.substitute(return_type, generic_params, &args);
 		let result_type = self.lower_type(return_type, file_id, name_span)?;
 
 		// Each parameter is its scalars, as its locals are, and so is the
@@ -955,19 +955,19 @@ impl<'a> Lowerer<'a> {
 		Ok((index, param_types, result_type))
 	}
 
-	/// `ty`, written where `env`'s parameters are in scope, with `args` for
+	/// `ty`, written where `frame`'s parameters are in scope, with `args` for
 	/// them. Not normalized: `lower_type` normalizes what it lowers.
 	fn substitute(
 		&mut self,
 		ty: TypeIndex,
-		env: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		args: &[TypeIndex],
 	) -> TypeIndex {
 		let ty = self.sema.types.substitute(
 			ty,
 			Substitution {
-				envs: &self.sema.generic_envs,
-				env,
+				frames: &self.sema.generic_frames,
+				frame,
 				args,
 			},
 		);
@@ -985,7 +985,7 @@ impl<'a> Lowerer<'a> {
 		state: &FunctionState,
 		pattern: PatIdx,
 	) -> TypeIndex {
-		self.substitute(body.pattern_ty(pattern), state.env, &state.args)
+		self.substitute(body.pattern_ty(pattern), state.frame, &state.args)
 	}
 
 	/// The primitive `expr`'s type is held as, in this instance (an enum's
@@ -1036,14 +1036,14 @@ impl<'a> Lowerer<'a> {
 		state: &FunctionState,
 		expr: ExprIdx,
 	) -> TypeIndex {
-		self.substitute(body.ty(expr), state.env, &state.args)
+		self.substitute(body.ty(expr), state.frame, &state.args)
 	}
 
 	fn lower_body(
 		&mut self,
 		instance: FunctionInstance,
 		file_id: FileId,
-		env: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		args: Box<[TypeIndex]>,
 		body: &Body,
 		param_types: &[mir::ValueType],
@@ -1059,7 +1059,7 @@ impl<'a> Lowerer<'a> {
 
 		let mut state = FunctionState {
 			file_id,
-			env,
+			frame,
 			args,
 			instance,
 			bindings: vec![LocalRun::EMPTY; body.locals().len()],
@@ -1095,7 +1095,7 @@ impl<'a> Lowerer<'a> {
 			{
 				continue;
 			}
-			let ty = self.substitute(local.ty, env, &state.args);
+			let ty = self.substitute(local.ty, frame, &state.args);
 			let ty = self.lower_type(ty, file_id, local.name.span)?;
 			let mutability = if local.mut_span.is_some() {
 				mir::Mutability::Mutable
@@ -2334,7 +2334,7 @@ impl<'a> Lowerer<'a> {
 				let (signature_env, field_list) = {
 					let signature =
 						&self.sema.structs[usize::from(struct_index)];
-					(signature.type_params, signature.field_types)
+					(signature.generic_params, signature.field_types)
 				};
 				let args: Box<[TypeIndex]> =
 					self.sema.types.list(type_args).into();
@@ -2344,8 +2344,8 @@ impl<'a> Lowerer<'a> {
 					fields.push(self.sema.types.substitute(
 						field,
 						Substitution {
-							envs: &self.sema.generic_envs,
-							env: signature_env,
+							frames: &self.sema.generic_frames,
+							frame: signature_env,
 							args: &args,
 						},
 					));
@@ -9854,7 +9854,7 @@ mod tests {
 		let reported = sema.diagnostics().len();
 		let take = free_function(&sema, &strings, "take");
 		let signature = &sema.functions[usize::from(take)];
-		let env = sema.assumption_envs.normalized(signature.type_params);
+		let env = sema.assumption_envs.normalized(signature.generic_params);
 		let item = sema.types.list(signature.param_types)[0];
 		assert!(sema.types.has_projection(item));
 		let symbol = strings.get("WIDTH").unwrap();

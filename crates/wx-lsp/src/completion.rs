@@ -24,11 +24,11 @@ use tower_lsp_server::ls_types::{
 use wx_compiler::ast::{
 	AST, AssocBinding, AssocBindingKind, Block, BlockId, BoundExpression,
 	BoundId, Branch, Comment, CommentMap, ConstArgument, ConstId, Destructure,
-	EnumVariant, ExprId, Expression, FunctionTypeParam, ImplItem,
+	EnumVariant, ExprId, Expression, FunctionTypeParam, GenericParam, ImplItem,
 	ImportDeclaration, ImportEntry, InColumn, Item, List, NamedArgument, PatId,
 	Path, PathSegment, Pattern, PatternElement, PatternFieldItem,
 	QualifiedPathRoot, SignatureId, Spanned, Statement, TraitItem,
-	TypeArgument, TypeExpression, TypeId, TypeParam, UseTree, rest_span,
+	TypeArgument, TypeExpression, TypeId, UseTree, rest_span,
 };
 use wx_compiler::diagnostics::{SourceSpan, TextOffset, TextSpan};
 use wx_compiler::tir::{
@@ -678,9 +678,11 @@ impl Cursor<'_> {
 					.position(self.ty(*ty))
 			}
 			Item::PackageType {
-				name, type_params, ..
+				name,
+				generic_params,
+				..
 			} => Within::Signature(Anchor::Name(name.span))
-				.position(self.type_params(*type_params)),
+				.position(self.generic_params(*generic_params)),
 			Item::Global {
 				name, ty, value, ..
 			}
@@ -701,20 +703,21 @@ impl Cursor<'_> {
 				}),
 			Item::Struct {
 				name,
-				type_params,
+				generic_params,
 				fields,
 				..
 			} => Within::Signature(Anchor::Name(name.span)).position(
-				self.type_params(*type_params)
+				self.generic_params(*generic_params)
 					.or_else(|| self.ty(self.node(*fields)?.ty?)),
 			),
 			Item::TypeAlias {
 				name,
-				type_params,
+				generic_params,
 				body,
 				..
 			} => Within::Signature(Anchor::Name(name.span)).position(
-				self.type_params(*type_params).or_else(|| self.ty((*body)?)),
+				self.generic_params(*generic_params)
+					.or_else(|| self.ty((*body)?)),
 			),
 			Item::TypeSet {
 				name,
@@ -763,18 +766,23 @@ impl Cursor<'_> {
 					})
 			}
 			Item::InherentImpl {
-				type_params,
+				generic_params,
 				target,
 				items,
 				..
-			} => self.impl_block(*type_params, None, target, *items),
+			} => self.impl_block(*generic_params, None, target, *items),
 			Item::TraitImpl {
-				type_params,
+				generic_params,
 				trait_name,
 				target,
 				items,
 				..
-			} => self.impl_block(*type_params, Some(trait_name), target, *items),
+			} => self.impl_block(
+				*generic_params,
+				Some(trait_name),
+				target,
+				*items,
+			),
 			Item::Import {
 				entries,
 				internal_name,
@@ -922,7 +930,7 @@ impl Cursor<'_> {
 		let signature = self.ast.signature(signature);
 		let name = signature.name.span;
 		let site = self
-			.type_params(signature.type_params)
+			.generic_params(signature.generic_params)
 			.or_else(|| self.ty(self.node(signature.params)?.ty?))
 			.or_else(|| self.ty(signature.result?));
 		Within::Signature(Anchor::Name(name))
@@ -945,14 +953,14 @@ impl Cursor<'_> {
 	/// An impl: its header, read in its own scope, and its members.
 	fn impl_block(
 		&self,
-		type_params: List<TypeParam>,
+		generic_params: List<GenericParam>,
 		trait_name: Option<&Path>,
 		target: &Path,
 		items: List<ImplItem>,
 	) -> Option<Position> {
 		let header = Within::Signature(Anchor::ImplTarget(target.span));
 		let site = self
-			.type_params(type_params)
+			.generic_params(generic_params)
 			.or_else(|| {
 				self.path(self.ast.list(trait_name?.segments), NameUse::Trait)
 			})
@@ -973,10 +981,10 @@ impl Cursor<'_> {
 		})
 	}
 
-	fn type_params(&self, params: List<TypeParam>) -> Option<Site> {
+	fn generic_params(&self, params: List<GenericParam>) -> Option<Site> {
 		match self.node(params)? {
-			TypeParam::Type { bounds, .. } => self.bound(bounds?),
-			TypeParam::Const { ty, .. } => self.ty(ty),
+			GenericParam::Type { bounds, .. } => self.bound(bounds?),
+			GenericParam::Const { ty, .. } => self.ty(ty),
 		}
 	}
 

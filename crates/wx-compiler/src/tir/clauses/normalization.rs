@@ -12,14 +12,14 @@ use crate::ast::StringInterner;
 use crate::diagnostics::SourceSpan;
 use crate::tir::signatures::Semantics;
 use crate::tir::solver::{NormalizationDepth, RewriteFlags, SolverError};
-use crate::tir::types::{GenericEnvIdx, Type, TypeIndex};
+use crate::tir::types::{GenericFrameIdx, Type, TypeIndex};
 
 /// What one frame's clauses are rewritten against.
 #[derive(Clone, Copy)]
 pub(in crate::tir) struct RewriteScope {
 	/// The frame whose own parameters the clauses state facts about, if it
 	/// has any: an equality about them keeps its projection as written.
-	pub(in crate::tir) own_frame: Option<GenericEnvIdx>,
+	pub(in crate::tir) own_frame: Option<GenericFrameIdx>,
 	/// The frame's clauses as written over its parent's normalized env:
 	/// every rule in scope.
 	pub(in crate::tir) rewriting_env: AssumptionEnvIdx,
@@ -95,7 +95,7 @@ impl Semantics {
 	pub(in crate::tir) fn normalize_env(
 		&mut self,
 		strings: &StringInterner,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 	) -> AssumptionEnvIdx {
 		match self.assumption_envs.normalization(frame) {
 			EnvNormalization::Normalized(env) => return env,
@@ -105,7 +105,7 @@ impl Semantics {
 			EnvNormalization::Unasked => {}
 		}
 		let parent = self
-			.generic_envs
+			.generic_frames
 			.parent(frame)
 			.expect("the root frame is normalized from the start");
 		let parent_env = self.normalize_env(strings, parent);
@@ -122,7 +122,7 @@ impl Semantics {
 		strings: &StringInterner,
 	) {
 		for frame in 0..self.assumption_envs.frame_count() {
-			let frame = GenericEnvIdx::new(u32::try_from(frame).unwrap());
+			let frame = GenericFrameIdx::new(u32::try_from(frame).unwrap());
 			self.normalize_env(strings, frame);
 		}
 	}
@@ -133,8 +133,8 @@ impl Semantics {
 	fn build_normalized_env(
 		&mut self,
 		strings: &StringInterner,
-		frame: GenericEnvIdx,
-		parent: GenericEnvIdx,
+		frame: GenericFrameIdx,
+		parent: GenericFrameIdx,
 		parent_env: AssumptionEnvIdx,
 	) -> AssumptionEnvIdx {
 		let written = self.assumption_envs.written(frame);
@@ -236,10 +236,10 @@ impl Semantics {
 
 	/// The frame whose parameter `ty`'s projection path starts at; `None`
 	/// for a path that starts at no parameter.
-	fn root_frame(&self, mut ty: TypeIndex) -> Option<GenericEnvIdx> {
+	fn root_frame(&self, mut ty: TypeIndex) -> Option<GenericFrameIdx> {
 		loop {
 			match *self.types.resolve(ty) {
-				Type::TypeParam { env, .. } => return Some(env),
+				Type::TypeParam { frame, .. } => return Some(frame),
 				Type::TypeProjection { base, .. } => ty = base,
 				_ => return None,
 			}
@@ -265,7 +265,7 @@ impl Semantics {
 	fn prove_at_their_bounds(
 		&mut self,
 		strings: &StringInterner,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		env: AssumptionEnvIdx,
 		proved: &[Clause],
 	) {
@@ -422,8 +422,9 @@ impl Semantics {
 			if declared.is_empty() {
 				continue;
 			}
-			let trait_env = self.traits[usize::from(trait_index)].env;
-			let lent = self.instantiate_clauses(declared, trait_env, &[base]);
+			let trait_frame =
+				self.traits[usize::from(trait_index)].generic_params;
+			let lent = self.instantiate_clauses(declared, trait_frame, &[base]);
 			let range =
 				lent.final_range().expect("instantiated clauses are final");
 			self.rewrite_run(strings, scope, range, Provenance::Lent, out);

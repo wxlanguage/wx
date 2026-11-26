@@ -39,7 +39,7 @@ use super::decls::{
 };
 use super::members::MemberLookup;
 use super::signatures::Semantics;
-use super::types::{GenericEnvIdx, GenericEnvOwner, ImplKind};
+use super::types::{GenericFrameIdx, GenericFrameOwner, ImplKind};
 use crate::ast::Keyword;
 use crate::diagnostics::{SourceSpan, TextOffset};
 use crate::vfs::FileId;
@@ -150,7 +150,7 @@ pub enum Reference {
 	},
 	/// A generic parameter, or a trait's own `Self`: its frame and position
 	/// in it.
-	TypeParam { env: GenericEnvIdx, index: u32 },
+	TypeParam { frame: GenericFrameIdx, index: u32 },
 	/// A member selected through a type: `T::A`, `<X as Tr>::A`.
 	Member(MemberKind),
 	/// The label of a jump target of the body `owner`, named by a `break`
@@ -204,7 +204,7 @@ pub enum Definition {
 		parameter: ParamIdx,
 	},
 	TypeParam {
-		env: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		index: u32,
 	},
 	Member(MemberKind),
@@ -259,8 +259,8 @@ impl Reference {
 				function,
 				parameter,
 			},
-			Reference::TypeParam { env, index } => {
-				Definition::TypeParam { env, index }
+			Reference::TypeParam { frame, index } => {
+				Definition::TypeParam { frame, index }
 			}
 			Reference::Member(kind) => Definition::Member(kind),
 			Reference::Label { owner, target } => {
@@ -308,10 +308,13 @@ impl Semantics {
 		let decls = &self.decls;
 		match definition {
 			Definition::Item(key) => Some(decls.declaration_span(key)),
-			Definition::TypeParam { env, index } => {
-				let name =
-					self.generic_envs.param_names(env).get(index as usize)?;
-				let file = self.env_owner_file(self.generic_envs.owner(env));
+			Definition::TypeParam { frame, index } => {
+				let name = self
+					.generic_frames
+					.param_names(frame)
+					.get(index as usize)?;
+				let file =
+					self.env_owner_file(self.generic_frames.owner(frame));
 				Some(SourceSpan::new(file, name.span))
 			}
 			Definition::Member(kind) => {
@@ -418,7 +421,7 @@ impl Semantics {
 		}
 		self.scope_names(
 			scope.namespace,
-			scope.generic_env,
+			scope.generic_frame,
 			used_as,
 			|name| body.local_named_at(offset, name).is_some(),
 			&mut found,
@@ -445,52 +448,54 @@ impl Semantics {
 	}
 
 	/// Where `owner`'s signature is read: the scope its declaration is
-	/// written in, and its generic env, which holds its own type parameters
+	/// written in, and its generic frame, which holds its own type parameters
 	/// and those of its trait or impl (see `names_in_signature`).
 	pub(super) fn signature_scope(
 		&self,
 		owner: Definition,
-	) -> Option<(Scope, GenericEnvIdx)> {
+	) -> Option<(Scope, GenericFrameIdx)> {
 		match owner {
 			Definition::Item(loc) => {
-				let env = match self.declaration_kind(loc) {
+				let frame = match self.declaration_kind(loc) {
 					DeclKind::Function(index) => {
-						self.functions[usize::from(index)].type_params
+						self.functions[usize::from(index)].generic_params
 					}
 					DeclKind::Struct(index) => {
-						self.structs[usize::from(index)].type_params
+						self.structs[usize::from(index)].generic_params
 					}
 					DeclKind::TypeAlias(index) => {
-						self.type_aliases[usize::from(index)].type_params
+						self.type_aliases[usize::from(index)].generic_params
 					}
 					DeclKind::Trait(index) => {
-						self.traits[usize::from(index)].env
+						self.traits[usize::from(index)].generic_params
 					}
 					DeclKind::Const(index) | DeclKind::EnumVariant(index) => {
-						self.constants[usize::from(index)].env
+						self.constants[usize::from(index)].generic_params
 					}
 					// Declares no type parameters.
-					_ => GenericEnvIdx::ROOT,
+					_ => GenericFrameIdx::ROOT,
 				};
-				Some((self.decls.scope(loc), env))
+				Some((self.decls.scope(loc), frame))
 			}
 			Definition::InherentImplTarget(index) => Some((
 				self.decls.inherent_impls[usize::from(index)].namespace,
 				self.inherent_impls[usize::from(index)]
 					.as_ref()?
-					.type_params,
+					.generic_params,
 			)),
 			Definition::TraitImplTarget(index) => Some((
 				self.decls.trait_impls[usize::from(index)].namespace,
-				self.trait_impls[usize::from(index)].as_ref()?.type_params,
+				self.trait_impls[usize::from(index)]
+					.as_ref()?
+					.generic_params,
 			)),
 			_ => None,
 		}
 	}
 
 	/// What a bare name used as `used_as` can mean in `namespace` with the
-	/// type parameters of `env`, after the locals a body lists itself: as a
-	/// type, the parameters along `env`'s chain (each kept when no nearer one
+	/// type parameters of `frame`, after the locals a body lists itself: as
+	/// a type, the parameters along `frame`'s chain (each kept when no nearer one
 	/// of its name hides it), then the items of `namespace` and of the core
 	/// prelude an unqualified lookup finds (`lookup_unqualified`), accessible
 	/// from `namespace`, that can be written there and that no parameter, or
@@ -501,26 +506,32 @@ impl Semantics {
 	fn scope_names(
 		&self,
 		namespace: Scope,
-		env: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		used_as: NameUse,
 		is_local: impl Fn(SymbolU32) -> bool,
 		found: &mut Vec<(SymbolU32, Definition)>,
 	) {
 		if used_as == NameUse::Type {
-			let envs = std::iter::successors(Some(env), |&env| {
-				self.generic_envs.parent(env)
+			let chain = std::iter::successors(Some(frame), |&frame| {
+				self.generic_frames.parent(frame)
 			});
-			for frame in envs {
-				for (index, name) in
-					self.generic_envs.param_names(frame).iter().enumerate()
+			for declaring in chain {
+				for (index, name) in self
+					.generic_frames
+					.param_names(declaring)
+					.iter()
+					.enumerate()
 				{
 					let index = index as u32;
-					if self.generic_envs.resolve(env, name.inner)
-						== Some((frame, index))
+					if self.generic_frames.resolve(frame, name.inner)
+						== Some((declaring, index))
 					{
 						found.push((
 							name.inner,
-							Definition::TypeParam { env: frame, index },
+							Definition::TypeParam {
+								frame: declaring,
+								index,
+							},
 						));
 					}
 				}
@@ -529,8 +540,8 @@ impl Semantics {
 			// parameter. A written parameter/refinement takes precedence,
 			// just as it does in `resolve_type_path`.
 			let self_name = Keyword::SelfPascal.symbol();
-			if self.generic_envs.resolve(env, self_name).is_none()
-				&& let Some((kind, _)) = self.resolve_impl_self(env)
+			if self.generic_frames.resolve(frame, self_name).is_none()
+				&& let Some((kind, _)) = self.resolve_impl_self(frame)
 			{
 				let definition = match kind {
 					ImplKind::Inherent(index) => {
@@ -548,7 +559,7 @@ impl Semantics {
 		let hidden = |tier: Tier, name: SymbolU32| match (used_as, tier) {
 			(NameUse::Value, Tier::Value) => is_local(name),
 			(NameUse::Value | NameUse::Type | NameUse::Pattern, Tier::Type) => {
-				self.generic_envs.resolve(env, name).is_some()
+				self.generic_frames.resolve(frame, name).is_some()
 			}
 			_ => false,
 		};
@@ -639,7 +650,7 @@ impl Semantics {
 		let mut found = Vec::new();
 		self.scope_names(
 			scope,
-			GenericEnvIdx::ROOT,
+			GenericFrameIdx::ROOT,
 			used_as,
 			|_| false,
 			&mut found,
@@ -756,9 +767,9 @@ impl Semantics {
 		let mut next = 0;
 		while let Some(&current) = traits.get(next) {
 			next += 1;
-			let env = self.traits[usize::from(current)].env;
-			let own_self = self.generic_envs.param_types(env)[0];
-			let range = self.assumption_envs.requirements(env).range();
+			let frame = self.traits[usize::from(current)].generic_params;
+			let own_self = self.generic_frames.param_types(frame)[0];
+			let range = self.assumption_envs.requirements(frame).range();
 			for clause in self.clauses.traits(range) {
 				if clause.subject == own_self
 					&& clause.source == clause.origin
@@ -832,31 +843,31 @@ impl Semantics {
 		self.decls.file_id(owner.loc(&self.decls))
 	}
 
-	fn env_owner_file(&self, owner: GenericEnvOwner) -> FileId {
+	fn env_owner_file(&self, owner: GenericFrameOwner) -> FileId {
 		let decls = &self.decls;
 		match owner {
-			GenericEnvOwner::Constant(index) => {
+			GenericFrameOwner::Constant(index) => {
 				decls.file_id(decls.constants[usize::from(index)].loc)
 			}
-			GenericEnvOwner::Enum(index) => {
+			GenericFrameOwner::Enum(index) => {
 				decls.file_id(decls.enums[usize::from(index)].loc)
 			}
-			GenericEnvOwner::Struct(index) => {
+			GenericFrameOwner::Struct(index) => {
 				decls.file_id(decls.structs[usize::from(index)].loc)
 			}
-			GenericEnvOwner::Function(index) => {
+			GenericFrameOwner::Function(index) => {
 				decls.file_id(decls.functions[usize::from(index)].loc)
 			}
-			GenericEnvOwner::Trait(index) => {
+			GenericFrameOwner::Trait(index) => {
 				decls.file_id(decls.traits[usize::from(index)].loc)
 			}
-			GenericEnvOwner::TypeAlias(index) => {
+			GenericFrameOwner::TypeAlias(index) => {
 				decls.file_id(decls.type_aliases[usize::from(index)].loc)
 			}
-			GenericEnvOwner::InherentImpl(index) => {
+			GenericFrameOwner::InherentImpl(index) => {
 				decls.inherent_impls[usize::from(index)].file_id
 			}
-			GenericEnvOwner::TraitImpl(index) => {
+			GenericFrameOwner::TraitImpl(index) => {
 				decls.trait_impls[usize::from(index)].file_id
 			}
 		}
@@ -1608,8 +1619,8 @@ mod tests {
 			}
 		"});
 		let parameter = Reference::TypeParam {
-			env: a.sema.functions[usize::from(a.function_index("f"))]
-				.type_params,
+			frame: a.sema.functions[usize::from(a.function_index("f"))]
+				.generic_params,
 			index: 0,
 		};
 		for context in [
@@ -1670,7 +1681,7 @@ mod tests {
 		assert_eq!(
 			a.at("self: Self", "Self", Tier::Type),
 			Some(Reference::TypeParam {
-				env: a.sema.traits[usize::from(trait_index)].env,
+				frame: a.sema.traits[usize::from(trait_index)].generic_params,
 				index: 0,
 			})
 		);

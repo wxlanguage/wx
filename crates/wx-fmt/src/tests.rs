@@ -2349,7 +2349,7 @@ fn test_format_impl_trait_multi_segment() {
 #[test]
 fn test_format_impl_trait_generic_type_params() {
 	// Regression test: build_impl_trait_definition previously dropped the
-	// impl's own type_params (e.g. `impl<T> Trait for Type<T>` lost `<T>`),
+	// impl's own generic_params (e.g. `impl<T> Trait for Type<T>` lost `<T>`),
 	// silently changing the code's meaning.
 	let case = TestCase::new(indoc! {"
         impl<T> Trait for Wrapper<T> {

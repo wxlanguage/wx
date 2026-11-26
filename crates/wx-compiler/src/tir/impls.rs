@@ -244,7 +244,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			match &entry.node {
 				AstNodeRef::InherentImplBlock { item, block_index } => {
 					let ast::Item::InherentImpl {
-						type_params,
+						generic_params,
 						target: target_path,
 						..
 					} = &ast.item(*item)
@@ -255,7 +255,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						entry.file_id,
 						entry.namespace,
 						target_path,
-						*type_params,
+						*generic_params,
 					) else {
 						continue;
 					};
@@ -274,7 +274,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 				}
 				AstNodeRef::TraitImplBlock { item, block_index } => {
 					let ast::Item::TraitImpl {
-						type_params,
+						generic_params,
 						trait_name,
 						target: target_path,
 						..
@@ -287,7 +287,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 							entry.file_id,
 							entry.namespace,
 							target_path,
-							*type_params,
+							*generic_params,
 						)
 						.ok()
 						.map(|inner| Spanned {
@@ -795,7 +795,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		file_id: FileId,
 		namespace: Scope,
 		path: &ast::Path,
-		params: ast::List<ast::TypeParam>,
+		params: ast::List<ast::GenericParam>,
 	) -> Result<ImplTarget, ()> {
 		let ast = &self.asts[file_id.as_usize()];
 		let segments = ast.list(path.segments);

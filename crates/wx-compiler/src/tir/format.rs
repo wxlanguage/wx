@@ -10,7 +10,7 @@
 //! `self` right after — the same reason the legacy one existed as its own
 //! type rather than living on the (bigger, `&mut`-heavy) `Builder`.
 //!
-//! Borrows `types`/`decls`/`strings` plus `generic_envs` for generic parameter
+//! Borrows `types`/`decls`/`strings` plus `generic_frames` for generic parameter
 //! names. Struct, enum, function, trait, and memory names come directly
 //! from their definitions, without forcing signature resolution.
 //! The formatter currently wraps `Semantics`'s pieces.
@@ -28,7 +28,7 @@ use super::decls::{
 use super::resolutions::Definition;
 use super::signatures::Semantics;
 use super::types::{
-	GenericEnvArena, GenericEnvIdx, Type, TypeIndex, TypeInterner,
+	GenericFrameArena, GenericFrameIdx, Type, TypeIndex, TypeInterner,
 };
 
 /// The bytes a type may take in a message, as rustc shortens a long type.
@@ -38,7 +38,7 @@ pub struct TypeFormatter<'a> {
 	pub(super) types: &'a TypeInterner,
 	pub(super) decls: &'a Declarations,
 	pub(super) strings: &'a StringInterner,
-	pub(super) generic_envs: &'a GenericEnvArena,
+	pub(super) generic_frames: &'a GenericFrameArena,
 	/// How many bytes a type may take before the rest of it is written as
 	/// `...`. A type can be far larger than its interned form (a doubling
 	/// chain of shared parts is a handful of types and 2^n leaves), so this
@@ -63,7 +63,7 @@ impl Semantics {
 			types: &self.types,
 			decls: &self.decls,
 			strings,
-			generic_envs: &self.generic_envs,
+			generic_frames: &self.generic_frames,
 			budget: TYPE_DISPLAY_BUDGET,
 		}
 	}
@@ -88,10 +88,10 @@ impl Semantics {
 		definition: Definition,
 	) -> Vec<SourceClauseId> {
 		match definition {
-			Definition::TypeParam { env, index } => {
+			Definition::TypeParam { frame, index } => {
 				let subject =
-					self.generic_envs.param_types(env)[index as usize];
-				self.bounds_written_on(env, subject)
+					self.generic_frames.param_types(frame)[index as usize];
+				self.bounds_written_on(frame, subject)
 			}
 			Definition::Member(MemberKind::AssociatedType(index)) => self
 				.assoc_types[usize::from(index)]
@@ -117,19 +117,19 @@ impl Semantics {
 		&self,
 		trait_index: TraitIdx,
 	) -> Vec<SourceClauseId> {
-		let env = self.traits[usize::from(trait_index)].env;
-		self.bounds_written_on(env, self.generic_envs.param_types(env)[0])
+		let frame = self.traits[usize::from(trait_index)].generic_params;
+		self.bounds_written_on(frame, self.generic_frames.param_types(frame)[0])
 	}
 
-	/// The bounds `env`'s item writes on `subject`, in written order: the
+	/// The bounds `frame`'s item writes on `subject`, in written order: the
 	/// clauses about it that a bound written there states itself, not one
 	/// it brings in from a supertrait.
 	fn bounds_written_on(
 		&self,
-		env: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		subject: TypeIndex,
 	) -> Vec<SourceClauseId> {
-		let range = self.assumption_envs.requirements(env).range();
+		let range = self.assumption_envs.requirements(frame).range();
 		let mut bounds = Vec::new();
 		for clause in self.clauses.traits(range) {
 			if clause.subject == subject
@@ -356,9 +356,9 @@ impl TypeFormatter<'_> {
 				self.write_type_args(f, limit, type_args);
 			}
 			Type::TypeParam {
-				env, param_index, ..
+				frame, param_index, ..
 			} => {
-				let symbol = self.generic_envs.param_names(*env)
+				let symbol = self.generic_frames.param_names(*frame)
 					[*param_index as usize]
 					.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
@@ -484,7 +484,7 @@ mod tests {
 	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::signatures::tests::source_graph;
 	use crate::tir::signatures::{QueryInfo, SemanticsBuilder};
-	use crate::tir::types::GenericEnvIdx;
+	use crate::tir::types::GenericFrameIdx;
 
 	/// A `Semantics` with every signature built and no body checked, and
 	/// its interner.
@@ -587,13 +587,14 @@ mod tests {
 			&self,
 			function: &str,
 			name: &str,
-		) -> (GenericEnvIdx, usize) {
-			let env = self.sema.functions[usize::from(self.function(function))]
-				.type_params;
+		) -> (GenericFrameIdx, usize) {
+			let frame = self.sema.functions
+				[usize::from(self.function(function))]
+			.generic_params;
 			let index = self
 				.sema
-				.generic_envs
-				.param_names(env)
+				.generic_frames
+				.param_names(frame)
 				.iter()
 				.position(|param| {
 					self.strings.resolve(param.inner) == Some(name)
@@ -603,7 +604,7 @@ mod tests {
 						"expected `{function}` to have a type parameter `{name}`"
 					)
 				});
-			(env, index)
+			(frame, index)
 		}
 
 		fn type_formatter(&self) -> TypeFormatter<'_> {
@@ -612,7 +613,7 @@ mod tests {
 
 		fn type_param(&self, function: &str, name: &str) -> TypeIndex {
 			let (env, index) = self.parameter(function, name);
-			self.sema.generic_envs.param_types(env)[index]
+			self.sema.generic_frames.param_types(env)[index]
 		}
 
 		/// The bounds written on `param`, as written: every top-level bound
@@ -623,7 +624,7 @@ mod tests {
 			param: &str,
 		) -> Vec<SourceClauseId> {
 			let (env, index) = self.parameter(function, param);
-			let names = self.sema.generic_envs.param_names(env);
+			let names = self.sema.generic_frames.param_names(env);
 			let after = names[index].span.end;
 			let before = names
 				.get(index + 1)

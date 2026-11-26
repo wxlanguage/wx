@@ -33,7 +33,7 @@ use super::literals::UntypedValue;
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::signatures::Semantics;
 use super::types::{
-	GenericEnvArena, GenericEnvIdx, ImplArgs, ImplKind, Substitution, Type,
+	GenericFrameArena, GenericFrameIdx, ImplArgs, ImplKind, Substitution, Type,
 	TypeIndex, TypeInterner, TypeList,
 };
 
@@ -84,13 +84,22 @@ impl Subjects {
 	fn stated(
 		self,
 		types: &mut TypeInterner,
-		(envs, env, args): (&GenericEnvArena, GenericEnvIdx, &[TypeIndex]),
+		(envs, frame, args): (
+			&GenericFrameArena,
+			GenericFrameIdx,
+			&[TypeIndex],
+		),
 		ty: TypeIndex,
 	) -> TypeIndex {
 		match self {
-			Subjects::All => {
-				types.substitute(ty, Substitution { envs, env, args })
-			}
+			Subjects::All => types.substitute(
+				ty,
+				Substitution {
+					frames: envs,
+					frame,
+					args,
+				},
+			),
 			Subjects::Rooted { root, subject } => {
 				rebase(types, ty, root, subject)
 			}
@@ -584,13 +593,13 @@ impl Semantics {
 			}
 			Err(error) => return Err(error),
 		};
-		let scope = self.trait_impls[usize::from(member.impl_index)]
+		let impl_frame = self.trait_impls[usize::from(member.impl_index)]
 			.as_ref()
 			.expect("a member with a value has a resolved impl header")
-			.type_params;
+			.generic_params;
 		// Before the judgement starts: normalizing the impl's env is not part
 		// of judging this value.
-		let normalized_env = self.normalize_env(strings, scope);
+		let normalized_env = self.normalize_env(strings, impl_frame);
 		self.solver
 			.verdicts
 			.insert(Definition::Member(member), Verdict::InProgress);
@@ -938,12 +947,13 @@ impl Semantics {
 					.trait_decl
 					.expect("a selected impl names its trait")
 					.inner;
-				let env = self.traits[usize::from(trait_index)].env;
+				let frame =
+					self.traits[usize::from(trait_index)].generic_params;
 				Ok(self.types.substitute(
 					default,
 					Substitution {
-						envs: &self.generic_envs,
-						env,
+						frames: &self.generic_frames,
+						frame,
 						args: &[target],
 					},
 				))
@@ -1547,16 +1557,16 @@ impl Semantics {
 		let instantiated = if args.is_empty() {
 			value
 		} else {
-			let env = self.trait_impls[usize::from(impl_index)]
+			let frame = self.trait_impls[usize::from(impl_index)]
 				.as_ref()
 				.expect("a generic selected impl has a resolved header")
-				.type_params;
-			debug_assert_ne!(env, GenericEnvIdx::ROOT);
+				.generic_params;
+			debug_assert_ne!(frame, GenericFrameIdx::ROOT);
 			self.types.substitute(
 				value,
 				Substitution {
-					envs: &self.generic_envs,
-					env,
+					frames: &self.generic_frames,
+					frame,
 					args: &args,
 				},
 			)
@@ -2428,7 +2438,7 @@ impl Semantics {
 			strings,
 			assumption_context,
 			ImplKind::Trait(impl_index),
-			header.type_params,
+			header.generic_params,
 			header.target.inner,
 			receiver,
 		)
@@ -2459,13 +2469,13 @@ impl Semantics {
 			.match_impl_target(
 				header.target.inner,
 				receiver,
-				&self.generic_envs,
-				header.type_params,
+				&self.generic_frames,
+				header.generic_params,
 			)
 			.expect("the selected impl's target matches the receiver")
 	}
 
-	/// `assumption_context` is the caller's; `impl_env` is the candidate impl's own
+	/// `assumption_context` is the caller's; `impl_frame` is the candidate impl's own
 	/// parameter frame (for a synthetic impl, the frame it is generic over). The
 	/// impl's requirements are proved in the caller's assumptions, never the
 	/// candidate's.
@@ -2474,7 +2484,7 @@ impl Semantics {
 		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		impl_kind: ImplKind,
-		impl_env: GenericEnvIdx,
+		impl_frame: GenericFrameIdx,
 		target: TypeIndex,
 		receiver: TypeIndex,
 	) -> Result<bool, SolverError> {
@@ -2499,13 +2509,13 @@ impl Semantics {
 		// The arguments live only while the bounds are proved.
 		let mut args = ImplArgs::from_elem(
 			TypeIndex::INFER,
-			self.generic_envs.generic_count(impl_env),
+			self.generic_frames.generic_count(impl_frame),
 		);
 		if !self.types.match_impl_target_into(
 			target,
 			receiver,
-			&self.generic_envs,
-			impl_env,
+			&self.generic_frames,
+			impl_frame,
 			&mut args,
 		) {
 			return Ok(false);
@@ -2516,8 +2526,8 @@ impl Semantics {
 		if *self.solver.verdict(Definition::Requirements(impl_kind))
 			== Verdict::InProgress
 		{
-			if assumption_context == self.normalize_env(strings, impl_env)
-				&& *args == *self.generic_envs.identity_args(impl_env)
+			if assumption_context == self.normalize_env(strings, impl_frame)
+				&& *args == *self.generic_frames.identity_args(impl_frame)
 			{
 				self.solver.reenter_requirements(impl_kind)?;
 				return Ok(true);
@@ -2528,7 +2538,7 @@ impl Semantics {
 		self.prove_requirements(
 			strings,
 			assumption_context,
-			impl_env,
+			impl_frame,
 			&args,
 			None,
 		)
@@ -2564,19 +2574,19 @@ impl Semantics {
 				unreachable!("only a member's value is judged finite")
 			}
 		}
-		let impl_env = match impl_kind {
+		let impl_frame = match impl_kind {
 			ImplKind::Trait(index) => self.trait_impls[usize::from(index)]
 				.as_ref()
-				.map(|header| header.type_params),
+				.map(|header| header.generic_params),
 			ImplKind::Inherent(index) => self.inherent_impls
 				[usize::from(index)]
 			.as_ref()
-			.map(|header| header.type_params),
+			.map(|header| header.generic_params),
 		}
 		.ok_or(SolverError::Pending)?;
-		let args = self.generic_envs.identity_args(impl_env).to_vec();
+		let args = self.generic_frames.identity_args(impl_frame).to_vec();
 		// Before the judgement starts, as for a member's value.
-		let normalized_env = self.normalize_env(strings, impl_env);
+		let normalized_env = self.normalize_env(strings, impl_frame);
 		self.solver.verdicts.insert(definition, Verdict::InProgress);
 		let index = self.solver.state.frames.len();
 		self.solver.state.frames.push(SolverFrame::Requirements {
@@ -2590,7 +2600,7 @@ impl Semantics {
 		let result = self.prove_requirements(
 			strings,
 			normalized_env,
-			impl_env,
+			impl_frame,
 			&args,
 			Some(index),
 		);
@@ -2644,7 +2654,7 @@ impl Semantics {
 		answer
 	}
 
-	/// Whether every clause `impl_env`'s item and the items around it state
+	/// Whether every clause `impl_frame`'s item and the items around it state
 	/// holds for `args` (the flat arguments of its chain) under
 	/// `assumption_context`: each frame's requirements, proved whole. A
 	/// judgement passes its frame, which records the bound being proved.
@@ -2652,24 +2662,24 @@ impl Semantics {
 		&mut self,
 		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
-		impl_env: GenericEnvIdx,
+		impl_frame: GenericFrameIdx,
 		args: &[TypeIndex],
 		judgement: Option<usize>,
 	) -> Result<bool, SolverError> {
-		let mut frame = Some(impl_env);
+		let mut frame = Some(impl_frame);
 		while let Some(current) = frame {
 			if !self.satisfies_clauses(
 				strings,
 				assumption_context,
 				self.assumption_envs.requirements(current),
 				Subjects::All,
-				(impl_env, args),
+				(impl_frame, args),
 				None,
 				judgement,
 			)? {
 				return Ok(false);
 			}
-			frame = self.generic_envs.parent(current);
+			frame = self.generic_frames.parent(current);
 		}
 		Ok(true)
 	}
@@ -2691,7 +2701,7 @@ impl Semantics {
 		assumption_context: AssumptionEnvIdx,
 		clauses: PublishedClauses,
 		subjects: Subjects,
-		(frame, arguments): (GenericEnvIdx, &[TypeIndex]),
+		(frame, arguments): (GenericFrameIdx, &[TypeIndex]),
 		mut failures: Option<&mut Vec<UnsatisfiedClause>>,
 		judgement: Option<usize>,
 	) -> Result<bool, SolverError> {
@@ -2719,7 +2729,7 @@ impl Semantics {
 			self.solver.record_proving(judgement, clause.origin);
 			let stated = subjects.stated(
 				&mut self.types,
-				(&self.generic_envs, frame, arguments),
+				(&self.generic_frames, frame, arguments),
 				clause.subject,
 			);
 			let receiver = if matches!(
@@ -2791,14 +2801,14 @@ impl Semantics {
 					self.solver.record_proving(judgement, clause.origin);
 					let projection = subjects.stated(
 						&mut self.types,
-						(&self.generic_envs, frame, arguments),
+						(&self.generic_frames, frame, arguments),
 						clause.projection,
 					);
 					let required = self.types.substitute(
 						clause.value,
 						Substitution {
-							envs: &self.generic_envs,
-							env: frame,
+							frames: &self.generic_frames,
+							frame,
 							args: arguments,
 						},
 					);
@@ -2855,7 +2865,7 @@ impl Semantics {
 					self.solver.record_proving(judgement, clause.origin);
 					let stated = subjects.stated(
 						&mut self.types,
-						(&self.generic_envs, frame, arguments),
+						(&self.generic_frames, frame, arguments),
 						clause.subject,
 					);
 					let subject = self.normalize(
@@ -2868,8 +2878,8 @@ impl Semantics {
 					let ty = self.types.substitute(
 						clause.ty,
 						Substitution {
-							envs: &self.generic_envs,
-							env: frame,
+							frames: &self.generic_frames,
+							frame,
 							args: arguments,
 						},
 					);
@@ -2985,8 +2995,12 @@ impl Semantics {
 				};
 				if clause_trait != trait_index
 					|| clause_assoc != assoc_type_index
-					|| !source.names(types, tables.generic_envs, base, receiver)
-				{
+					|| !source.names(
+						types,
+						tables.generic_frames,
+						base,
+						receiver,
+					) {
 					continue;
 				}
 				let candidate = ContextualEquality {
@@ -3023,8 +3037,8 @@ impl Semantics {
 			Some(context) => self.types.substitute(
 				fact.value,
 				Substitution {
-					envs: &self.generic_envs,
-					env: context.env,
+					frames: &self.generic_frames,
+					frame: context.frame,
 					args: &[context.receiver],
 				},
 			),

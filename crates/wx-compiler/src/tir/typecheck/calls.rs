@@ -32,7 +32,7 @@ use crate::tir::resolutions::{Definition, Reference, Site};
 use crate::tir::signatures::Semantics;
 use crate::tir::solver::SolverError;
 use crate::tir::types::{
-	GenericArgs, GenericEnvIdx, GenericEnvOwner, Type, TypeIndex, TypeList,
+	GenericArgs, GenericFrameIdx, GenericFrameOwner, Type, TypeIndex, TypeList,
 };
 use crate::vfs::FileId;
 
@@ -67,9 +67,9 @@ impl Callee {
 		leading: &[TypeIndex],
 		proven: usize,
 	) -> Self {
-		let env = sema.functions[usize::from(function)].type_params;
+		let frame = sema.functions[usize::from(function)].generic_params;
 		let mut type_args =
-			vec![TypeIndex::INFER; sema.generic_envs.generic_count(env)]
+			vec![TypeIndex::INFER; sema.generic_frames.generic_count(frame)]
 				.into_boxed_slice();
 		type_args[..leading.len()].copy_from_slice(leading);
 		Self {
@@ -127,7 +127,7 @@ pub(super) struct CallTarget {
 	pub(super) kind: CallTargetKind,
 	/// The frames the parameter types are written with: the whole chain the
 	/// call's flat type arguments instantiate.
-	pub(super) generic_env: GenericEnvIdx,
+	pub(super) generic_frame: GenericFrameIdx,
 	/// Each parameter's type as declared, `self` included.
 	pub(super) param_types: TypeList,
 }
@@ -137,7 +137,7 @@ impl CallTarget {
 		let signature = &sema.functions[usize::from(function)];
 		Self {
 			kind: CallTargetKind::Function(function),
-			generic_env: signature.type_params,
+			generic_frame: signature.generic_params,
 			param_types: signature.param_types,
 		}
 	}
@@ -149,7 +149,7 @@ impl CallTarget {
 		let signature = &sema.structs[usize::from(struct_index)];
 		Self {
 			kind: CallTargetKind::StructConstructor(struct_index),
-			generic_env: signature.type_params,
+			generic_frame: signature.generic_params,
 			param_types: signature.field_types,
 		}
 	}
@@ -278,11 +278,11 @@ pub(super) enum CallTargetKind {
 }
 
 impl CallTargetKind {
-	pub(super) fn owner(self) -> GenericEnvOwner {
+	pub(super) fn owner(self) -> GenericFrameOwner {
 		match self {
-			Self::Function(function) => GenericEnvOwner::Function(function),
+			Self::Function(function) => GenericFrameOwner::Function(function),
 			Self::StructConstructor(struct_index) => {
-				GenericEnvOwner::Struct(struct_index)
+				GenericFrameOwner::Struct(struct_index)
 			}
 		}
 	}
@@ -348,7 +348,7 @@ impl BodyBuilder<'_, '_> {
 		self.write_type_args(
 			segment,
 			own,
-			GenericEnvOwner::Function(function),
+			GenericFrameOwner::Function(function),
 			&mut type_args,
 		);
 		let mut mismatched = false;
@@ -356,10 +356,10 @@ impl BodyBuilder<'_, '_> {
 			let expected = self.context().normalized(expected);
 			let declared = self.sema.types.intern_function(
 				function,
-				self.sema.generic_envs.identity_args(env),
+				self.sema.generic_frames.identity_args(env),
 			);
 			self.sema.types.learn(
-				&self.sema.generic_envs,
+				&self.sema.generic_frames,
 				env,
 				&mut type_args,
 				declared,
@@ -423,7 +423,7 @@ impl BodyBuilder<'_, '_> {
 		self.write_type_args(
 			segment,
 			own,
-			GenericEnvOwner::Function(function),
+			GenericFrameOwner::Function(function),
 			&mut type_args,
 		);
 		// A method's receiver is expected to be what the method takes as
@@ -440,7 +440,7 @@ impl BodyBuilder<'_, '_> {
 		if expected != TypeIndex::INFER && expected != TypeIndex::ERROR {
 			let expected = self.context().normalized(expected);
 			self.sema.types.learn(
-				&self.sema.generic_envs,
+				&self.sema.generic_frames,
 				env,
 				&mut type_args,
 				return_type,
@@ -576,7 +576,7 @@ impl BodyBuilder<'_, '_> {
 			TypeIndex::ERROR
 		} else {
 			let declared = self.declared_after(target, skipped);
-			self.instantiate(declared, target.generic_env, type_args)
+			self.instantiate(declared, target.generic_frame, type_args)
 		};
 		self.pack(given.iter().map(|argument| argument.value), order, ty, span)
 	}
@@ -636,7 +636,7 @@ impl BodyBuilder<'_, '_> {
 			let ty = if self.sema.types.has_infer(argument.expected) {
 				self.instantiate(
 					argument.declared,
-					target.generic_env,
+					target.generic_frame,
 					type_args,
 				)
 			} else {
@@ -657,8 +657,8 @@ impl BodyBuilder<'_, '_> {
 	) {
 		let actual = self.body.ty(value);
 		self.sema.types.learn(
-			&self.sema.generic_envs,
-			target.generic_env,
+			&self.sema.generic_frames,
+			target.generic_frame,
 			type_args,
 			declared,
 			actual,
@@ -712,7 +712,7 @@ impl BodyBuilder<'_, '_> {
 			let declared =
 				self.sema.types.list(target.param_types)[usize::from(param)];
 			let hint =
-				self.instantiate(declared, target.generic_env, type_args);
+				self.instantiate(declared, target.generic_frame, type_args);
 			let value = self.build(*argument, hint);
 			self.learn_argument(target, type_args, declared, value);
 			given.push(GivenArgument {
@@ -740,7 +740,7 @@ impl BodyBuilder<'_, '_> {
 		let skipped = given.len();
 		let open = target.param_types.len() - skipped;
 		let declared = self.declared_after(target, skipped);
-		let hint = self.instantiate(declared, target.generic_env, type_args);
+		let hint = self.instantiate(declared, target.generic_frame, type_args);
 		let value = self.build(argument, hint);
 		let actual = self.body.ty(value);
 		let is_tuple =
@@ -776,7 +776,7 @@ impl BodyBuilder<'_, '_> {
 		let param = ParamIdx::new(given.len() as u32);
 		let declared =
 			self.sema.types.list(target.param_types)[usize::from(param)];
-		let hint = self.instantiate(declared, target.generic_env, type_args);
+		let hint = self.instantiate(declared, target.generic_frame, type_args);
 		let fits = match *self.sema.types.resolve(hint) {
 			Type::Tuple { elements } => elements.len() == arguments.len(),
 			_ => self.sema.types.has_infer(hint),
@@ -838,7 +838,7 @@ impl BodyBuilder<'_, '_> {
 			let declared =
 				self.sema.types.list(target.param_types)[usize::from(param)];
 			let hint =
-				self.instantiate(declared, target.generic_env, type_args);
+				self.instantiate(declared, target.generic_frame, type_args);
 			let value = self.build_named_argument(argument, hint);
 			self.learn_argument(target, type_args, declared, value);
 			given.push(GivenArgument {
@@ -1002,29 +1002,29 @@ impl BodyBuilder<'_, '_> {
 	pub(super) fn function_frames(
 		&self,
 		function: FunctionIdx,
-	) -> (GenericEnvIdx, GenericEnvIdx) {
-		let env = self.sema.functions[usize::from(function)].type_params;
-		let own = if env != GenericEnvIdx::ROOT
-			&& self.sema.generic_envs.owner(env)
-				== GenericEnvOwner::Function(function)
+	) -> (GenericFrameIdx, GenericFrameIdx) {
+		let frame = self.sema.functions[usize::from(function)].generic_params;
+		let own = if frame != GenericFrameIdx::ROOT
+			&& self.sema.generic_frames.owner(frame)
+				== GenericFrameOwner::Function(function)
 		{
-			env
+			frame
 		} else {
-			GenericEnvIdx::ROOT
+			GenericFrameIdx::ROOT
 		};
-		(env, own)
+		(frame, own)
 	}
 
-	/// `ty`, written with the parameters of `env`, with `args` for them. A
+	/// `ty`, written with the parameters of `frame`, with `args` for them. A
 	/// type argument not known yet leaves its parts `INFER`, which expect
 	/// nothing; one that failed makes the whole type `ERROR`.
 	pub(super) fn instantiate(
 		&mut self,
 		ty: TypeIndex,
-		env: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		args: &[TypeIndex],
 	) -> TypeIndex {
-		let ty = self.sema.substitute_type(ty, env, args);
+		let ty = self.sema.substitute_type(ty, frame, args);
 		let ty = self.context().normalized(ty);
 		self.sema.types.collapse_error(ty)
 	}
@@ -1193,7 +1193,7 @@ impl BodyBuilder<'_, '_> {
 		let return_type =
 			self.sema.functions[usize::from(function)].return_type;
 		let result =
-			self.instantiate(return_type, target.generic_env, &type_args);
+			self.instantiate(return_type, target.generic_frame, &type_args);
 		let args = self.arguments_value(
 			&target,
 			&type_args,

@@ -33,7 +33,7 @@ use crate::tir::satisfaction::{
 };
 use crate::tir::signatures::InferPolicy;
 use crate::tir::solver::SolverError;
-use crate::tir::types::{GenericEnvOwner, Substitution, Type, TypeIndex};
+use crate::tir::types::{GenericFrameOwner, Substitution, Type, TypeIndex};
 
 /// What a call's context expects of it.
 #[derive(Clone, Copy)]
@@ -311,14 +311,16 @@ impl BodyBuilder<'_, '_> {
 		}
 		let signature = &self.sema.constants[usize::from(constant)];
 		debug_assert_eq!(
-			self.sema.generic_envs.generic_count(signature.env),
+			self.sema
+				.generic_frames
+				.generic_count(signature.generic_params),
 			type_args.len()
 		);
 		let ty = self.sema.types.substitute(
 			signature.ty,
 			Substitution {
-				envs: &self.sema.generic_envs,
-				env: signature.env,
+				frames: &self.sema.generic_frames,
+				frame: signature.generic_params,
 				args: type_args,
 			},
 		);
@@ -504,7 +506,7 @@ impl BodyBuilder<'_, '_> {
 				let found = self.sema.resolve_trait_qualified_value(
 					self.builder.strings,
 					&mut self.obligations.types,
-					self.scope.generic_env,
+					self.scope.generic_frame,
 					receiver,
 					trait_index,
 					member.ident,
@@ -531,7 +533,7 @@ impl BodyBuilder<'_, '_> {
 			{
 				// Selection matches clauses as written.
 				let written =
-					self.sema.assumption_envs.written(self.scope.generic_env);
+					self.sema.assumption_envs.written(self.scope.generic_frame);
 				match self.sema.declared_bound_member(written, receiver, key) {
 					MemberLookup::NotFound => {
 						let _ = self.sema.check_projection_member(
@@ -610,7 +612,7 @@ impl BodyBuilder<'_, '_> {
 				let header = self.sema.inherent_impls[usize::from(impl_index)]
 					.as_ref()
 					.expect("a selected impl has a header");
-				let env = header.type_params;
+				let frame = header.generic_params;
 				// The lookup matched this impl's target to the receiver.
 				let leading = self
 					.sema
@@ -618,8 +620,8 @@ impl BodyBuilder<'_, '_> {
 					.match_impl_target(
 						header.target.inner,
 						receiver,
-						&self.sema.generic_envs,
-						env,
+						&self.sema.generic_frames,
+						frame,
 					)
 					.expect("the selected impl's target matches the receiver");
 				// Selected by name alone: the impl's bounds are this use's
@@ -630,10 +632,10 @@ impl BodyBuilder<'_, '_> {
 					.push(leading.iter().map(|&ty| (ty, member.ident.span)));
 				self.sema.record_bounds_check(
 					&mut self.obligations.types,
-					self.scope.generic_env,
-					BoundRequirements::Frame { env, args },
+					self.scope.generic_frame,
+					BoundRequirements::Frame { frame, args },
 					reference,
-					GenericEnvOwner::InherentImpl(impl_index),
+					GenericFrameOwner::InherentImpl(impl_index),
 				);
 				(kind, Some(leading), true)
 			}
@@ -782,7 +784,7 @@ impl BodyBuilder<'_, '_> {
 			(signature.return_type, signature.param_types);
 		let expected = self.context().normalized(expected);
 		self.sema.types.learn(
-			&self.sema.generic_envs,
+			&self.sema.generic_frames,
 			env,
 			&mut type_args,
 			return_type,

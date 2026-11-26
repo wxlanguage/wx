@@ -837,8 +837,8 @@ impl<'a> Builder<'a> {
 			ast::Item::PackageType {
 				pub_at,
 				name,
-				type_params,
-				type_params_span,
+				generic_params,
+				generic_params_span,
 				..
 			} => {
 				let mut items = Vec::new();
@@ -848,9 +848,10 @@ impl<'a> Builder<'a> {
 				items.push(self.text(Text::Package));
 				items.push(self.text(Text::TypeKw));
 				items.push(self.symbol(name.inner));
-				items.extend(
-					self.build_type_params(*type_params, *type_params_span),
-				);
+				items.extend(self.build_generic_params(
+					*generic_params,
+					*generic_params_span,
+				));
 				items.push(self.text(Text::Semi));
 				self.arena.concat(&items)
 			}
@@ -911,27 +912,31 @@ impl<'a> Builder<'a> {
 			} => self
 				.build_enum_definition(span, *pub_at, *repr, name, *variants),
 			ast::Item::InherentImpl {
-				type_params,
-				type_params_span,
+				generic_params,
+				generic_params_span,
 				target,
 				items,
 			} => {
-				let type_params =
-					self.build_type_params(*type_params, *type_params_span);
-				self.build_impl_definition(span, type_params, target, *items)
+				let generic_params = self.build_generic_params(
+					*generic_params,
+					*generic_params_span,
+				);
+				self.build_impl_definition(span, generic_params, target, *items)
 			}
 			ast::Item::TraitImpl {
-				type_params,
-				type_params_span,
+				generic_params,
+				generic_params_span,
 				trait_name,
 				target,
 				items,
 			} => {
-				let type_params =
-					self.build_type_params(*type_params, *type_params_span);
+				let generic_params = self.build_generic_params(
+					*generic_params,
+					*generic_params_span,
+				);
 				self.build_impl_trait_definition(
 					span,
-					type_params,
+					generic_params,
 					trait_name,
 					target,
 					*items,
@@ -968,18 +973,20 @@ impl<'a> Builder<'a> {
 			),
 			ast::Item::Struct {
 				name,
-				type_params,
-				type_params_span,
+				generic_params,
+				generic_params_span,
 				fields,
 				pub_at,
 				..
 			} => {
-				let type_params =
-					self.build_type_params(*type_params, *type_params_span);
+				let generic_params = self.build_generic_params(
+					*generic_params,
+					*generic_params_span,
+				);
 				self.build_struct_declaration(
 					span,
 					name,
-					type_params,
+					generic_params,
 					*fields,
 					*pub_at,
 				)
@@ -996,17 +1003,19 @@ impl<'a> Builder<'a> {
 			ast::Item::TypeAlias {
 				pub_at,
 				name,
-				type_params,
-				type_params_span,
+				generic_params,
+				generic_params_span,
 				body,
 				..
 			} => {
-				let type_params =
-					self.build_type_params(*type_params, *type_params_span);
+				let generic_params = self.build_generic_params(
+					*generic_params,
+					*generic_params_span,
+				);
 				self.build_type_alias_definition(
 					*pub_at,
 					name,
-					type_params,
+					generic_params,
 					*body,
 				)
 			}
@@ -1276,12 +1285,12 @@ impl<'a> Builder<'a> {
 	fn build_impl_definition(
 		&mut self,
 		span: TextSpan,
-		type_params: Option<NodeId>,
+		generic_params: Option<NodeId>,
 		target: &ast::Path,
 		items: ast::List<ast::ImplItem>,
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = vec![self.text(Text::Impl)];
-		nodes.extend(type_params);
+		nodes.extend(generic_params);
 		nodes.push(self.text(Text::Space));
 		nodes.push(self.build_type_path(self.ast.list(target.segments)));
 		nodes.push(self.text(Text::SpaceLBrace));
@@ -1303,13 +1312,13 @@ impl<'a> Builder<'a> {
 	fn build_impl_trait_definition(
 		&mut self,
 		span: TextSpan,
-		type_params: Option<NodeId>,
+		generic_params: Option<NodeId>,
 		trait_name: &ast::Path,
 		target: &ast::Path,
 		items: ast::List<ast::ImplItem>,
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = vec![self.text(Text::Impl)];
-		nodes.extend(type_params);
+		nodes.extend(generic_params);
 		nodes.push(self.text(Text::Space));
 		let trait_id = self.build_type_path(self.ast.list(trait_name.segments));
 		let for_kw = self.text(Text::ForKw);
@@ -1575,7 +1584,7 @@ impl<'a> Builder<'a> {
 		&mut self,
 		pub_at: Option<TextOffset>,
 		name: &ast::Spanned<SymbolU32>,
-		type_params: Option<NodeId>,
+		generic_params: Option<NodeId>,
 		body: Option<ast::TypeId>,
 	) -> NodeId {
 		let mut nodes: Vec<NodeId> = Vec::new();
@@ -1584,7 +1593,7 @@ impl<'a> Builder<'a> {
 		}
 		nodes.push(self.text(Text::TypeKw));
 		nodes.push(self.symbol(name.inner));
-		nodes.extend(type_params);
+		nodes.extend(generic_params);
 		if let Some(body) = body {
 			nodes.push(self.text(Text::EqSp));
 			nodes.push(self.build_type_expression(body));
@@ -1812,7 +1821,7 @@ impl<'a> Builder<'a> {
 		&mut self,
 		span: TextSpan,
 		name: &ast::Spanned<SymbolU32>,
-		type_params: Option<NodeId>,
+		generic_params: Option<NodeId>,
 		fields: ast::List<ast::StructField>,
 		pub_at: Option<TextOffset>,
 	) -> NodeId {
@@ -1822,7 +1831,7 @@ impl<'a> Builder<'a> {
 		}
 		items.push(self.text(Text::Struct));
 		items.push(self.symbol(name.inner));
-		items.extend(type_params);
+		items.extend(generic_params);
 
 		let entries = self.build_struct_fields(fields);
 		items.push(self.build_delimited_list(
@@ -2105,21 +2114,21 @@ impl<'a> Builder<'a> {
 	}
 
 	/// `<...>` as written, or nothing when no list is written.
-	fn build_type_params(
+	fn build_generic_params(
 		&mut self,
-		type_params: ast::List<ast::TypeParam>,
+		generic_params: ast::List<ast::GenericParam>,
 		span: Option<TextSpan>,
 	) -> Option<NodeId> {
-		if type_params.is_empty() {
+		if generic_params.is_empty() {
 			return None;
 		}
 		let span = span.expect("written type parameters have their span");
 		let entries = self
 			.ast
-			.spanned(type_params)
+			.spanned(generic_params)
 			.map(|param| {
 				let node = match param.inner {
-					ast::TypeParam::Type { name, bounds } => {
+					ast::GenericParam::Type { name, bounds } => {
 						let name = self.symbol(name.inner);
 						match bounds {
 							Some(bounds) => {
@@ -2131,7 +2140,7 @@ impl<'a> Builder<'a> {
 							None => name,
 						}
 					}
-					ast::TypeParam::Const { name, ty, .. } => {
+					ast::GenericParam::Const { name, ty, .. } => {
 						let keyword = self.text(Text::Const);
 						let name = self.symbol(name.inner);
 						let colon = self.text(Text::ColonSp);
@@ -2159,9 +2168,9 @@ impl<'a> Builder<'a> {
 		let signature = self.ast.signature(signature);
 		out.push(self.text(Text::Func));
 		out.push(self.symbol(signature.name.inner));
-		out.extend(self.build_type_params(
-			signature.type_params,
-			signature.type_params_span,
+		out.extend(self.build_generic_params(
+			signature.generic_params,
+			signature.generic_params_span,
 		));
 		let entries = self
 			.ast

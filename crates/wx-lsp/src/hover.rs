@@ -10,7 +10,7 @@ use wx_compiler::ast::{Keyword, Spanned, StringInterner};
 use wx_compiler::diagnostics::{SourceSpan, TextOffset};
 use wx_compiler::tir::{
 	AssocTypeIdx, Body, BodyOwner, ConstIdx, ConstScalar, DeclKind, Definition,
-	FieldIdx, FieldOwner, FunctionIdx, GenericEnvIdx, GenericEnvOwner,
+	FieldIdx, FieldOwner, FunctionIdx, GenericFrameIdx, GenericFrameOwner,
 	MemberKind, MemberOwner, Reference, ScopeIdx, Semantics, StructIdx,
 	TargetIdx, Type, TypeIndex, TypesetIdx, Val, Visibility,
 };
@@ -51,7 +51,7 @@ pub(crate) fn signature(
 				}
 				Some(format!(
 					"type {name}{} = {target}",
-					renderer.type_params(signature.type_params),
+					renderer.generic_params(signature.generic_params),
 				))
 			}
 			DeclKind::EnumVariant(index) => renderer.variant(index),
@@ -121,8 +121,8 @@ pub(crate) fn signature(
 				))
 			}
 		},
-		Definition::TypeParam { env, index } => {
-			let names = sema.generic_envs.param_names(env);
+		Definition::TypeParam { frame, index } => {
+			let names = sema.generic_frames.param_names(frame);
 			let name = names.get(index as usize)?;
 			let head = format!("type {}", renderer.name(*name));
 			Some(renderer.bounded(head, definition))
@@ -306,7 +306,7 @@ pub(crate) fn declaration_summary(
 				return Some(format!(
 					"struct {}{}({})",
 					renderer.name(sema.decls.item(decl.loc).name),
-					renderer.type_param_names(signature.type_params),
+					renderer.generic_param_names(signature.generic_params),
 					fields.join(", ")
 				));
 			}
@@ -336,7 +336,7 @@ pub(crate) fn declaration_summary(
 	Some(format!(
 		"func {}{}({}) -> {}",
 		renderer.name(sema.decls.item(decl.loc).name),
-		renderer.type_param_names(renderer.own_type_params(function)),
+		renderer.generic_param_names(renderer.own_generic_params(function)),
 		params.join(", "),
 		renderer.ty(signature.return_type)
 	))
@@ -465,10 +465,10 @@ impl Renderer<'_> {
 	}
 
 	/// `<A, B>`, or nothing when the declaration has no parameters of its own.
-	/// `<T, U>`: the type parameters of `env` by name, without their
+	/// `<T, U>`: the type parameters of `frame` by name, without their
 	/// bounds; nothing when it has none.
-	fn type_param_names(&self, env: GenericEnvIdx) -> String {
-		let names = self.sema.generic_envs.param_names(env);
+	fn generic_param_names(&self, frame: GenericFrameIdx) -> String {
+		let names = self.sema.generic_frames.param_names(frame);
 		if names.is_empty() {
 			return String::new();
 		}
@@ -479,8 +479,8 @@ impl Renderer<'_> {
 		format!("<{}>", names.join(", "))
 	}
 
-	fn type_params(&self, env: GenericEnvIdx) -> String {
-		let names = self.sema.generic_envs.param_names(env);
+	fn generic_params(&self, frame: GenericFrameIdx) -> String {
+		let names = self.sema.generic_frames.param_names(frame);
 		if names.is_empty() {
 			return String::new();
 		}
@@ -488,7 +488,7 @@ impl Renderer<'_> {
 			.map(|(index, name)| {
 				let index = index as u32;
 				let head = self.name(*name).to_string();
-				self.bounded(head, Definition::TypeParam { env, index })
+				self.bounded(head, Definition::TypeParam { frame, index })
 			})
 			.collect();
 		format!("<{}>", params.join(", "))
@@ -497,9 +497,9 @@ impl Renderer<'_> {
 	/// `head`, followed by the bounds written on `definition`, if any. A
 	/// trait's own `Self` is bounded by the trait itself.
 	fn bounded(&self, head: String, definition: Definition) -> String {
-		if let Definition::TypeParam { env, index: 0 } = definition
-			&& let GenericEnvOwner::Trait(trait_index) =
-				self.sema.generic_envs.owner(env)
+		if let Definition::TypeParam { frame, index: 0 } = definition
+			&& let GenericFrameOwner::Trait(trait_index) =
+				self.sema.generic_frames.owner(frame)
 		{
 			let name = self.name(self.sema.decls.name(trait_index));
 			return format!("{head}: {name}");
@@ -534,15 +534,15 @@ impl Renderer<'_> {
 
 	/// The function's own parameter frame, or the empty root frame when its
 	/// signature uses an enclosing impl's or trait's frame instead.
-	fn own_type_params(&self, function: FunctionIdx) -> GenericEnvIdx {
-		let env = self.sema.functions[usize::from(function)].type_params;
-		if env != GenericEnvIdx::ROOT
-			&& self.sema.generic_envs.owner(env)
-				== GenericEnvOwner::Function(function)
+	fn own_generic_params(&self, function: FunctionIdx) -> GenericFrameIdx {
+		let frame = self.sema.functions[usize::from(function)].generic_params;
+		if frame != GenericFrameIdx::ROOT
+			&& self.sema.generic_frames.owner(frame)
+				== GenericFrameOwner::Function(function)
 		{
-			env
+			frame
 		} else {
-			GenericEnvIdx::ROOT
+			GenericFrameIdx::ROOT
 		}
 	}
 
@@ -563,7 +563,7 @@ impl Renderer<'_> {
 		format!(
 			"func {}{}({}) -> {}",
 			self.name(self.sema.decls.item(decl.loc).name),
-			self.type_params(self.own_type_params(function)),
+			self.generic_params(self.own_generic_params(function)),
 			params.join(", "),
 			self.ty(signature.return_type)
 		)
@@ -584,7 +584,7 @@ impl Renderer<'_> {
 					self.sema.inherent_impls[usize::from(index)].as_ref()?;
 				Some(format!(
 					"impl{} {}",
-					self.type_params(header.type_params),
+					self.generic_params(header.generic_params),
 					self.ty(header.target.inner),
 				))
 			}
@@ -595,7 +595,7 @@ impl Renderer<'_> {
 				let decl = &self.sema.decls.traits[usize::from(trait_index)];
 				Some(format!(
 					"impl{} {} for {}",
-					self.type_params(header.type_params),
+					self.generic_params(header.generic_params),
 					self.name(self.sema.decls.item(decl.loc).name),
 					self.ty(header.target.inner),
 				))
@@ -621,7 +621,7 @@ impl Renderer<'_> {
 		format!(
 			"struct {}{}({})",
 			self.name(self.sema.decls.item(decl.loc).name),
-			self.type_params(signature.type_params),
+			self.generic_params(signature.generic_params),
 			fields.join(", ")
 		)
 	}

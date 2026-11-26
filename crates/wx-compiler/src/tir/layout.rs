@@ -692,11 +692,11 @@ mod tests {
 		path: &str,
 		index: usize,
 	) -> Result<Option<Layout>, SolverError> {
-		let scope = case.function_signature(path).type_params;
+		let frame = case.function_signature(path).generic_params;
 		let ty = case.param_types(path)[index];
 		case.sema.memory_layout(
 			&case.strings,
-			case.sema.assumption_envs.normalized(scope),
+			case.sema.assumption_envs.normalized(frame),
 			ty,
 		)
 	}
@@ -707,12 +707,12 @@ mod tests {
 		path: &str,
 		index: usize,
 	) -> Option<AggregateIdx> {
-		let scope = case.function_signature(path).type_params;
+		let frame = case.function_signature(path).generic_params;
 		let ty = case.param_types(path)[index];
 		case.sema
 			.aggregate_layout(
 				&case.strings,
-				case.sema.assumption_envs.normalized(scope),
+				case.sema.assumption_envs.normalized(frame),
 				ty,
 			)
 			.expect("a parameter's layout is final")

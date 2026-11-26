@@ -26,8 +26,8 @@ use super::solver::{
 	SolverError, Verdict,
 };
 use super::types::{
-	GenericArgs, GenericEnvIdx, GenericEnvOwner, ImplKind, Substitution, Type,
-	TypeIndex,
+	GenericArgs, GenericFrameIdx, GenericFrameOwner, ImplKind, Substitution,
+	Type, TypeIndex,
 };
 use crate::ast::StringInterner;
 use crate::diagnostics::{DiagnosticCode, SourceSpan};
@@ -42,7 +42,7 @@ pub(super) enum BoundRequirements {
 	/// written in the declaration, so it may name any of them. A failure is
 	/// reported where the argument its clause is about is given.
 	Frame {
-		env: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		args: GenericArgs,
 	},
 	/// The declared bounds of `declaration`, a member of `trait_index`, whose
@@ -62,19 +62,19 @@ pub(super) enum TypeObligation {
 	/// one pointer. Compare after signatures exist so aliases and associated
 	/// types have their meaning, rather than inspecting the written syntax.
 	ReceiverType {
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		ty: TypeIndex,
 		self_type: TypeIndex,
 		reference: SourceSpan,
 	},
 	Bounds {
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		requirements: BoundRequirements,
 		reference: SourceSpan,
-		owner: GenericEnvOwner,
+		owner: GenericFrameOwner,
 	},
 	TraitMembership {
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		subject: TypeIndex,
 		required: TraitIdx,
 		reference: SourceSpan,
@@ -83,7 +83,7 @@ pub(super) enum TypeObligation {
 	/// inside it is found even if nothing ever reads the type. The result is
 	/// discarded: the stored type stays as written.
 	WellFormed {
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		ty: TypeIndex,
 		reference: SourceSpan,
 	},
@@ -113,7 +113,7 @@ pub(super) enum TypeObligation {
 	/// any member of the typesets its bounds name, so the value must be
 	/// representable as every one of them, and the type works with each.
 	ConstantRepresentable {
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		ty: TypeIndex,
 		bits: u64,
 		reference: SourceSpan,
@@ -124,7 +124,7 @@ pub(super) enum TypeObligation {
 	/// compared normalized with every fact, so a constant either names is read;
 	/// a constant's body therefore records it for after the values exist.
 	ConstantType {
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		/// The `Type::ConstRef` the length names.
 		length: TypeIndex,
 		expected: TypeIndex,
@@ -134,7 +134,7 @@ pub(super) enum TypeObligation {
 	/// part, a local's) is a `StackValue`. A field, a tuple's element and a
 	/// type argument need nothing: their container states what it needs.
 	ValueType {
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		ty: TypeIndex,
 		reference: SourceSpan,
 	},
@@ -145,7 +145,7 @@ pub(super) enum TypeObligation {
 	/// decides what to say: a plain "no such member", or, when the value does
 	/// have one, how to write it.
 	ProjectionMember {
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		projection: TypeIndex,
 		key: BindingKey,
 		reference: SourceSpan,
@@ -678,7 +678,7 @@ impl Semantics {
 			unreachable!("a length checked for its type names a constant")
 		};
 		let signature = &self.constants[usize::from(constant)];
-		let (mut ty, frame) = (signature.ty, signature.env);
+		let (mut ty, frame) = (signature.ty, signature.generic_params);
 		let mut env = self.normalize_env(strings, frame);
 		// With its arguments, the declared type is read where it is named.
 		if !type_args.is_empty() {
@@ -686,8 +686,8 @@ impl Semantics {
 			ty = self.types.substitute(
 				ty,
 				Substitution {
-					envs: &self.generic_envs,
-					env: frame,
+					frames: &self.generic_frames,
+					frame,
 					args: &args,
 				},
 			);

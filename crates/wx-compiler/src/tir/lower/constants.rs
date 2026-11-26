@@ -33,7 +33,7 @@ impl Lowerer<'_> {
 		let args = written
 			.into_iter()
 			.map(|arg| {
-				let arg = self.substitute(arg, state.env, &state.args);
+				let arg = self.substitute(arg, state.frame, &state.args);
 				self.normalize_type(arg, file_id, span)
 			})
 			.collect::<Result<Vec<TypeIndex>, ()>>()?;
