@@ -696,7 +696,7 @@ mod tests {
 		let ty = case.param_types(path)[index];
 		case.sema.memory_layout(
 			&case.strings,
-			case.sema.assumption_envs.completed(scope),
+			case.sema.assumption_envs.normalized(scope),
 			ty,
 		)
 	}
@@ -712,7 +712,7 @@ mod tests {
 		case.sema
 			.aggregate_layout(
 				&case.strings,
-				case.sema.assumption_envs.completed(scope),
+				case.sema.assumption_envs.normalized(scope),
 				ty,
 			)
 			.expect("a parameter's layout is final")

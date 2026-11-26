@@ -1596,18 +1596,18 @@ impl Semantics {
 		};
 		// Elements whose bytes are not known yet (of an abstract type) cannot
 		// be written.
-		let completed = self.completed_env(strings, body_env(self, owner));
-		let (layout, places) = match self.memory_values(strings, completed, of)
-		{
-			Ok(Some(layout)) => layout,
-			Ok(None) => {
-				return Err(Halt::Own(EvalError {
-					span,
-					kind: EvalErrorKind::NotConst,
-				}));
-			}
-			Err(_) => return Err(Halt::Silent),
-		};
+		let normalized_env = self.normalize_env(strings, body_env(self, owner));
+		let (layout, places) =
+			match self.memory_values(strings, normalized_env, of) {
+				Ok(Some(layout)) => layout,
+				Ok(None) => {
+					return Err(Halt::Own(EvalError {
+						span,
+						kind: EvalErrorKind::NotConst,
+					}));
+				}
+				Err(_) => return Err(Halt::Silent),
+			};
 		// An offset into an allocation is a `u32`.
 		let Some(size) = count
 			.checked_mul(u64::from(layout.size))
@@ -1666,7 +1666,7 @@ impl Semantics {
 		ty: TypeIndex,
 		span: TextSpan,
 	) -> Result<(MemoryIdx, Primitive), Halt> {
-		let scope = self.completed_env(strings, body_env(self, owner));
+		let scope = self.normalize_env(strings, body_env(self, owner));
 		let Type::Pointer { memory, .. } = *self.types.resolve(ty) else {
 			unreachable!("static data is behind a pointer")
 		};
@@ -1720,10 +1720,10 @@ impl Semantics {
 		length: TypeIndex,
 	) -> Result<u64, Halt> {
 		let env = body_env(self, owner);
-		let completed = self.completed_env(strings, env);
+		let normalized_env = self.normalize_env(strings, env);
 		match self.normalize(
 			strings,
-			completed,
+			normalized_env,
 			length,
 			NormalizationDepth::Shallow,
 			RewriteFlags::ALL,
@@ -1755,10 +1755,10 @@ impl Semantics {
 				args: owner.args,
 			},
 		);
-		let completed = self.completed_env(strings, env);
+		let normalized_env = self.normalize_env(strings, env);
 		self.normalize(
 			strings,
-			completed,
+			normalized_env,
 			ty,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
@@ -2000,8 +2000,8 @@ impl Semantics {
 		let (ty, scope) = (signature.ty, signature.env);
 		let ty = self.instance_type(strings, owner, ty);
 		let mut scalars = Vec::new();
-		let completed = self.completed_env(strings, scope);
-		self.root_scalars(strings, completed, ty, &mut scalars)?;
+		let normalized_env = self.normalize_env(strings, scope);
+		self.root_scalars(strings, normalized_env, ty, &mut scalars)?;
 		Ok(scalars)
 	}
 

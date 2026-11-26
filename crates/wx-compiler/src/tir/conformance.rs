@@ -29,7 +29,8 @@
 
 use super::clauses::{
 	AssumptionEnvIdx, Clause, EqualityClause, PublishedClauses,
-	RepresentableClause, SourceClauseId, TraitClause,
+	RepresentableClause, RewriteScope, RewrittenClauses, SourceClauseId,
+	TraitClause,
 };
 use super::decls::{
 	AstNodeRef, BindingKey, ConstIdx, DeclKind, FunctionIdx, MemberIdx,
@@ -68,37 +69,50 @@ impl Semantics {
 	}
 
 	/// The env a caller through the trait sees `function` in: the impl's
-	/// env around it, and what the clauses the declaration itself states
-	/// mean with `Self` as `target` and the declaration's parameters as the
-	/// function's, by position (`normalize_clauses`, as the function's own
-	/// `Self` entry is read). It exists for the check alone; its index is
-	/// new, so its cache entries alias no declaration's. A function whose
-	/// declaration states nothing is read in its impl's.
+	/// env around it, and the clauses the declaration itself states with
+	/// `Self` as `target` and the declaration's parameters as the
+	/// function's, by position, rewritten as a frame's own are when its env
+	/// is normalized. It exists for the check alone; its index is new, so its
+	/// cache entries alias no declaration's. A function whose declaration
+	/// states nothing is read in its impl's.
 	fn contract_env(
 		&mut self,
 		strings: &StringInterner,
 		declaration: FunctionIdx,
 		function: FunctionIdx,
 		target: TypeIndex,
-	) -> Result<AssumptionEnvIdx, SolverError> {
+	) -> AssumptionEnvIdx {
 		let env = self.functions[usize::from(function)].type_params;
 		let impl_env = self.impl_env(strings, function);
 		let declaration_env =
 			self.functions[usize::from(declaration)].type_params;
 		let requirements = self.own_requirements(declaration_env);
 		if requirements.is_empty() {
-			return Ok(impl_env);
+			return impl_env;
 		}
 		let arguments: Box<[TypeIndex]> = std::iter::once(target)
 			.chain(self.own_params(env).iter().copied())
 			.collect();
 		let clauses =
 			self.instantiate_clauses(requirements, declaration_env, &arguments);
-		let (assumed, _) =
-			self.normalize_clauses(strings, impl_env, clauses)?;
-		let contract = self.assumption_envs.push(impl_env, None);
-		*self.assumption_envs.clauses_mut(contract) = assumed;
-		Ok(contract)
+		let own = clauses
+			.final_range()
+			.expect("instantiated clauses are final");
+		let rewriting_env =
+			self.assumption_envs.push_final(impl_env, None, own);
+		let scope = RewriteScope {
+			own_frame: self.own_frame(env),
+			rewriting_env,
+			parent_env: impl_env,
+		};
+		let mut rewritten = RewrittenClauses::default();
+		self.rewrite_own_clauses(strings, scope, own, &mut rewritten);
+		self.lend_declared_bounds(strings, scope, own, &mut rewritten);
+		if !rewritten.changed {
+			return rewriting_env;
+		}
+		let run = self.clauses.push(&rewritten.assumed);
+		self.assumption_envs.push_final(impl_env, None, run)
 	}
 
 	/// `clauses`, written in `env`'s chain, with that chain's parameters
@@ -168,13 +182,23 @@ impl Semantics {
 		if requirements.is_empty() {
 			return Ok(true);
 		}
-		// Only what the function assumes is compared: a clause about a type
-		// that is not abstract holds or not of its own, and is checked where
-		// it is written (`normalize_self_entry`). Each is read where the
-		// function is written, not under the contract's assumptions.
-		let impl_env = self.impl_env(strings, function);
-		let (clauses, _) =
-			self.normalize_clauses(strings, impl_env, requirements)?;
+		// Only what the function assumes is compared, as its normalized env
+		// reads it: a clause about a type that is not abstract holds or not
+		// of its own, and normalizing its env proves it at its bound. Each is read
+		// where the function is written, not under the contract's
+		// assumptions.
+		let scope = RewriteScope {
+			own_frame: Some(env),
+			rewriting_env: self.normalize_env(strings, env),
+			parent_env: self.impl_env(strings, function),
+		};
+		let Some(own) = requirements.final_range() else {
+			unreachable!("every signature exists when declarations are checked")
+		};
+		let mut rewritten = RewrittenClauses::default();
+		self.rewrite_own_clauses(strings, scope, own, &mut rewritten);
+		let clauses =
+			PublishedClauses::Final(self.clauses.push(&rewritten.assumed));
 		let arguments: Box<[TypeIndex]> =
 			self.generic_envs.identity_args(env).into();
 		let mut failures = Vec::new();
@@ -249,7 +273,7 @@ impl Semantics {
 				.expect("a function's own frame has its impl's around it"),
 			_ => env,
 		};
-		self.completed_env(strings, impl_frame)
+		self.normalize_env(strings, impl_frame)
 	}
 
 	/// What `frame`'s function itself states: nothing when it has no frame
@@ -261,6 +285,12 @@ impl Semantics {
 			}
 			_ => PublishedClauses::NONE,
 		}
+	}
+
+	/// `frame` when it is its function's own, not its impl's or trait's.
+	fn own_frame(&self, frame: GenericEnvIdx) -> Option<GenericEnvIdx> {
+		matches!(self.generic_envs.owner(frame), GenericEnvOwner::Function(_))
+			.then_some(frame)
 	}
 
 	fn own_params(&self, frame: GenericEnvIdx) -> &[TypeIndex] {
@@ -969,10 +999,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 		// bounds assumed.
 		let trait_env = sema.traits[usize::from(trait_index)].env;
 		let args = sema.generic_args.push([(target.inner, target.span)]);
-		let completed = sema.completed_env(self.strings, scope);
+		let normalized_env = sema.normalize_env(self.strings, scope);
 		let result = sema.check_bound_requirements(
 			self.strings,
-			completed,
+			normalized_env,
 			BoundRequirements::Frame {
 				env: trait_env,
 				args,
@@ -1030,10 +1060,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 					}
 					_ => at_target,
 				};
-			let completed = sema.completed_env(self.strings, scope);
+			let normalized_env = sema.normalize_env(self.strings, scope);
 			let result = sema.check_bound_requirements(
 				self.strings,
-				completed,
+				normalized_env,
 				BoundRequirements::AssociatedType {
 					declaration: declaration_index,
 					trait_index,
@@ -1226,7 +1256,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			return Ok(());
 		}
 		let contract =
-			sema.contract_env(self.strings, declaration, function, target)?;
+			sema.contract_env(self.strings, declaration, function, target);
 		if !sema.check_own_bounds(
 			self.strings,
 			trait_index,
@@ -1412,17 +1442,17 @@ impl<'ast> SemanticsBuilder<'ast> {
 				args: &[target],
 			},
 		);
-		let completed = sema.completed_env(self.strings, env);
+		let normalized_env = sema.normalize_env(self.strings, env);
 		let expected = sema.normalize(
 			self.strings,
-			completed,
+			normalized_env,
 			expected,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
 		)?;
 		let found = sema.normalize(
 			self.strings,
-			completed,
+			normalized_env,
 			found,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
@@ -2154,6 +2184,42 @@ mod tests {
 			case.sema.diagnostics[0].labels[0].message,
 			"impl has extra requirement `<U as Container>::Item == u16`"
 		);
+	}
+
+	/// The declaration's `Item: PartialEq` reads `V: PartialEq` by its own
+	/// `Item = V`, so the function's `V: PartialEq` follows.
+	#[test]
+	fn a_contract_reads_its_clauses_by_its_own_equalities() {
+		let case = TestCase::new(&format!(
+			"{PRELUDE}{ORDERING}{}",
+			indoc! {"
+				trait Store {
+					func take<U: StackValue + Container where { Item = V } + Container where { Item: PartialEq }, V>(x: U);
+				}
+				impl Store for Bag {
+					func take<U: StackValue + Container where { Item = V }, V: PartialEq>(x: U) {}
+				}
+			"}
+		));
+		case.diagnostics().assert_none();
+	}
+
+	/// The function's `Item: PartialEq` reads `V: PartialEq` by its own
+	/// `Item = V`, which the declaration states.
+	#[test]
+	fn an_impl_function_reads_its_clauses_by_its_own_equalities() {
+		let case = TestCase::new(&format!(
+			"{PRELUDE}{ORDERING}{}",
+			indoc! {"
+				trait Store {
+					func take<U: StackValue + Container where { Item = V }, V: PartialEq>(x: U);
+				}
+				impl Store for Bag {
+					func take<U: StackValue + Container where { Item = V } + Container where { Item: PartialEq }, V>(x: U) {}
+				}
+			"}
+		));
+		case.diagnostics().assert_none();
 	}
 
 	/// A bound nested on a projection is proved like one on the parameter:

@@ -315,7 +315,7 @@ impl Semantics {
 		{
 			return Ok(expansion);
 		}
-		let env = self.completed_env(
+		let env = self.normalize_env(
 			strings,
 			self.structs[usize::from(struct_index)].type_params,
 		);
@@ -723,9 +723,11 @@ impl Semantics {
 	/// The facts an owner's fields are walked under.
 	fn owner_env(&self, owner: StepOwner) -> AssumptionEnvIdx {
 		match owner {
-			StepOwner::Definition(struct_index) => self
-				.assumption_envs
-				.completed(self.structs[usize::from(struct_index)].type_params),
+			StepOwner::Definition(struct_index) => {
+				self.assumption_envs.normalized(
+					self.structs[usize::from(struct_index)].type_params,
+				)
+			}
 			StepOwner::Instance(key) => key.env,
 		}
 	}

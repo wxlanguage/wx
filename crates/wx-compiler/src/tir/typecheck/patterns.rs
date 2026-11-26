@@ -1434,7 +1434,7 @@ impl BodyBuilder<'_, '_> {
 							&self.sema.constants[usize::from(constant)];
 						let ty = signature.ty;
 						let env =
-							self.sema.assumption_envs.completed(signature.env);
+							self.sema.assumption_envs.normalized(signature.env);
 						let ty = self.context().normalized_in(ty, env);
 						let kind = PatternKind::Constant {
 							constant,

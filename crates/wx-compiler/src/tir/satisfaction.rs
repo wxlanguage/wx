@@ -14,10 +14,7 @@
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::clauses::{
-	AssumptionEnvIdx, Clause, EqualityClause, PublishedClauses,
-	RepresentableClause, SourceClauseId, TraitClause,
-};
+use super::clauses::{AssumptionEnvIdx, PublishedClauses, SourceClauseId};
 use string_interner::symbol::SymbolU32;
 
 use super::decls::{BindingKey, DeclKind, Declarations, Tier, TraitIdx};
@@ -144,7 +141,7 @@ impl Semantics {
 
 /// The checks bound satisfaction owns, run by the declaration check.
 impl Semantics {
-	/// Proves `proved`, clauses of `frame` that completing its env found not
+	/// Proves `proved`, clauses of `frame` that normalizing its env found not
 	/// to be about an abstract type, in `env`, and reports each that does not
 	/// hold at its bound: an error without a parameter (`Bytes: Show` never
 	/// holds), and unsupported with one (`Wrap<T>: Show` would be an
@@ -316,103 +313,6 @@ impl Semantics {
 			self.source_clauses.span(source.bound).file_id,
 			TextSpan::new(binding.name.span.start, value.span.end),
 		)
-	}
-
-	/// `clauses`, about types (a `Self` entry's, read in a trait impl),
-	/// normalized in `env`: those that now read about an abstract type, as
-	/// they read, which is what assuming them means; then the rest, as
-	/// written, which holds or not of its own and assumes nothing.
-	pub(super) fn normalize_clauses(
-		&mut self,
-		strings: &StringInterner,
-		env: AssumptionEnvIdx,
-		clauses: PublishedClauses,
-	) -> Result<(PublishedClauses, PublishedClauses), SolverError> {
-		let Some(range) = clauses.final_range() else {
-			unreachable!("normalized clauses are final")
-		};
-		let (mut assumed, mut other) = (Vec::new(), Vec::new());
-		// Read one clause at a time: normalizing interns, and the arena only
-		// grows, so the range stays valid.
-		for at in 0..range.len() {
-			let clause = self.clauses.get(range)[at];
-			let normalized = match clause {
-				Clause::Trait(clause) => {
-					let subject = self.normalize(
-						strings,
-						env,
-						clause.subject,
-						NormalizationDepth::Deep,
-						RewriteFlags::ALL,
-					)?;
-					self.types.is_abstract(subject).then_some(Clause::Trait(
-						TraitClause { subject, ..clause },
-					))
-				}
-				Clause::Equality(clause) => {
-					let projection = self.normalize(
-						strings,
-						env,
-						clause.projection,
-						NormalizationDepth::Deep,
-						RewriteFlags::ALL,
-					)?;
-					if matches!(
-						self.types.resolve(projection),
-						Type::TypeProjection { .. }
-					) && self.types.is_abstract(projection)
-					{
-						let value = self.normalize(
-							strings,
-							env,
-							clause.value,
-							NormalizationDepth::Deep,
-							RewriteFlags::ALL,
-						)?;
-						Some(Clause::Equality(EqualityClause {
-							projection,
-							value,
-							..clause
-						}))
-					} else {
-						None
-					}
-				}
-				Clause::Representable(clause) => {
-					let subject = self.normalize(
-						strings,
-						env,
-						clause.subject,
-						NormalizationDepth::Deep,
-						RewriteFlags::ALL,
-					)?;
-					if self.types.is_abstract(subject) {
-						let ty = self.normalize(
-							strings,
-							env,
-							clause.ty,
-							NormalizationDepth::Deep,
-							RewriteFlags::ALL,
-						)?;
-						Some(Clause::Representable(RepresentableClause {
-							subject,
-							ty,
-							..clause
-						}))
-					} else {
-						None
-					}
-				}
-			};
-			match normalized {
-				Some(normalized) => assumed.push(normalized),
-				None => other.push(clause),
-			}
-		}
-		Ok((
-			PublishedClauses::Final(self.clauses.push(&assumed)),
-			PublishedClauses::Final(self.clauses.push(&other)),
-		))
 	}
 
 	/// Gather violations before emitting them: another requirement can still
@@ -1077,7 +977,7 @@ mod tests {
 				self.sema.functions[usize::from(function_index)].type_params;
 			let param =
 				self.sema.types.intern(Type::TypeParam { env, param_index });
-			(param, self.sema.assumption_envs.completed(env))
+			(param, self.sema.assumption_envs.normalized(env))
 		}
 
 		/// Whether `receiver` implements `required_trait` under `env`.

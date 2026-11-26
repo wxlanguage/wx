@@ -42,7 +42,7 @@
 //! item writes clauses, else its parent's. Construction makes the frame's
 //! written env, its clauses as written, which path selection reads. Once
 //! every signature exists, `normalization` rewrites it by the equalities in
-//! scope into its completed env, which everything after construction reads.
+//! scope into its normalized env, which everything after construction reads.
 //! A frame's requirements are the same clauses in the other role: proved at
 //! each use, as written, never rewritten.
 //!
@@ -76,6 +76,8 @@ use super::types::{
 };
 
 mod normalization;
+
+pub(super) use normalization::{RewriteScope, RewrittenClauses};
 
 index_newtype!(SourceClauseId);
 index_newtype!(AssumptionEnvIdx);
@@ -165,6 +167,24 @@ pub(super) enum Clause {
 	Trait(TraitClause),
 	Equality(EqualityClause),
 	Representable(RepresentableClause),
+}
+
+impl Clause {
+	/// Whether `self` and `other` state the same fact, whatever writes them.
+	pub(super) fn states_same(&self, other: &Clause) -> bool {
+		match (self, other) {
+			(Clause::Trait(a), Clause::Trait(b)) => {
+				a.subject == b.subject && a.trait_index == b.trait_index
+			}
+			(Clause::Equality(a), Clause::Equality(b)) => {
+				a.projection == b.projection && a.value == b.value
+			}
+			(Clause::Representable(a), Clause::Representable(b)) => {
+				a.subject == b.subject && a.target == b.target && a.ty == b.ty
+			}
+			_ => false,
+		}
+	}
 }
 
 /// A run of clauses in the `ClauseArena`, owned by one subject.
@@ -344,33 +364,36 @@ pub(super) struct AssumptionEnv {
 /// What a frame's item states (rustc's `predicates_of` and `param_env`,
 /// keyed by the item's frame): `requirements` are its own clauses as
 /// written, which a use proves; `written` is the env construction made for
-/// it, its clauses as written, which path selection reads; `completion` is
-/// the env everything after construction reads, its clauses rewritten by
-/// the equalities in scope (`Semantics::completed_env`). A trait impl
-/// function's `Self` entry is in `requirements` only, never in `written`.
+/// it, its clauses as written, which path selection reads; `normalization`
+/// leads to its normalized env, which everything after construction reads,
+/// its clauses rewritten by the equalities in scope
+/// (`Semantics::normalize_env`). A trait impl function's `Self` entry is in
+/// `requirements` only, never in `written`.
 #[derive(Clone, Copy)]
 struct FrameClauses {
 	written: AssumptionEnvIdx,
-	completion: FrameCompletion,
+	normalization: EnvNormalization,
 	requirements: PublishedClauses,
 }
 
-/// How far a frame's completed env is (`Semantics::completed_env`).
+/// How far a frame's normalized env is (`Semantics::normalize_env`).
 #[derive(Clone, Copy)]
-pub(super) enum FrameCompletion {
+pub(super) enum EnvNormalization {
 	/// Not asked yet: only the written env exists.
 	Unasked,
-	/// Its clauses are being rewritten in `rules`, its rules as written over
-	/// its parent's completed env; a read of the frame meanwhile (a clause
-	/// normalizing back through it) sees `rules`, and the judgement it
-	/// reaches again owns that loop.
-	Rewriting { rules: AssumptionEnvIdx },
-	/// The written env itself, the parent's completed env, or a new flat one.
-	Completed(AssumptionEnvIdx),
+	/// Its clauses are being rewritten in `rewriting_env`, its clauses as
+	/// written over its parent's normalized env; a read of the frame
+	/// meanwhile (a clause normalizing back through it) sees that env, and
+	/// the judgement it reaches again owns that loop.
+	Rewriting { rewriting_env: AssumptionEnvIdx },
+	/// The written env itself, the parent's normalized env, or a new flat
+	/// one.
+	Normalized(AssumptionEnvIdx),
 }
 
 /// Every scope's clauses. An item that writes no bound has no env of its
 /// own and shares its parent's; `AssumptionEnvIdx::ROOT` assumes nothing.
+/// An env's clauses are published once final and never change after.
 pub(super) struct AssumptionEnvArena {
 	envs: Vec<AssumptionEnv>,
 	frames: Vec<FrameClauses>,
@@ -390,17 +413,19 @@ impl AssumptionEnvArena {
 			}],
 			frames: vec![FrameClauses {
 				written: AssumptionEnvIdx::ROOT,
-				completion: FrameCompletion::Completed(AssumptionEnvIdx::ROOT),
+				normalization: EnvNormalization::Normalized(
+					AssumptionEnvIdx::ROOT,
+				),
 				requirements: PublishedClauses::NONE,
 			}],
 		}
 	}
 
-	/// A new env inside `parent`, its clauses not published yet.
-	pub(super) fn push(
+	fn push(
 		&mut self,
 		parent: AssumptionEnvIdx,
 		reflexive: Option<(TypeIndex, TraitIdx)>,
+		clauses: PublishedClauses,
 	) -> AssumptionEnvIdx {
 		let env = AssumptionEnvIdx::new(
 			u32::try_from(self.envs.len())
@@ -408,10 +433,30 @@ impl AssumptionEnvArena {
 		);
 		self.envs.push(AssumptionEnv {
 			parent: Some(parent),
-			clauses: PublishedClauses::PENDING,
+			clauses,
 			reflexive,
 		});
 		env
+	}
+
+	/// A new env inside `parent` for construction, its clauses published
+	/// later (`publish_env`).
+	pub(super) fn push_pending(
+		&mut self,
+		parent: AssumptionEnvIdx,
+		reflexive: Option<(TypeIndex, TraitIdx)>,
+	) -> AssumptionEnvIdx {
+		self.push(parent, reflexive, PublishedClauses::PENDING)
+	}
+
+	/// A new env inside `parent` holding `clauses`, final from the start.
+	pub(super) fn push_final(
+		&mut self,
+		parent: AssumptionEnvIdx,
+		reflexive: Option<(TypeIndex, TraitIdx)>,
+		clauses: ClauseRange,
+	) -> AssumptionEnvIdx {
+		self.push(parent, reflexive, PublishedClauses::Final(clauses))
 	}
 
 	/// Records that `frame`, just pushed, is read in `env`: its own, whose
@@ -426,7 +471,7 @@ impl AssumptionEnvArena {
 		debug_assert_eq!(usize::from(frame), self.frames.len());
 		self.frames.push(FrameClauses {
 			written: env,
-			completion: FrameCompletion::Unasked,
+			normalization: EnvNormalization::Unasked,
 			requirements: if own {
 				PublishedClauses::PENDING
 			} else {
@@ -442,33 +487,36 @@ impl AssumptionEnvArena {
 		self.frames[usize::from(frame)].written
 	}
 
-	pub(super) fn completion(&self, frame: GenericEnvIdx) -> FrameCompletion {
-		self.frames[usize::from(frame)].completion
-	}
-
-	pub(super) fn set_completion(
-		&mut self,
-		frame: GenericEnvIdx,
-		completion: FrameCompletion,
-	) {
-		self.frames[usize::from(frame)].completion = completion;
-	}
-
-	/// `frame`'s completed env, for a reader that runs once every frame is
-	/// complete (bodies, lowering); any other asks
-	/// `Semantics::completed_env`.
-	pub(super) fn completed(&self, frame: GenericEnvIdx) -> AssumptionEnvIdx {
-		match self.frames[usize::from(frame)].completion {
-			FrameCompletion::Completed(env) => env,
-			FrameCompletion::Unasked | FrameCompletion::Rewriting { .. } => {
+	/// `frame`'s normalized env, for a reader that runs once every frame is
+	/// normalized (bodies, lowering); any other asks
+	/// `Semantics::normalize_env`.
+	pub(super) fn normalized(&self, frame: GenericEnvIdx) -> AssumptionEnvIdx {
+		match self.frames[usize::from(frame)].normalization {
+			EnvNormalization::Normalized(env) => env,
+			EnvNormalization::Unasked | EnvNormalization::Rewriting { .. } => {
 				unreachable!(
-					"every frame is complete once declarations are checked"
+					"every frame is normalized once declarations are checked"
 				)
 			}
 		}
 	}
 
-	/// The number of frames, for completing each of them.
+	pub(super) fn normalization(
+		&self,
+		frame: GenericEnvIdx,
+	) -> EnvNormalization {
+		self.frames[usize::from(frame)].normalization
+	}
+
+	pub(super) fn set_normalization(
+		&mut self,
+		frame: GenericEnvIdx,
+		normalization: EnvNormalization,
+	) {
+		self.frames[usize::from(frame)].normalization = normalization;
+	}
+
+	/// The number of frames, for normalizing each one's env.
 	pub(super) fn frame_count(&self) -> usize {
 		self.frames.len()
 	}
@@ -491,7 +539,7 @@ impl AssumptionEnvArena {
 	) {
 		self.set_requirements(frame, clauses);
 		let env = self.written(frame);
-		self.envs[usize::from(env)].clauses = clauses;
+		self.publish_env(env, clauses);
 	}
 
 	/// Publishes `clauses` as what `frame`'s item states, apart from what
@@ -509,10 +557,28 @@ impl AssumptionEnvArena {
 		entry.requirements = clauses;
 	}
 
+	/// Publishes `clauses` as what `env`, made by construction, assumes:
+	/// its memberships, then the whole run.
+	pub(super) fn publish_env(
+		&mut self,
+		env: AssumptionEnvIdx,
+		clauses: PublishedClauses,
+	) {
+		let published = &mut self.envs[usize::from(env)].clauses;
+		debug_assert!(
+			matches!(published, PublishedClauses::Provisional(_)),
+			"an env's final clauses never change"
+		);
+		*published = clauses;
+	}
+
 	pub(super) fn get(&self, env: AssumptionEnvIdx) -> &AssumptionEnv {
 		&self.envs[usize::from(env)]
 	}
 
+	/// `env`'s clauses, for tests that move an env back to an earlier
+	/// stage of construction.
+	#[cfg(test)]
 	pub(super) fn clauses_mut(
 		&mut self,
 		env: AssumptionEnvIdx,

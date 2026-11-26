@@ -298,7 +298,7 @@ impl Semantics {
 	pub(super) fn owner_scope(&self, owner: BodyOwner) -> LexicalScope {
 		let scope = self.owner_scope_frame(owner);
 		LexicalScope {
-			assumption_env: self.assumption_envs.completed(scope.generic_env),
+			assumption_env: self.assumption_envs.normalized(scope.generic_env),
 			..scope
 		}
 	}
@@ -328,7 +328,7 @@ impl Semantics {
 	}
 
 	/// `owner_scope` as construction reads it, in the written env: a
-	/// constant's body is built before any frame is complete.
+	/// constant's body is built before any frame's env is normalized.
 	pub(super) fn written_owner_scope(&self, owner: BodyOwner) -> LexicalScope {
 		let scope = self.owner_scope_frame(owner);
 		LexicalScope {
@@ -1767,9 +1767,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 			}
 		}
 		self.obligations = obligations;
-		// A frame no check asked about still reports its completion, and
-		// readers after this find every frame complete.
-		sema.complete_every_frame(self.strings);
+		// A frame no check asked about still reports its env's normalization, and
+		// readers after this find every frame's env normalized.
+		sema.normalize_every_env(self.strings);
 	}
 
 	/// Builds every constant's body (a variant's value included), in
@@ -2021,7 +2021,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let written = || self_entry.into_iter().chain(declared());
 		// In a trait impl's function the entry is about the impl's target:
 		// a use proves its clauses as written, and the function assumes
-		// them once they are normalized (`Semantics::completed_env`), which
+		// them once they are normalized (`Semantics::normalize_env`), which
 		// construction cannot do. Until then they are in no env.
 		let deferred = usize::from(
 			self_subject.is_some()
@@ -2046,7 +2046,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let own_env = written()
 			.skip(deferred)
 			.any(is_bounded)
-			.then(|| sema.assumption_envs.push(parent_env, None));
+			.then(|| sema.assumption_envs.push_pending(parent_env, None));
 		let states_clauses = own_env.is_some() || entry_bounded;
 		sema.assumption_envs.bind_frame(
 			generic_env,
@@ -2140,10 +2140,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 			);
 		}
 		if let Some(env) = own_env {
-			*sema.assumption_envs.clauses_mut(env) =
+			sema.assumption_envs.publish_env(
+				env,
 				PublishedClauses::Provisional(
 					provisional.split_at(entry_traits).1,
-				);
+				),
+			);
 		}
 
 		// Resolve source bounds now that every sibling has provisional
@@ -2201,8 +2203,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 				.set_requirements(generic_env, PublishedClauses::Final(run));
 		}
 		if let Some(env) = own_env {
-			*sema.assumption_envs.clauses_mut(env) =
-				PublishedClauses::Final(own);
+			sema.assumption_envs
+				.publish_env(env, PublishedClauses::Final(own));
 		}
 		generic_env
 	}
@@ -3000,7 +3002,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					}],
 				);
 				let self_type = sema.generic_envs.param_types(self_scope)[0];
-				let env = sema.assumption_envs.push(
+				let env = sema.assumption_envs.push_pending(
 					AssumptionEnvIdx::ROOT,
 					Some((self_type, trait_index)),
 				);
@@ -3929,7 +3931,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					}],
 				);
 				let self_type = sema.generic_envs.param_types(self_scope)[0];
-				let env = sema.assumption_envs.push(
+				let env = sema.assumption_envs.push_pending(
 					AssumptionEnvIdx::ROOT,
 					Some((self_type, trait_index)),
 				);
@@ -5937,7 +5939,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 						// type can take: `Size = i32` against `type Size:
 						// PointerSize` states a fact no impl can satisfy. An
 						// abstract one is given the declared bounds instead,
-						// by the completed env (`completed_env`).
+						// by the normalized env (`normalize_env`).
 						if value.inner != TypeIndex::ERROR
 							&& !sema.types.is_abstract(value.inner)
 						{
@@ -7568,7 +7570,7 @@ pub(super) mod tests {
 			let types = &case.sema.types;
 			let mut sources = tables.declarations_of(
 				types,
-				case.sema.assumption_envs.completed(scope),
+				case.sema.assumption_envs.normalized(scope),
 				item,
 				128,
 			);
@@ -7835,7 +7837,7 @@ pub(super) mod tests {
 			for subject in [next, next_next] {
 				let traits = tables.declared_traits(
 					&case.sema.types,
-					case.sema.assumption_envs.completed(scope),
+					case.sema.assumption_envs.normalized(scope),
 					subject,
 					128,
 				);
@@ -7846,7 +7848,7 @@ pub(super) mod tests {
 				tables
 					.declared_traits(
 						&case.sema.types,
-						case.sema.assumption_envs.completed(scope),
+						case.sema.assumption_envs.normalized(scope),
 						next_next,
 						1
 					)
@@ -8529,7 +8531,7 @@ pub(super) mod tests {
 			self.sema
 				.normalize(
 					&self.strings,
-					self.sema.assumption_envs.completed(scope),
+					self.sema.assumption_envs.normalized(scope),
 					ty,
 					NormalizationDepth::Deep,
 					RewriteFlags::ALL,
@@ -8558,7 +8560,7 @@ pub(super) mod tests {
 			let ty = self.param_types(path)[index];
 			self.sema.normalize(
 				&self.strings,
-				self.sema.assumption_envs.completed(scope),
+				self.sema.assumption_envs.normalized(scope),
 				ty,
 				NormalizationDepth::Deep,
 				RewriteFlags::ALL,
@@ -10864,7 +10866,7 @@ pub(super) mod tests {
 			assert!(matches!(
 				case.sema.normalize(
 					&case.strings,
-					case.sema.assumption_envs.completed(scope),
+					case.sema.assumption_envs.normalized(scope),
 					written,
 					NormalizationDepth::Deep,
 					RewriteFlags::ALL
@@ -11283,7 +11285,7 @@ pub(super) mod tests {
 				assert_eq!(
 					case.sema.normalize(
 						&case.strings,
-						case.sema.assumption_envs.completed(scope),
+						case.sema.assumption_envs.normalized(scope),
 						written,
 						NormalizationDepth::Deep,
 						RewriteFlags::ALL
@@ -15358,7 +15360,7 @@ pub(super) mod tests {
 		assert!(matches!(
 			case.sema.normalize(
 				&case.strings,
-				case.sema.assumption_envs.completed(scope),
+				case.sema.assumption_envs.normalized(scope),
 				written,
 				NormalizationDepth::Deep,
 				RewriteFlags::ALL
@@ -16452,7 +16454,7 @@ pub(super) mod tests {
 			let (t, u) = (params[0], params[1]);
 			// The parameter is stored as `T::Item` and means `U`; the evidence
 			// about `T::Item` is kept as written in the written env, and reads
-			// `U: Marker` in the completed one.
+			// `U: Marker` in the normalized one.
 			assert!(matches!(
 				case.sema.types.resolve(written),
 				Type::TypeProjection { .. }
@@ -16478,13 +16480,13 @@ pub(super) mod tests {
 				)
 				.contains(&(projection, case.trait_index("Marker")))
 			);
-			let completed = memberships(
+			let normalized = memberships(
 				&case.sema,
-				case.sema.assumption_envs.completed(assumption_context),
+				case.sema.assumption_envs.normalized(assumption_context),
 			);
-			assert!(completed.contains(&(u, case.trait_index("Marker"))));
+			assert!(normalized.contains(&(u, case.trait_index("Marker"))));
 			assert!(
-				!completed.contains(&(projection, case.trait_index("Marker")))
+				!normalized.contains(&(projection, case.trait_index("Marker")))
 			);
 			let clauses =
 				case.sema.assumption_envs.requirements(assumption_context);
@@ -16629,7 +16631,7 @@ pub(super) mod tests {
 			assert_eq!(free_cx, GenericEnvIdx::ROOT);
 			let local = memberships(
 				&case.sema,
-				case.sema.assumption_envs.completed(assumption_context),
+				case.sema.assumption_envs.normalized(assumption_context),
 			);
 			assert!(local.contains(&(outer, case.trait_index("Outer"))));
 			assert!(
@@ -16640,7 +16642,7 @@ pub(super) mod tests {
 			assert_eq!(
 				memberships(
 					&case.sema,
-					case.sema.assumption_envs.completed(plain_cx)
+					case.sema.assumption_envs.normalized(plain_cx)
 				),
 				vec![
 					(outer, case.trait_index("Outer")),
@@ -16650,7 +16652,7 @@ pub(super) mod tests {
 			assert!(
 				memberships(
 					&case.sema,
-					case.sema.assumption_envs.completed(free_cx)
+					case.sema.assumption_envs.normalized(free_cx)
 				)
 				.is_empty()
 			);
@@ -16696,7 +16698,7 @@ pub(super) mod tests {
 			);
 			let facts = memberships(
 				&case.sema,
-				case.sema.assumption_envs.completed(assumption_context),
+				case.sema.assumption_envs.normalized(assumption_context),
 			);
 			assert!(facts.contains(&(trait_self, case.trait_index("Child"))));
 			assert!(facts.contains(&(trait_self, case.trait_index("Parent"))));
@@ -16709,7 +16711,7 @@ pub(super) mod tests {
 			let tables = case.sema.clause_tables();
 			let sources = tables.declarations_of(
 				&case.sema.types,
-				case.sema.assumption_envs.completed(signature.type_params),
+				case.sema.assumption_envs.normalized(signature.type_params),
 				subject,
 				128,
 			);
@@ -16783,7 +16785,7 @@ pub(super) mod tests {
 				assert_eq!(
 					sema.find_trait_impl_query(
 						builder.strings,
-						sema.assumption_envs.completed(env),
+						sema.assumption_envs.normalized(env),
 						ty,
 						marker
 					)
@@ -16795,7 +16797,7 @@ pub(super) mod tests {
 				assert_eq!(
 					sema.find_trait_impl_query(
 						builder.strings,
-						sema.assumption_envs.completed(env),
+						sema.assumption_envs.normalized(env),
 						ty,
 						marker
 					)
@@ -16922,10 +16924,10 @@ pub(super) mod tests {
 		}
 	}
 
-	/// Each frame's env is completed once every signature exists: its clauses
+	/// Each frame's env is normalized once every signature exists: its clauses
 	/// rewritten by the equalities in scope
 	/// (`notes/member-selection-and-equalities.md`, decision 2).
-	mod env_completion {
+	mod env_normalization {
 		use super::*;
 
 		const PRELUDE: &str = "trait Marker {}\n\
@@ -17006,7 +17008,7 @@ pub(super) mod tests {
 		#[test]
 		fn a_body_path_resolves_as_its_signature_path() {
 			// Selection reads the clauses as written in a body too, though the
-			// body's completed env states `U: Project`.
+			// body's normalized env states `U: Project`.
 			case("trait Project { type Output: StackValue; }\n\
 				func f<T: Container where { Item = U } + Container where { Item: Project }, U>(x: T::Item::Output) -> T::Item::Output {\n\
 					local y: T::Item::Output = x;\n\
@@ -17073,7 +17075,7 @@ pub(super) mod tests {
 		#[test]
 		fn associated_declaration_bounds_supply_no_members_through_equality() {
 			// `Item: Project` belongs to `T::Item`. `Item = U` lends it to `U`
-			// in the completed env, but a path selects through bounds as
+			// in the normalized env, but a path selects through bounds as
 			// written, so `U::Output` needs `U: Project` written.
 			let case = TestCase::checked(indoc! {"
                 trait Project { type Output: StackValue; }
@@ -17364,7 +17366,7 @@ pub(super) mod tests {
 					let proof = sema
 						.find_trait_impl_query(
 							builder.strings,
-							sema.assumption_envs.completed(assumption_context),
+							sema.assumption_envs.normalized(assumption_context),
 							TypeIndex::I32,
 							TraitIdx::new(0),
 						)
@@ -17378,7 +17380,7 @@ pub(super) mod tests {
 					let MemberLookup::Found(member) = sema
 						.resolve_applicable_member(
 							builder.strings,
-							sema.assumption_envs.completed(assumption_context),
+							sema.assumption_envs.normalized(assumption_context),
 							TypeIndex::I32,
 							key,
 						)
@@ -17392,7 +17394,7 @@ pub(super) mod tests {
 					assert_eq!(
 						sema.normalize(
 							builder.strings,
-							sema.assumption_envs.completed(assumption_context),
+							sema.assumption_envs.normalized(assumption_context),
 							ty,
 							NormalizationDepth::Deep,
 							RewriteFlags::ALL
@@ -17412,7 +17414,7 @@ pub(super) mod tests {
 		fn a_concrete_equal_subject_takes_no_assumed_trait() {
 			// `T::Item = i32` and `T::Item: Project` say nothing about `i32`:
 			// only an impl gives a concrete type a trait. The clause reads
-			// `i32: Project` once completed, and is proved at its bound.
+			// `i32: Project` once normalized, and is proved at its bound.
 			let case = TestCase::checked(indoc! {"
                 trait Project { type Output; }
                 trait Container { type Item; }
@@ -17511,7 +17513,7 @@ pub(super) mod tests {
 					let MemberLookup::Found(member) = sema
 						.resolve_applicable_member(
 							builder.strings,
-							sema.assumption_envs.completed(assumption_context),
+							sema.assumption_envs.normalized(assumption_context),
 							receiver,
 							key,
 						)
@@ -17614,7 +17616,7 @@ pub(super) mod tests {
 				case.sema.decls.intrinsics.stack_value_repr.unwrap();
 			for name in ["unknown", "bounded", "fixed"] {
 				let frame = case.function_signature(name).type_params;
-				let env = case.sema.assumption_envs.completed(frame);
+				let env = case.sema.assumption_envs.normalized(frame);
 				let ty = case.sema.generic_envs.param_types(frame)[0];
 				let projection = case.sema.types.intern(Type::TypeProjection {
 					base: ty,
@@ -17945,7 +17947,7 @@ pub(super) mod tests {
 					"trait Marker {{}} trait Container {{ type Item; }} struct Need<X: Marker>(); {source}"
 				);
 				let case = TestCase::new(&source);
-				// At the bound, which reads a concrete type once completed,
+				// At the bound, which reads a concrete type once normalized,
 				// and at the use.
 				case.diagnostics().assert_codes(&[
 					DiagnosticCode::TraitBoundViolation,
@@ -17968,7 +17970,7 @@ pub(super) mod tests {
                 >(x: Need<V::Item>) {}
             "});
 
-			// At the bound, which reads a concrete type once completed, and
+			// At the bound, which reads a concrete type once normalized, and
 			// at the use.
 			case.diagnostics().assert_codes(&[
 				DiagnosticCode::TraitBoundViolation,
@@ -17993,7 +17995,7 @@ pub(super) mod tests {
                 >(x: Need<P::Item>) {}
             "});
 
-			// At the bound, which reads a concrete type once completed, and
+			// At the bound, which reads a concrete type once normalized, and
 			// at the use.
 			case.diagnostics().assert_codes(&[
 				DiagnosticCode::TraitBoundViolation,
@@ -18103,7 +18105,7 @@ pub(super) mod tests {
 					assert_eq!(
 						sema.normalize(
 							builder.strings,
-							sema.assumption_envs.completed(env),
+							sema.assumption_envs.normalized(env),
 							written,
 							NormalizationDepth::Deep,
 							RewriteFlags::ALL
@@ -18115,7 +18117,7 @@ pub(super) mod tests {
 						assert_eq!(
 							sema.find_trait_impl_query(
 								builder.strings,
-								sema.assumption_envs.completed(env),
+								sema.assumption_envs.normalized(env),
 								ty,
 								marker
 							)
@@ -18294,7 +18296,7 @@ pub(super) mod tests {
 					);
 					*sema.assumption_envs.clauses_mut(assumption_env) = clauses;
 					// Final, the written facts state `T::Item: Marker`, not
-					// `U: Marker`: only the completed env says that.
+					// `U: Marker`: only the normalized env says that.
 					assert_eq!(
 						sema.find_trait_impl_query(
 							builder.strings,
@@ -18315,7 +18317,7 @@ pub(super) mod tests {
 		}
 
 		#[test]
-		fn completing_reports_an_overflow_at_its_clause_and_carries_on() {
+		fn normalizing_reports_an_overflow_at_its_clause_and_carries_on() {
 			// A projection at the bottom: a type without one is already normal
 			// and spends no budget.
 			let nested =

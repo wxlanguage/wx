@@ -1163,7 +1163,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			| DeclKind::EnumVariant(const_index) => {
 				let signature = &self.sema.constants[usize::from(const_index)];
 				let ty = signature.ty;
-				let env = self.sema.assumption_envs.completed(signature.env);
+				let env = self.sema.assumption_envs.normalized(signature.env);
 				let ty = self.context().normalized_in(ty, env);
 				let kind = ExprKind::Const {
 					constant: const_index,
@@ -6372,7 +6372,7 @@ mod tests {
 			case.sema
 				.normalize(
 					&case.strings,
-					case.sema.assumption_envs.completed(scope),
+					case.sema.assumption_envs.normalized(scope),
 					ty,
 					NormalizationDepth::Deep,
 					facts,

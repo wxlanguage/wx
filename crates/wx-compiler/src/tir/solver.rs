@@ -588,9 +588,9 @@ impl Semantics {
 			.as_ref()
 			.expect("a member with a value has a resolved impl header")
 			.type_params;
-		// Before the judgement starts: completing the impl's env is not part
+		// Before the judgement starts: normalizing the impl's env is not part
 		// of judging this value.
-		let completed = self.completed_env(strings, scope);
+		let normalized_env = self.normalize_env(strings, scope);
 		self.solver
 			.verdicts
 			.insert(Definition::Member(member), Verdict::InProgress);
@@ -605,7 +605,7 @@ impl Semantics {
 		});
 		let result = self.normalize(
 			strings,
-			completed,
+			normalized_env,
 			value,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
@@ -661,7 +661,7 @@ impl Semantics {
 		// Judged with the verdict already `Resolved`: an instance walk that
 		// normalizes through this member again reads its value, and finiteness
 		// sees the repeat on its own stack.
-		match self.type_is_finite(strings, completed, value) {
+		match self.type_is_finite(strings, normalized_env, value) {
 			Ok(true) => Ok(value),
 			Ok(false) => {
 				self.solver
@@ -2516,7 +2516,7 @@ impl Semantics {
 		if *self.solver.verdict(Definition::Requirements(impl_kind))
 			== Verdict::InProgress
 		{
-			if assumption_context == self.completed_env(strings, impl_env)
+			if assumption_context == self.normalize_env(strings, impl_env)
 				&& *args == *self.generic_envs.identity_args(impl_env)
 			{
 				self.solver.reenter_requirements(impl_kind)?;
@@ -2576,7 +2576,7 @@ impl Semantics {
 		.ok_or(SolverError::Pending)?;
 		let args = self.generic_envs.identity_args(impl_env).to_vec();
 		// Before the judgement starts, as for a member's value.
-		let completed = self.completed_env(strings, impl_env);
+		let normalized_env = self.normalize_env(strings, impl_env);
 		self.solver.verdicts.insert(definition, Verdict::InProgress);
 		let index = self.solver.state.frames.len();
 		self.solver.state.frames.push(SolverFrame::Requirements {
@@ -2589,7 +2589,7 @@ impl Semantics {
 		});
 		let result = self.prove_requirements(
 			strings,
-			completed,
+			normalized_env,
 			impl_env,
 			&args,
 			Some(index),

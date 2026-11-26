@@ -3,6 +3,10 @@
 Status: both decided 2026-11-26. Decision 1 implemented; decision 2
 (option C) stage 1 implemented, stages 2 and 3 open.
 
+Terminology: the "completed env" below is called the normalized env in the
+code (`Semantics::normalize_env`, `AssumptionEnvArena::normalized`,
+`EnvNormalization`, `tir/clauses/normalization.rs`), renamed after stage 1.
+
 Signature construction records types as written: a constant in a type stays
 a reference, a projection keeps its written receiver, and every check is an
 obligation run once all signatures exist. Name resolution is the exception:
@@ -460,8 +464,8 @@ one normalized list per item with its parents' predicates in it.
 - A frame is read again while its clauses are rewritten when one of them
   normalizes back through it: `impl<T: Loop where { Out = <S<T> as
   Loop>::Out }> Loop for S<T>` selects itself, and proving its requirements
-  asks for its env. The read sees the rules being rewritten against
-  (`FrameCompletion::Rewriting { rules }`), and the judgement reached again
+  asks for its env. The read sees the env being rewritten in
+  (`EnvNormalization::Rewriting { rewriting_env }`), and the judgement reached again
   (here the impl's requirements) owns the loop and reports it once (E2073);
   completion reports nothing of its own.
 - A child's equality on a projection its parent fixes is reported by the
@@ -477,6 +481,14 @@ one normalized list per item with its parents' predicates in it.
   it, where before the bound was ignored.
 - `TypeObligation`'s variants lost their `Check` prefix once
   `NormalizeSelfEntry` was gone.
+- Conformance rewrites with the same operation (decision 9): the contract
+  env is the trait declaration's clauses, instantiated for the target and
+  rewritten as a frame's own (lent bounds included) over the impl's
+  normalized env, and the impl function's own clauses are rewritten over its
+  normalized env before they are proved there.
+- Envs that are final from the start (normalized, rewriting, contract) are
+  made by `push_final`; only construction publishes an env's clauses after
+  making it (`publish_env`), and never changes a final run.
 
 **Future: interning envs.** A parameter is `Type::TypeParam { env,
 param_index }`, so every frame has its own parameter types and two items'

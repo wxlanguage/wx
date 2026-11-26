@@ -674,10 +674,10 @@ impl Semantics {
 		span: TextSpan,
 	) -> Result<TraitImplLookup, ()> {
 		let reference = SourceSpan::new(file_id, span);
-		let completed = self.completed_env(strings, frame);
+		let normalized_env = self.normalize_env(strings, frame);
 		match self.find_trait_impl_query(
 			strings,
-			completed,
+			normalized_env,
 			receiver,
 			required_trait,
 		) {
@@ -1281,7 +1281,7 @@ impl Semantics {
 		else {
 			return Vec::new();
 		};
-		let assumption_env = self.completed_env(strings, env);
+		let assumption_env = self.normalize_env(strings, env);
 		let mut found = Vec::new();
 		if receiver == TypeIndex::ERROR {
 			return found;

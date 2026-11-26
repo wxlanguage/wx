@@ -1,12 +1,12 @@
-//! Normalizing a frame's assumption env: its written env, the clauses in
-//! scope as construction made them, rewritten by the equalities in scope into
-//! its completed env, once every signature exists
+//! Normalizing a frame's assumption env. Construction makes its written env,
+//! the clauses in scope as written; once every signature exists, they are
+//! rewritten by the equalities in scope into its normalized env
 //! (`notes/member-selection-and-equalities.md`, decision 2). Path selection
-//! reads the written env; everything after construction reads the completed
-//! one.
+//! reads the written env; everything after construction reads the normalized
+//! one. Conformance rewrites a trait function's contract the same way.
 use super::{
-	AssumptionEnvIdx, Clause, ClauseRange, EqualityClause, FrameCompletion,
-	PublishedClauses, RepresentableClause, TraitClause, push_trait_clause,
+	AssumptionEnvIdx, Clause, ClauseRange, EnvNormalization, EqualityClause,
+	PublishedClauses, RepresentableClause, TraitClause,
 };
 use crate::ast::StringInterner;
 use crate::diagnostics::SourceSpan;
@@ -14,37 +14,71 @@ use crate::tir::signatures::Semantics;
 use crate::tir::solver::{NormalizationDepth, RewriteFlags, SolverError};
 use crate::tir::types::{GenericEnvIdx, Type, TypeIndex};
 
-/// The clauses a completed env holds, and the written clauses it proves
-/// instead of assuming.
-#[derive(Default)]
-struct Completed {
-	traits: Vec<TraitClause>,
-	values: Vec<Clause>,
-	/// Written clauses not about an abstract type once rewritten: each holds
-	/// or not of its own, and is proved at its bound.
-	proved: Vec<Clause>,
-	/// Whether any clause reads differently than written, so the written
-	/// env no longer says what the frame assumes.
-	rewritten: bool,
-}
-
-/// What a frame's clauses are rewritten against.
+/// What one frame's clauses are rewritten against.
 #[derive(Clone, Copy)]
-struct Rewrite {
-	frame: GenericEnvIdx,
-	/// The frame's rules as written over its parent's completed env: every
-	/// rule in scope.
-	rules: AssumptionEnvIdx,
-	/// The parent's completed env: what an equality of the frame's own is
+pub(in crate::tir) struct RewriteScope {
+	/// The frame whose own parameters the clauses state facts about, if it
+	/// has any: an equality about them keeps its projection as written.
+	pub(in crate::tir) own_frame: Option<GenericEnvIdx>,
+	/// The frame's clauses as written over its parent's normalized env:
+	/// every rule in scope.
+	pub(in crate::tir) rewriting_env: AssumptionEnvIdx,
+	/// The parent's normalized env: what an equality of the frame's own is
 	/// read in when it is about anything but the frame's own parameters, so
 	/// a rule never rewrites itself.
-	parent_env: AssumptionEnvIdx,
+	pub(in crate::tir) parent_env: AssumptionEnvIdx,
+}
+
+/// What one clause becomes once rewritten.
+enum Rewritten {
+	/// Still about an abstract type: assumed as it now reads.
+	Assumed(Clause),
+	/// No longer about an abstract type: it holds or not of its own, and is
+	/// proved at its bound.
+	Proved,
+}
+
+/// Rewritten clauses, collected.
+#[derive(Default)]
+pub(in crate::tir) struct RewrittenClauses {
+	/// What is assumed, each statement once; the first source of a statement
+	/// is the one diagnostics name.
+	pub(in crate::tir) assumed: Vec<Clause>,
+	/// The clauses found to be proved, as written.
+	pub(in crate::tir) proved: Vec<Clause>,
+	/// Whether the clauses say anything other than as written: one reads
+	/// differently, is proved instead, or was lent.
+	pub(in crate::tir) changed: bool,
+}
+
+impl RewrittenClauses {
+	fn push(
+		&mut self,
+		written: Clause,
+		rewritten: Rewritten,
+		provenance: Provenance,
+	) {
+		match rewritten {
+			Rewritten::Proved => {
+				self.changed = true;
+				self.proved.push(written);
+			}
+			Rewritten::Assumed(clause) => {
+				self.changed |=
+					provenance == Provenance::Lent || clause != written;
+				if !self.assumed.iter().any(|known| known.states_same(&clause))
+				{
+					self.assumed.push(clause);
+				}
+			}
+		}
+	}
 }
 
 /// Where a clause comes from, which decides what rewrites it.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Origin {
-	/// Already completed in the parent: only the frame's rules rewrite it.
+enum Provenance {
+	/// Already normalized in the parent: only the frame's rules rewrite it.
 	Inherited,
 	/// Written on the frame.
 	Own,
@@ -54,47 +88,49 @@ enum Origin {
 }
 
 impl Semantics {
-	/// `frame`'s completed env: asks for its parent's first, then rewrites
+	/// `frame`'s normalized env: asks for its parent's first, then rewrites
 	/// what `frame` states, once; a frame read again later gets the same env.
 	/// Asked once every signature exists, so nothing it normalizes is
 	/// `Pending`.
-	pub(in crate::tir) fn completed_env(
+	pub(in crate::tir) fn normalize_env(
 		&mut self,
 		strings: &StringInterner,
 		frame: GenericEnvIdx,
 	) -> AssumptionEnvIdx {
-		match self.assumption_envs.completion(frame) {
-			FrameCompletion::Completed(env) => return env,
-			FrameCompletion::Rewriting { rules } => return rules,
-			FrameCompletion::Unasked => {}
+		match self.assumption_envs.normalization(frame) {
+			EnvNormalization::Normalized(env) => return env,
+			EnvNormalization::Rewriting { rewriting_env } => {
+				return rewriting_env;
+			}
+			EnvNormalization::Unasked => {}
 		}
 		let parent = self
 			.generic_envs
 			.parent(frame)
-			.expect("the root frame is complete from the start");
-		let parent_env = self.completed_env(strings, parent);
-		let env = self.complete_frame(strings, frame, parent, parent_env);
+			.expect("the root frame is normalized from the start");
+		let parent_env = self.normalize_env(strings, parent);
+		let env = self.build_normalized_env(strings, frame, parent, parent_env);
 		self.assumption_envs
-			.set_completion(frame, FrameCompletion::Completed(env));
+			.set_normalization(frame, EnvNormalization::Normalized(env));
 		env
 	}
 
-	/// Completes every frame not asked for yet, so readers that run after
-	/// declarations are checked find each complete.
-	pub(in crate::tir) fn complete_every_frame(
+	/// Normalizes every frame's env not asked for yet, so readers that run
+	/// after declarations are checked find each normalized.
+	pub(in crate::tir) fn normalize_every_env(
 		&mut self,
 		strings: &StringInterner,
 	) {
 		for frame in 0..self.assumption_envs.frame_count() {
 			let frame = GenericEnvIdx::new(u32::try_from(frame).unwrap());
-			self.completed_env(strings, frame);
+			self.normalize_env(strings, frame);
 		}
 	}
 
-	/// A frame that adds no facts reuses `parent_env`; one in whose scope
-	/// nothing rewrites keeps its written env; any other gets a flat env
+	/// A frame that adds no facts reuses `parent_env`; one whose clauses
+	/// read as written keeps its written env; any other gets a flat env
 	/// holding every clause in scope, rewritten.
-	fn complete_frame(
+	fn build_normalized_env(
 		&mut self,
 		strings: &StringInterner,
 		frame: GenericEnvIdx,
@@ -115,86 +151,70 @@ impl Semantics {
 			return written;
 		}
 		let written_own = self.written_own(written, parent_written);
-		// Under a kept parent the written env is the frame's rules over its
-		// parent's completed env already; under a replaced one they are put
-		// over the parent's completed env instead. A `Self` entry is in
+		// Under a kept parent the written env is the frame's clauses over its
+		// parent's normalized env already; under a replaced one they are put
+		// over the parent's normalized env instead. A `Self` entry is in
 		// neither: about a trait impl's target, lookup never matches it as
 		// written.
-		let rules = if parent_kept {
+		let rewriting_env = if parent_kept {
 			written
 		} else {
-			let rules = self.assumption_envs.push(parent_env, None);
-			*self.assumption_envs.clauses_mut(rules) =
-				PublishedClauses::Final(written_own);
-			rules
+			self.assumption_envs
+				.push_final(parent_env, None, written_own)
 		};
-		self.assumption_envs
-			.set_completion(frame, FrameCompletion::Rewriting { rules });
-		let rewrite = Rewrite {
+		self.assumption_envs.set_normalization(
 			frame,
-			rules,
+			EnvNormalization::Rewriting { rewriting_env },
+		);
+		let scope = RewriteScope {
+			own_frame: Some(frame),
+			rewriting_env,
 			parent_env,
 		};
-		let mut completed = Completed {
-			// The written env lacks what is not in it: a `Self` entry, or the
-			// whole run of a frame that shares its parent's env.
-			rewritten: !parent_kept || written_own.len() != own.len(),
-			..Completed::default()
-		};
+		let mut rewritten = RewrittenClauses::default();
 		let inherited: Vec<ClauseRange> = self
 			.assumption_envs
 			.chain(parent_env)
 			.map(|env| {
-				env.clauses.final_range().expect("a completed env is final")
+				env.clauses
+					.final_range()
+					.expect("a normalized env is final")
 			})
 			.collect();
 		for range in inherited {
-			for at in 0..range.len() {
-				let clause = self.clauses.get(range)[at];
-				self.rewrite(
-					strings,
-					rewrite,
-					clause,
-					Origin::Inherited,
-					&mut completed,
-				);
-			}
+			self.rewrite_run(
+				strings,
+				scope,
+				range,
+				Provenance::Inherited,
+				&mut rewritten,
+			);
 		}
-		for at in 0..own.len() {
-			let clause = self.clauses.get(own)[at];
-			self.rewrite(strings, rewrite, clause, Origin::Own, &mut completed);
-		}
-		self.lend_declared_bounds(strings, rewrite, own, &mut completed);
-		if !completed.proved.is_empty() {
-			let at = self.clause_span(completed.proved[0]);
-			let proved =
-				PublishedClauses::Final(self.clauses.push(&completed.proved));
-			if let Err(error) = self
-				.prove_clauses_at_their_bounds(strings, frame, rules, proved)
-			{
-				self.report_completion_failure(strings, error, at);
-			}
-		}
-		if !completed.rewritten {
+		self.rewrite_own_clauses(strings, scope, own, &mut rewritten);
+		self.lend_declared_bounds(strings, scope, own, &mut rewritten);
+		self.prove_at_their_bounds(
+			strings,
+			frame,
+			rewriting_env,
+			&rewritten.proved,
+		);
+		// The written env says what the frame assumes when it holds every
+		// clause (no `Self` entry is missing from it), reads its parent's
+		// facts where they are (the parent's env was kept), and none of them
+		// reads differently.
+		if parent_kept && written_own.len() == own.len() && !rewritten.changed {
 			return written;
 		}
 		let reflexive = self
 			.assumption_envs
 			.chain(written)
 			.find_map(|env| env.reflexive);
-		let run: Vec<Clause> = completed
-			.traits
-			.into_iter()
-			.map(Clause::Trait)
-			.chain(completed.values)
-			.collect();
-		let flat = self.assumption_envs.push(AssumptionEnvIdx::ROOT, reflexive);
-		*self.assumption_envs.clauses_mut(flat) =
-			PublishedClauses::Final(self.clauses.push(&run));
-		flat
+		let run = self.clauses.push(&rewritten.assumed);
+		self.assumption_envs
+			.push_final(AssumptionEnvIdx::ROOT, reflexive, run)
 	}
 
-	/// Whether completing can change anything: an equality in scope, or a
+	/// Whether normalizing can change anything: an equality in scope, or a
 	/// clause about a type not rooted at a parameter (a `Self` entry's),
 	/// which reduces through definitions.
 	fn may_rewrite(&self, written: AssumptionEnvIdx, own: ClauseRange) -> bool {
@@ -240,142 +260,145 @@ impl Semantics {
 		}
 	}
 
-	/// Rewrites `clause` into `completed`. A part whose normalization fails
-	/// keeps its written form: its failure is reported where it belongs, and
-	/// a completed env never loses a fact construction had.
-	fn rewrite(
+	/// Proves `proved`, `frame`'s clauses no longer about an abstract type,
+	/// in `env`, reporting each that does not hold at its bound.
+	fn prove_at_their_bounds(
 		&mut self,
 		strings: &StringInterner,
-		rewrite: Rewrite,
-		clause: Clause,
-		origin: Origin,
-		completed: &mut Completed,
+		frame: GenericEnvIdx,
+		env: AssumptionEnvIdx,
+		proved: &[Clause],
 	) {
+		let Some(&first) = proved.first() else {
+			return;
+		};
+		let proved = PublishedClauses::Final(self.clauses.push(proved));
+		if let Err(error) =
+			self.prove_clauses_at_their_bounds(strings, frame, env, proved)
+		{
+			let at = self.clause_span(first);
+			self.report_normalization_failure(strings, error, at);
+		}
+	}
+
+	/// `own`, a frame's own clauses, rewritten in `scope` into `out`.
+	pub(in crate::tir) fn rewrite_own_clauses(
+		&mut self,
+		strings: &StringInterner,
+		scope: RewriteScope,
+		own: ClauseRange,
+		out: &mut RewrittenClauses,
+	) {
+		self.rewrite_run(strings, scope, own, Provenance::Own, out);
+	}
+
+	fn rewrite_run(
+		&mut self,
+		strings: &StringInterner,
+		scope: RewriteScope,
+		range: ClauseRange,
+		provenance: Provenance,
+		out: &mut RewrittenClauses,
+	) {
+		// One clause at a time: normalizing interns and may push clauses,
+		// and the arena only grows, so the range stays valid.
+		for at in 0..range.len() {
+			let clause = self.clauses.get(range)[at];
+			let rewritten =
+				self.rewrite_clause(strings, scope, clause, provenance);
+			out.push(clause, rewritten, provenance);
+		}
+	}
+
+	/// `clause` rewritten. A part whose normalization fails keeps its
+	/// written form: its failure is reported where it belongs, and a
+	/// normalized env never loses a fact construction had.
+	fn rewrite_clause(
+		&mut self,
+		strings: &StringInterner,
+		scope: RewriteScope,
+		clause: Clause,
+		provenance: Provenance,
+	) -> Rewritten {
 		let at = self.clause_span(clause);
+		let normalize = |sema: &mut Self, env, ty| {
+			sema.normalize_or_written(strings, env, ty, at)
+		};
 		match clause {
 			Clause::Trait(written) => {
-				let subject = self.normalize_or_written(
-					strings,
-					rewrite.rules,
-					written.subject,
-					at,
-				);
-				if self.types.is_abstract(subject) {
-					completed.rewritten |= subject != written.subject;
-					push_trait_clause(
-						&mut completed.traits,
-						TraitClause { subject, ..written },
-					);
-				} else {
-					completed.rewritten = true;
-					completed.proved.push(clause);
+				let subject =
+					normalize(self, scope.rewriting_env, written.subject);
+				if !self.types.is_abstract(subject) {
+					return Rewritten::Proved;
 				}
+				Rewritten::Assumed(Clause::Trait(TraitClause {
+					subject,
+					..written
+				}))
 			}
 			Clause::Representable(written) => {
-				let subject = self.normalize_or_written(
-					strings,
-					rewrite.rules,
-					written.subject,
-					at,
-				);
-				let ty = self.normalize_or_written(
-					strings,
-					rewrite.rules,
-					written.ty,
-					at,
-				);
-				if self.types.is_abstract(subject) {
-					completed.rewritten |=
-						subject != written.subject || ty != written.ty;
-					completed.values.push(Clause::Representable(
-						RepresentableClause {
-							subject,
-							ty,
-							..written
-						},
-					));
-				} else {
-					completed.rewritten = true;
-					completed.proved.push(clause);
+				let subject =
+					normalize(self, scope.rewriting_env, written.subject);
+				if !self.types.is_abstract(subject) {
+					return Rewritten::Proved;
 				}
+				let ty = normalize(self, scope.rewriting_env, written.ty);
+				Rewritten::Assumed(Clause::Representable(RepresentableClause {
+					subject,
+					ty,
+					..written
+				}))
 			}
 			Clause::Equality(written) => {
-				let projection = match origin {
-					Origin::Inherited => written.projection,
+				let projection = match provenance {
+					Provenance::Inherited => written.projection,
 					// About the frame's own parameters, the parent knows
 					// nothing and the frame's own rules must not apply.
-					Origin::Own
-						if self.root_frame(written.projection)
-							== Some(rewrite.frame) =>
+					Provenance::Own
+						if scope.own_frame.is_some()
+							&& self.root_frame(written.projection)
+								== scope.own_frame =>
 					{
 						written.projection
 					}
 					// About a parent's parameter, whose rules may fix it, or
 					// a trait impl's target, which reduces through definitions.
-					Origin::Own => self.normalize_or_written(
-						strings,
-						rewrite.parent_env,
-						written.projection,
-						at,
-					),
-					Origin::Lent => self.normalize_or_written(
-						strings,
-						rewrite.rules,
-						written.projection,
-						at,
-					),
+					Provenance::Own => {
+						normalize(self, scope.parent_env, written.projection)
+					}
+					Provenance::Lent => {
+						normalize(self, scope.rewriting_env, written.projection)
+					}
 				};
-				let value = self.normalize_or_written(
-					strings,
-					rewrite.rules,
-					written.value,
-					at,
-				);
-				if matches!(
+				let still_projection = matches!(
 					self.types.resolve(projection),
 					Type::TypeProjection { .. }
-				) && self.types.is_abstract(projection)
-				{
-					completed.rewritten |= projection != written.projection
-						|| value != written.value;
-					let known = completed.values.iter().any(|existing| {
-						matches!(
-							existing,
-							Clause::Equality(EqualityClause {
-								projection: known,
-								value: known_value,
-								..
-							}) if *known == projection && *known_value == value
-						)
-					});
-					if !known {
-						completed.values.push(Clause::Equality(
-							EqualityClause {
-								projection,
-								value,
-								..written
-							},
-						));
-					}
-				} else {
-					completed.rewritten = true;
-					completed.proved.push(clause);
+				) && self.types.is_abstract(projection);
+				if !still_projection {
+					return Rewritten::Proved;
 				}
+				let value = normalize(self, scope.rewriting_env, written.value);
+				Rewritten::Assumed(Clause::Equality(EqualityClause {
+					projection,
+					value,
+					..written
+				}))
 			}
 		}
 	}
 
-	/// What an equality of the frame's own, with an abstract value as
-	/// written, gives: the declared bounds of its associated type, held by
-	/// the value. Sound, since every impl proves its associated types'
-	/// declared bounds, so whatever the value is at a use satisfies them; a
-	/// concrete value is checked against them where it is written instead.
-	fn lend_declared_bounds(
+	/// What the equalities in `own` with an abstract value as written give:
+	/// the declared bounds of their associated type, held by the value,
+	/// rewritten into `out`. Sound, since every impl proves its associated
+	/// types' declared bounds, so whatever the value is at a use satisfies
+	/// them; a concrete value is checked against them where it is written
+	/// instead.
+	pub(in crate::tir) fn lend_declared_bounds(
 		&mut self,
 		strings: &StringInterner,
-		rewrite: Rewrite,
+		scope: RewriteScope,
 		own: ClauseRange,
-		completed: &mut Completed,
+		out: &mut RewrittenClauses,
 	) {
 		for at in 0..own.len() {
 			let Clause::Equality(equality) = self.clauses.get(own)[at] else {
@@ -403,11 +426,7 @@ impl Semantics {
 			let lent = self.instantiate_clauses(declared, trait_env, &[base]);
 			let range =
 				lent.final_range().expect("instantiated clauses are final");
-			for at in 0..range.len() {
-				let clause = self.clauses.get(range)[at];
-				completed.rewritten = true;
-				self.rewrite(strings, rewrite, clause, Origin::Lent, completed);
-			}
+			self.rewrite_run(strings, scope, range, Provenance::Lent, out);
 		}
 	}
 
@@ -429,13 +448,13 @@ impl Semantics {
 		) {
 			Ok(normalized) => normalized,
 			Err(error) => {
-				self.report_completion_failure(strings, error, at);
+				self.report_normalization_failure(strings, error, at);
 				ty
 			}
 		}
 	}
 
-	fn report_completion_failure(
+	fn report_normalization_failure(
 		&mut self,
 		strings: &StringInterner,
 		error: SolverError,
@@ -451,7 +470,7 @@ impl Semantics {
 			}
 			SolverError::Poisoned => {}
 			SolverError::Pending => {
-				unreachable!("every signature exists when envs are completed")
+				unreachable!("every signature exists when envs are normalized")
 			}
 		}
 	}

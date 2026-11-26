@@ -206,7 +206,7 @@ impl Semantics {
 				self_type,
 				reference,
 			} => {
-				let env = self.completed_env(strings, frame);
+				let env = self.normalize_env(strings, frame);
 				let normalized = (|| {
 					let ty = self.normalize(
 						strings,
@@ -258,7 +258,7 @@ impl Semantics {
 				reference,
 				owner,
 			} => {
-				let env = self.completed_env(strings, frame);
+				let env = self.normalize_env(strings, frame);
 				match self.check_bound_requirements(
 					strings,
 					env,
@@ -288,7 +288,7 @@ impl Semantics {
 				required,
 				reference,
 			} => {
-				let env = self.completed_env(strings, frame);
+				let env = self.normalize_env(strings, frame);
 				match self
 					.find_trait_impl_query(strings, env, subject, required)
 				{
@@ -324,7 +324,7 @@ impl Semantics {
 				ty,
 				reference,
 			} => {
-				let env = self.completed_env(strings, frame);
+				let env = self.normalize_env(strings, frame);
 				match self.normalize(
 					strings,
 					env,
@@ -441,7 +441,7 @@ impl Semantics {
 				bits,
 				reference,
 			} => {
-				let env = self.completed_env(strings, frame);
+				let env = self.normalize_env(strings, frame);
 				match self.check_constant_representable(
 					strings, env, ty, bits, reference,
 				) {
@@ -467,7 +467,7 @@ impl Semantics {
 				expected,
 				reference,
 			} => {
-				let env = self.completed_env(strings, frame);
+				let env = self.normalize_env(strings, frame);
 				match self.check_constant_type(
 					strings, env, length, expected, reference,
 				) {
@@ -492,7 +492,7 @@ impl Semantics {
 				ty,
 				reference,
 			} => {
-				let env = self.completed_env(strings, frame);
+				let env = self.normalize_env(strings, frame);
 				match self.check_value_type(strings, env, ty, reference) {
 					Ok(_) => Ok(()),
 					Err(SolverError::Cycle(cycle)) => {
@@ -516,7 +516,7 @@ impl Semantics {
 				key,
 				reference,
 			} => {
-				let env = self.completed_env(strings, frame);
+				let env = self.normalize_env(strings, frame);
 				match self.check_projection_member(
 					strings, env, projection, key, reference,
 				) {
@@ -679,7 +679,7 @@ impl Semantics {
 		};
 		let signature = &self.constants[usize::from(constant)];
 		let (mut ty, frame) = (signature.ty, signature.env);
-		let mut env = self.completed_env(strings, frame);
+		let mut env = self.normalize_env(strings, frame);
 		// With its arguments, the declared type is read where it is named.
 		if !type_args.is_empty() {
 			let args: Box<[TypeIndex]> = self.types.list(type_args).into();
