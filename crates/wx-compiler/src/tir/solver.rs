@@ -16,8 +16,8 @@ use crate::ast::{Ownership, StringInterner};
 use crate::diagnostics::SourceSpan;
 
 use super::clauses::{
-	AssumptionEnvIdx, BindingRef, BoundClauses, BoundId, Clause, Readiness,
-	SelfSubstitution, known_distinct,
+	AssumptionEnvIdx, BindingRef, Clause, PublishedClauses, Readiness,
+	SelfSubstitution, SourceClauseId, known_distinct,
 };
 use super::decls::{
 	AssocTypeIdx, ConstIdx, MemberKind, TraitIdx, TraitImplIdx,
@@ -109,7 +109,7 @@ pub(super) enum UnsatisfiedClause {
 		subject: TypeIndex,
 		reduced: TypeIndex,
 		trait_index: TraitIdx,
-		source: BoundId,
+		source: SourceClauseId,
 	},
 	/// `subject`'s value of the trait constant `constant` is not representable
 	/// as `ty`, which the entry `source` requires: `value` is it, or `None`
@@ -262,7 +262,7 @@ pub(super) struct ProjectionCycle {
 	pub(super) owner: Option<Definition>,
 	/// For a loop an impl's requirements own: the bound being proved when it
 	/// closed, where the impl's check reports it.
-	pub(super) bound: Option<BoundId>,
+	pub(super) bound: Option<SourceClauseId>,
 }
 
 /// A definition the solver judges once, in its own scope, and which owns the
@@ -410,7 +410,7 @@ pub(super) enum SolverFrame {
 	/// judgement's own, as for a member.
 	Requirements {
 		impl_kind: ImplKind,
-		bound: Option<BoundId>,
+		bound: Option<SourceClauseId>,
 		outer_budget: usize,
 	},
 	/// A constant being checked or evaluated (`Semantics::const_value`),
@@ -1052,7 +1052,11 @@ impl Solver {
 
 	/// Records on a requirements judgement's frame the bound being proved,
 	/// where a loop that closes in it is reported.
-	fn record_proving(&mut self, judgement: Option<usize>, bound: BoundId) {
+	fn record_proving(
+		&mut self,
+		judgement: Option<usize>,
+		bound: SourceClauseId,
+	) {
 		let Some(judgement) = judgement else {
 			return;
 		};
@@ -2685,7 +2689,7 @@ impl Semantics {
 		&mut self,
 		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
-		clauses: BoundClauses,
+		clauses: PublishedClauses,
 		subjects: Subjects,
 		(frame, arguments): (GenericEnvIdx, &[TypeIndex]),
 		mut failures: Option<&mut Vec<UnsatisfiedClause>>,

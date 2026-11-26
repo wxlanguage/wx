@@ -38,9 +38,9 @@ use super::body::{
 	Body, BodyIdx, BodyOwner, ConstBody, FunctionImplementation, Obligations,
 };
 use super::clauses::{
-	AssumptionEnvArena, AssumptionEnvIdx, BindingRequirement, BoundArena,
-	BoundClauses, BoundId, Clause, ClauseArena, SourceAssocBinding,
-	SourceTraitBound, TraitClause, push_trait_clause,
+	AssumptionEnvArena, AssumptionEnvIdx, BindingRequirement, Clause,
+	ClauseArena, PublishedClauses, SourceBinding, SourceClause,
+	SourceClauseArena, SourceClauseId, TraitClause, push_trait_clause,
 	report_duplicate_assoc_type_binding, report_not_a_binding_member,
 	report_not_a_trait_bound,
 };
@@ -77,7 +77,7 @@ use super::types::{
 /// resolver (`Semantics::fill_source_bounds`), so the two cannot disagree
 /// about which occurrences exist.
 struct BoundOccurrence {
-	id: BoundId,
+	id: SourceClauseId,
 	trait_index: TraitIdx,
 	span: SourceSpan,
 	bindings: Vec<BindingOccurrence>,
@@ -191,7 +191,7 @@ pub struct ConstantSignature {
 	pub env: GenericEnvIdx,
 }
 
-/// One `AssocTypeIdx`'s resolved signature. `declared_bounds`/
+/// One `AssocTypeIdx`'s resolved signature. `declared_clauses`/
 /// `clauses` (`type Name: Bound1 + Bound2;`, resolved against the
 /// trait's own `self_scope` — forced first, same as `TraitFunction`/
 /// `TraitConst` — so a bound may reference `Self`, e.g. `type Size: Memory
@@ -200,11 +200,11 @@ pub struct ConstantSignature {
 /// Each impl definition has a separate `AssocTypeIdx` from its declaration;
 /// only the declaration carries bounds and clauses.
 pub struct AssocTypeSignature {
-	pub declared_bounds: Box<[BoundId]>,
+	pub declared_clauses: Box<[SourceClauseId]>,
 	/// What the declaration assumes about `<Self as Trait>::Name`
-	/// (`BoundClauses`); its memberships can be read while equality values
+	/// (`PublishedClauses`); its memberships can be read while equality values
 	/// are still being resolved.
-	pub(super) clauses: BoundClauses,
+	pub(super) clauses: PublishedClauses,
 	pub value: Option<TypeIndex>,
 }
 
@@ -566,9 +566,9 @@ pub struct Semantics {
 
 	// The resolved data below is read across the sibling TIR modules.
 	pub types: TypeInterner,
-	pub(super) bounds: BoundArena,
+	pub(super) source_clauses: SourceClauseArena,
 	/// What each parameter and associated declaration assumes, flat
-	/// (`BoundClauses`).
+	/// (`PublishedClauses`).
 	pub(super) clauses: ClauseArena,
 	pub generic_envs: GenericEnvArena,
 	/// What each scope's bounds state (`clauses::AssumptionEnvArena`), kept apart
@@ -697,7 +697,7 @@ impl Semantics {
 				decls.intrinsics.bool.expect("core declares `Bool`"),
 				decls.intrinsics.char.expect("core declares `Char`"),
 			),
-			bounds: BoundArena::default(),
+			source_clauses: SourceClauseArena::default(),
 			clauses: ClauseArena::default(),
 			generic_envs: GenericEnvArena::new(),
 			assumption_envs: AssumptionEnvArena::new(),
@@ -1072,14 +1072,14 @@ impl Semantics {
 		}
 		self.assoc_types[usize::from(function_impls.args_assoc_type_index)] =
 			Some(AssocTypeSignature {
-				declared_bounds: Box::new([]),
-				clauses: BoundClauses::NONE,
+				declared_clauses: Box::new([]),
+				clauses: PublishedClauses::NONE,
 				value: Some(args),
 			});
 		self.assoc_types[usize::from(function_impls.result_assoc_type_index)] =
 			Some(AssocTypeSignature {
-				declared_bounds: Box::new([]),
-				clauses: BoundClauses::NONE,
+				declared_clauses: Box::new([]),
+				clauses: PublishedClauses::NONE,
 				value: Some(return_type),
 			});
 		for trait_impl_index in [
@@ -1256,8 +1256,8 @@ impl Semantics {
 
 		self.assoc_types[usize::from(value_assoc_type_index)] =
 			Some(AssocTypeSignature {
-				declared_bounds: Box::new([]),
-				clauses: BoundClauses::NONE,
+				declared_clauses: Box::new([]),
+				clauses: PublishedClauses::NONE,
 				value: Some(value.inner),
 			});
 
@@ -2136,12 +2136,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 		if states_clauses {
 			sema.assumption_envs.set_requirements(
 				generic_env,
-				BoundClauses::Provisional(provisional),
+				PublishedClauses::Provisional(provisional),
 			);
 		}
 		if let Some(env) = own_env {
 			*sema.assumption_envs.clauses_mut(env) =
-				BoundClauses::Provisional(provisional.split_at(entry_traits).1);
+				PublishedClauses::Provisional(
+					provisional.split_at(entry_traits).1,
+				);
 		}
 
 		// Resolve source bounds now that every sibling has provisional
@@ -2166,7 +2168,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let mut equalities = Vec::new();
 		let mut entry_equalities = 0;
 		for (at, (subject, name, occurrences)) in bounded.iter().enumerate() {
-			let ids: Box<[BoundId]> =
+			let ids: Box<[SourceClauseId]> =
 				occurrences.iter().map(|o| o.id).collect();
 			sema.collect_value_clauses(
 				self.strings,
@@ -2196,10 +2198,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let (_, own) = run.split_at(entry.0.len() + entry.1.len());
 		if states_clauses {
 			sema.assumption_envs
-				.set_requirements(generic_env, BoundClauses::Final(run));
+				.set_requirements(generic_env, PublishedClauses::Final(run));
 		}
 		if let Some(env) = own_env {
-			*sema.assumption_envs.clauses_mut(env) = BoundClauses::Final(own);
+			*sema.assumption_envs.clauses_mut(env) =
+				PublishedClauses::Final(own);
 		}
 		generic_env
 	}
@@ -2817,8 +2820,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 
 		sema.assoc_types[usize::from(size_assoc_type_index)] =
 			Some(AssocTypeSignature {
-				declared_bounds: Box::new([]),
-				clauses: BoundClauses::NONE,
+				declared_clauses: Box::new([]),
+				clauses: PublishedClauses::NONE,
 				value: Some(resolved_size),
 			});
 		sema.check_memory_limits(file_id, memory_index, resolved_size);
@@ -3172,7 +3175,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				});
 				sema.assoc_types[usize::from(assoc_type_index)] =
 					Some(AssocTypeSignature {
-						declared_bounds: resolved_bounds,
+						declared_clauses: resolved_bounds,
 						clauses,
 						value: resolved_value,
 					});
@@ -3288,13 +3291,13 @@ impl<'ast> SemanticsBuilder<'ast> {
 				);
 
 				// An impl provides a value, it doesn't declare a
-				// requirement — `declared_bounds`/`clauses` stay
+				// requirement — `declared_clauses`/`clauses` stay
 				// empty; only a trait's own declaration (the
 				// `TraitAssocType` arm above) ever populates those.
 				sema.assoc_types[usize::from(assoc_type_index)] =
 					Some(AssocTypeSignature {
-						declared_bounds: Box::new([]),
-						clauses: BoundClauses::NONE,
+						declared_clauses: Box::new([]),
+						clauses: PublishedClauses::NONE,
 						value: Some(resolved_ty),
 					});
 				SignatureLocation::AssocType(assoc_type_index)
@@ -5548,7 +5551,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		location: BoundSubject,
 		subject: TypeIndex,
 		name: SymbolU32,
-	) -> (Box<[BoundId]>, BoundClauses) {
+	) -> (Box<[SourceClauseId]>, PublishedClauses) {
 		let mut occurrences = Vec::new();
 		if let Some(bound) = bound {
 			self.collect_bound_occurrences(
@@ -5588,7 +5591,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			&occurrences,
 		);
 		let provisional =
-			BoundClauses::Provisional(sema.clauses.push_traits(&traits));
+			PublishedClauses::Provisional(sema.clauses.push_traits(&traits));
 		match location {
 			BoundSubject::Scope(env) => {
 				sema.assumption_envs.publish(env, provisional);
@@ -5596,7 +5599,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			BoundSubject::Assoc(index) => {
 				sema.assoc_types[usize::from(index)] =
 					Some(AssocTypeSignature {
-						declared_bounds: Box::new([]),
+						declared_clauses: Box::new([]),
 						clauses: provisional,
 						value: None,
 					})
@@ -5609,7 +5612,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 			subject,
 			&occurrences,
 		);
-		let ids: Box<[BoundId]> = occurrences.iter().map(|o| o.id).collect();
+		let ids: Box<[SourceClauseId]> =
+			occurrences.iter().map(|o| o.id).collect();
 		let mut equalities = Vec::new();
 		sema.collect_value_clauses(
 			self.strings,
@@ -5620,12 +5624,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 		);
 		(
 			ids,
-			BoundClauses::Final(sema.clauses.push_final(&traits, &equalities)),
+			PublishedClauses::Final(
+				sema.clauses.push_final(&traits, &equalities),
+			),
 		)
 	}
 
 	/// The memberships `occurrences` state about `subject`, published before
-	/// any equality's value is resolved (`BoundClauses`), appended to `out`,
+	/// any equality's value is resolved (`PublishedClauses`), appended to `out`,
 	/// which may hold other subjects'.
 	fn collect_occurrence_clauses(
 		&mut self,
@@ -5653,7 +5659,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		out: &mut Vec<TraitClause>,
 		subject: TypeIndex,
 		occurrence: &BoundOccurrence,
-		origin: BoundId,
+		origin: SourceClauseId,
 	) {
 		push_trait_clause(
 			out,
@@ -5680,15 +5686,15 @@ impl<'ast> SemanticsBuilder<'ast> {
 	}
 
 	/// Walks a bound expression exactly once, resolving trait paths,
-	/// reserving a `BoundId` per accepted occurrence, and reporting the
+	/// reserving a `SourceClauseId` per accepted occurrence, and reporting the
 	/// "not an associated type"/duplicate-binding diagnostics. The result is
 	/// consumed twice — once by `trait_clauses` to publish memberships (no
 	/// equality RHS types resolved), once by
 	/// `fill_source_bounds` to resolve those RHS types and fill in
-	/// `self.bounds` — but which occurrences exist, and which bindings on
+	/// `self.source_clauses` — but which occurrences exist, and which bindings on
 	/// them are accepted, is decided exactly once, here. The two former
 	/// consumers used to re-walk the raw AST independently and could only be
-	/// proven to agree by comparing how many `BoundId`s each had reserved;
+	/// proven to agree by comparing how many `SourceClauseId`s each had reserved;
 	/// walking a shared `BoundOccurrence` tree instead makes that agreement
 	/// structural rather than an invariant to maintain by hand.
 	fn collect_bound_occurrences(
@@ -5728,7 +5734,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			return;
 		};
 		let span = SourceSpan::new(file_id, ast.bound_span(expr));
-		let id = sema.bounds.reserve(trait_index, span);
+		let id = sema.source_clauses.reserve(trait_index, span);
 		let mut occurrence_bindings = Vec::new();
 		for binding in bindings {
 			let key = match binding.kind {
@@ -5890,8 +5896,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 		});
 	}
 
-	/// Resolves every equality binding's RHS type and fills `self.bounds` at
-	/// each occurrence's already-reserved `BoundId`. Run once every sibling
+	/// Resolves every equality binding's RHS type and fills `self.source_clauses` at
+	/// each occurrence's already-reserved `SourceClauseId`. Run once every sibling
 	/// param has provisional memberships published, so an equality RHS can
 	/// reference a sibling's associated types.
 	/// `subject` is the type the occurrences bound, the `Self` of each trait
@@ -5987,14 +5993,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 						)
 					}
 				};
-				source_bindings.push(SourceAssocBinding {
+				source_bindings.push(SourceBinding {
 					name: binding.name,
 					kind,
 				});
 			}
-			sema.bounds.fill(
+			sema.source_clauses.fill(
 				occurrence.id,
-				SourceTraitBound {
+				SourceClause {
 					trait_index: occurrence.trait_index,
 					span: occurrence.span,
 					bindings: source_bindings.into_boxed_slice(),
@@ -7517,7 +7523,7 @@ pub(super) mod tests {
 				.collect::<Vec<_>>()
 			{
 				assert_eq!(
-					case.sema.bounds.trait_index(clause.source),
+					case.sema.source_clauses.trait_index(clause.source),
 					clause.trait_index
 				);
 			}
@@ -7530,7 +7536,7 @@ pub(super) mod tests {
 			assert_eq!(equalities[0].projection, value);
 			assert_eq!(equalities[0].value, TypeIndex::I32);
 			assert!(
-				matches!(case.sema.bounds.binding(equalities[0].source).kind,
+				matches!(case.sema.source_clauses.binding(equalities[0].source).kind,
 				BindingRequirement::Equals(_, value) if value.inner == TypeIndex::I32)
 			);
 		}
@@ -7704,7 +7710,7 @@ pub(super) mod tests {
 					let env = sema.assumption_envs.written(scope);
 					let clauses = sema.assumption_envs.get(env).clauses;
 					*sema.assumption_envs.clauses_mut(env) =
-						BoundClauses::Provisional(clauses.range());
+						PublishedClauses::Provisional(clauses.range());
 					let (readiness, facts) = memberships(sema, scope);
 					assert_eq!(readiness, Readiness::Pending);
 					assert_eq!(facts[0].1, TraitIdx::new(0));
@@ -7781,7 +7787,7 @@ pub(super) mod tests {
 					sema.assoc_types[usize::from(declaration)]
 						.as_mut()
 						.unwrap()
-						.clauses = BoundClauses::Provisional(
+						.clauses = PublishedClauses::Provisional(
 						sema.assoc_types[usize::from(declaration)]
 							.as_ref()
 							.unwrap()
@@ -7994,7 +8000,7 @@ pub(super) mod tests {
 		clauses: &ClauseArena,
 		env: GenericEnvIdx,
 		subject: TypeIndex,
-	) -> Vec<BoundId> {
+	) -> Vec<SourceClauseId> {
 		let over_subject = |mut ty: TypeIndex| loop {
 			if ty == subject {
 				return true;
@@ -8013,7 +8019,8 @@ pub(super) mod tests {
 			.equalities(env.resolved())
 			.filter(|clause| over_subject(clause.projection))
 			.map(|clause| clause.origin);
-		let mut origins: Vec<BoundId> = traits.chain(equalities).collect();
+		let mut origins: Vec<SourceClauseId> =
+			traits.chain(equalities).collect();
 		origins.sort_by_key(|&id| u32::from(id));
 		origins.dedup();
 		origins
@@ -8200,7 +8207,7 @@ pub(super) mod tests {
 		}
 
 		/// The written clause excludes the implicit `Self: ThisTrait` bound.
-		fn trait_supertraits(&self, path: &str) -> Vec<&SourceTraitBound> {
+		fn trait_supertraits(&self, path: &str) -> Vec<&SourceClause> {
 			let env = self.sema.traits[usize::from(self.trait_index(path))].env;
 			let subject = self.sema.generic_envs.param_types(env)[0];
 			written_bounds(
@@ -8211,7 +8218,7 @@ pub(super) mod tests {
 				subject,
 			)
 			.into_iter()
-			.map(|id| self.sema.bounds.get(id))
+			.map(|id| self.sema.source_clauses.get(id))
 			.collect()
 		}
 
@@ -8244,7 +8251,7 @@ pub(super) mod tests {
 		}
 
 		/// See `trait_supertraits` — only the written clause.
-		fn typeset_supertraits(&self, path: &str) -> Vec<&SourceTraitBound> {
+		fn typeset_supertraits(&self, path: &str) -> Vec<&SourceClause> {
 			let env = self.sema.traits
 				[usize::from(self.typeset_trait_index(path))]
 			.env;
@@ -8257,7 +8264,7 @@ pub(super) mod tests {
 				subject,
 			)
 			.into_iter()
-			.map(|id| self.sema.bounds.get(id))
+			.map(|id| self.sema.source_clauses.get(id))
 			.collect()
 		}
 
@@ -8591,11 +8598,11 @@ pub(super) mod tests {
 		/// The one-hop declared bounds on generic parameter `param_index` of
 		/// whichever item owns `env` — bounds no longer live on the
 		/// signature struct itself, see `Semantics::assumption_envs`.
-		fn declared_bounds(
+		fn declared_clauses(
 			&self,
 			env: GenericEnvIdx,
 			param_index: u32,
-		) -> Vec<&SourceTraitBound> {
+		) -> Vec<&SourceClause> {
 			let subject =
 				self.sema.generic_envs.param_types(env)[param_index as usize];
 			written_bounds(
@@ -8606,7 +8613,7 @@ pub(super) mod tests {
 				subject,
 			)
 			.into_iter()
-			.map(|id| self.sema.bounds.get(id))
+			.map(|id| self.sema.source_clauses.get(id))
 			.collect()
 		}
 
@@ -8626,7 +8633,7 @@ pub(super) mod tests {
 		);
 		let env = case.type_alias("A").type_params;
 		assert_eq!(case.param_count(env), 2);
-		assert!((0..2).all(|i| case.declared_bounds(env, i).is_empty()));
+		assert!((0..2).all(|i| case.declared_clauses(env, i).is_empty()));
 	}
 
 	/// A slot's type left out is `_`: nothing infers it in a signature, so
@@ -9055,7 +9062,7 @@ pub(super) mod tests {
 		);
 		let header = case.sema.inherent_impls[0].as_ref().unwrap();
 		assert_eq!(case.param_count(header.type_params), 1);
-		let bounds = case.declared_bounds(header.type_params, 0);
+		let bounds = case.declared_clauses(header.type_params, 0);
 		assert_eq!(bounds.len(), 1);
 		assert_eq!(bounds[0].trait_index, case.trait_index("Bound"));
 	}
@@ -9230,7 +9237,7 @@ pub(super) mod tests {
 			case.sema.diagnostics
 		);
 		let env = case.type_alias("A").type_params;
-		assert_eq!(case.declared_bounds(env, 0).len(), 1);
+		assert_eq!(case.declared_clauses(env, 0).len(), 1);
 	}
 
 	#[test]
@@ -9261,7 +9268,7 @@ pub(super) mod tests {
 		let case = TestCase::new("type A<T: DoesNotExist> = T;");
 
 		let env = case.type_alias("A").type_params;
-		assert_eq!(case.declared_bounds(env, 0).len(), 0);
+		assert_eq!(case.declared_clauses(env, 0).len(), 0);
 		assert_eq!(
 			case.sema.diagnostics.len(),
 			1,
@@ -10727,7 +10734,7 @@ pub(super) mod tests {
 		);
 		assert!(
 			case.assoc_type_signature("Container", "Item")
-				.declared_bounds
+				.declared_clauses
 				.is_empty()
 		);
 	}
@@ -11092,7 +11099,7 @@ pub(super) mod tests {
 			.as_ref()
 			.expect("impl's associated type value is resolved");
 		assert_eq!(signature.value, Some(TypeIndex::I32));
-		assert!(signature.declared_bounds.is_empty());
+		assert!(signature.declared_clauses.is_empty());
 	}
 
 	#[test]
@@ -12575,14 +12582,14 @@ pub(super) mod tests {
 		);
 		let bounds = &case
 			.assoc_type_signature("Container", "Item")
-			.declared_bounds;
+			.declared_clauses;
 		assert_eq!(bounds.len(), 2);
 		assert_eq!(
-			case.sema.bounds.get(bounds[0]).trait_index,
+			case.sema.source_clauses.get(bounds[0]).trait_index,
 			case.trait_index("Bound1")
 		);
 		assert_eq!(
-			case.sema.bounds.get(bounds[1]).trait_index,
+			case.sema.source_clauses.get(bounds[1]).trait_index,
 			case.trait_index("Bound2")
 		);
 	}
@@ -13107,11 +13114,11 @@ pub(super) mod tests {
 			[("First", "Result"), ("Second", "Source")]
 		{
 			let signature = case.assoc_type_signature("Container", name);
-			assert_eq!(signature.declared_bounds.len(), 1);
+			assert_eq!(signature.declared_clauses.len(), 1);
 			assert_eq!(
 				case.sema
-					.bounds
-					.get(signature.declared_bounds[0])
+					.source_clauses
+					.get(signature.declared_clauses[0])
 					.trait_index,
 				case.trait_index(expected_trait),
 			);
@@ -13202,7 +13209,7 @@ pub(super) mod tests {
 		);
 		assert!(
 			case.assoc_type_signature("Container", "Item")
-				.declared_bounds
+				.declared_clauses
 				.is_empty()
 		);
 	}
@@ -13220,7 +13227,7 @@ pub(super) mod tests {
 			case.sema.diagnostics
 		);
 		let env = case.function_signature("f").type_params;
-		let bounds = case.declared_bounds(env, 0);
+		let bounds = case.declared_clauses(env, 0);
 		assert_eq!(bounds.len(), 1);
 		assert_eq!(bounds[0].trait_index, case.trait_index("Memory"));
 		assert_eq!(bounds[0].bindings.len(), 1);
@@ -13266,7 +13273,7 @@ pub(super) mod tests {
 		// The equality is kept as written, and still normalizes.
 		let env = case.function_signature("f").type_params;
 		assert!(matches!(
-			case.declared_bounds(env, 0)[0].bindings[0].kind,
+			case.declared_clauses(env, 0)[0].bindings[0].kind,
 			BindingRequirement::Equals(
 				_,
 				Spanned {
@@ -13615,7 +13622,7 @@ pub(super) mod tests {
 			case.sema.diagnostics
 		);
 		let env = case.function_signature("f").type_params;
-		let bounds = case.declared_bounds(env, 0);
+		let bounds = case.declared_clauses(env, 0);
 		assert_eq!(bounds.len(), 1);
 		assert_eq!(bounds[0].bindings.len(), 1);
 		let BindingRequirement::Bound(_, rhs_bounds) =
@@ -13625,7 +13632,7 @@ pub(super) mod tests {
 		};
 		assert_eq!(rhs_bounds.len(), 1);
 		assert_eq!(
-			case.sema.bounds.get(rhs_bounds[0]).trait_index,
+			case.sema.source_clauses.get(rhs_bounds[0]).trait_index,
 			case.trait_index("Unsigned")
 		);
 	}
@@ -13648,7 +13655,7 @@ pub(super) mod tests {
 			Some(DiagnosticCode::DuplicateAssocTypeBinding.code())
 		);
 		let env = case.function_signature("f").type_params;
-		let bounds = case.declared_bounds(env, 0);
+		let bounds = case.declared_clauses(env, 0);
 		assert_eq!(bounds[0].bindings.len(), 1);
 	}
 
@@ -13670,7 +13677,7 @@ pub(super) mod tests {
 			Some(DiagnosticCode::NotATraitMember.code())
 		);
 		let env = case.function_signature("f").type_params;
-		let bounds = case.declared_bounds(env, 0);
+		let bounds = case.declared_clauses(env, 0);
 		assert!(bounds[0].bindings.is_empty());
 	}
 
@@ -13688,7 +13695,7 @@ pub(super) mod tests {
 			case.sema.diagnostics
 		);
 		let env = case.function_signature("copy").type_params;
-		let bounds = case.declared_bounds(env, 0);
+		let bounds = case.declared_clauses(env, 0);
 		let BindingRequirement::Equals(_, ty) = &bounds[0].bindings[0].kind
 		else {
 			panic!("expected an `Equals` binding kind");
@@ -13712,7 +13719,7 @@ pub(super) mod tests {
 			case.sema.diagnostics
 		);
 		let env = case.function_signature("f").type_params;
-		let bounds = case.declared_bounds(env, 0);
+		let bounds = case.declared_clauses(env, 0);
 		assert_eq!(bounds.len(), 1);
 		assert_eq!(bounds[0].trait_index, case.typeset_trait_index("Int"));
 	}
@@ -14478,8 +14485,8 @@ pub(super) mod tests {
 				// that becomes reducible later. Here it models that result directly.
 				sema.assoc_types[usize::from(provider)] =
 					Some(AssocTypeSignature {
-						declared_bounds: Box::new([]),
-						clauses: BoundClauses::NONE,
+						declared_clauses: Box::new([]),
+						clauses: PublishedClauses::NONE,
 						value: Some(tuple),
 					});
 				assert_eq!(
@@ -15408,8 +15415,8 @@ pub(super) mod tests {
 			case.sema.diagnostics
 		);
 		let sig = case.assoc_type_signature("Container", "Item");
-		let bound = case.sema.bounds.get(sig.declared_bounds[0]);
-		let SourceAssocBinding {
+		let bound = case.sema.source_clauses.get(sig.declared_clauses[0]);
+		let SourceBinding {
 			kind: BindingRequirement::Equals(_, value),
 			..
 		} = &bound.bindings[0]
@@ -16102,7 +16109,7 @@ pub(super) mod tests {
 				let assumption_env = sema.assumption_envs.written(env);
 				let clauses = sema.assumption_envs.get(assumption_env).clauses;
 				*sema.assumption_envs.clauses_mut(assumption_env) =
-					BoundClauses::Provisional(clauses.range());
+					PublishedClauses::Provisional(clauses.range());
 				assert_eq!(
 					sema.normalize(
 						builder.strings,
@@ -16239,7 +16246,7 @@ pub(super) mod tests {
 		);
 		for (name, t_index, u_index) in [("f", 1, 0), ("g", 0, 1)] {
 			let signature = case.function_signature(name);
-			let source = case.declared_bounds(signature.type_params, t_index);
+			let source = case.declared_clauses(signature.type_params, t_index);
 			let BindingRequirement::Equals(_, value) =
 				source[0].bindings[0].kind
 			else {
@@ -16490,7 +16497,7 @@ pub(super) mod tests {
 			assert_eq!(equalities[0].projection, projection);
 			assert_eq!(equalities[0].value, stored);
 			let BindingRequirement::Equals(_, source) =
-				case.sema.bounds.binding(equalities[0].source).kind
+				case.sema.source_clauses.binding(equalities[0].source).kind
 			else {
 				panic!()
 			};
@@ -16540,7 +16547,7 @@ pub(super) mod tests {
 				Type::TypeProjection { .. }
 			));
 			let BindingRequirement::Equals(_, value) =
-				case.sema.bounds.binding(source).kind
+				case.sema.source_clauses.binding(source).kind
 			else {
 				panic!()
 			};
@@ -18274,7 +18281,7 @@ pub(super) mod tests {
 					let clauses =
 						sema.assumption_envs.get(assumption_env).clauses;
 					*sema.assumption_envs.clauses_mut(assumption_env) =
-						BoundClauses::Provisional(clauses.range());
+						PublishedClauses::Provisional(clauses.range());
 					assert_eq!(
 						sema.find_trait_impl_query(
 							builder.strings,

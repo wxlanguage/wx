@@ -28,8 +28,8 @@
 //! compared there.
 
 use super::clauses::{
-	AssumptionEnvIdx, BoundClauses, BoundId, Clause, EqualityClause,
-	RepresentableClause, TraitClause,
+	AssumptionEnvIdx, Clause, EqualityClause, PublishedClauses,
+	RepresentableClause, SourceClauseId, TraitClause,
 };
 use super::decls::{
 	AstNodeRef, BindingKey, ConstIdx, DeclKind, FunctionIdx, MemberIdx,
@@ -106,10 +106,10 @@ impl Semantics {
 	/// kept.
 	pub(super) fn instantiate_clauses(
 		&mut self,
-		clauses: BoundClauses,
+		clauses: PublishedClauses,
 		env: GenericEnvIdx,
 		arguments: &[TypeIndex],
-	) -> BoundClauses {
+	) -> PublishedClauses {
 		let Some(range) = clauses.final_range() else {
 			unreachable!("every signature exists when declarations are checked")
 		};
@@ -147,7 +147,7 @@ impl Semantics {
 				}
 			})
 			.collect();
-		BoundClauses::Final(self.clauses.push(&instantiated))
+		PublishedClauses::Final(self.clauses.push(&instantiated))
 	}
 
 	/// Proves the clauses `function`'s own env states in `contract`, where
@@ -254,12 +254,12 @@ impl Semantics {
 
 	/// What `frame`'s function itself states: nothing when it has no frame
 	/// of its own and `frame` is its impl's or its trait's.
-	fn own_requirements(&self, frame: GenericEnvIdx) -> BoundClauses {
+	fn own_requirements(&self, frame: GenericEnvIdx) -> PublishedClauses {
 		match self.generic_envs.owner(frame) {
 			GenericEnvOwner::Function(_) => {
 				self.assumption_envs.requirements(frame)
 			}
-			_ => BoundClauses::NONE,
+			_ => PublishedClauses::NONE,
 		}
 	}
 
@@ -360,7 +360,7 @@ impl Semantics {
 		strings: &StringInterner,
 		trait_index: TraitIdx,
 		(declaration, function): (FunctionIdx, FunctionIdx),
-		origin: BoundId,
+		origin: SourceClauseId,
 		failure: &UnsatisfiedClause,
 	) {
 		let read = match *failure {
@@ -408,9 +408,14 @@ impl Semantics {
 				"impl has stricter requirements than trait `{}`",
 				self.trait_name(strings, trait_index),
 			))
-			.with_label(self.bounds.span(origin).primary_label().with_message(
-				format!("impl has extra requirement `{requirement}`"),
-			))
+			.with_label(
+				self.source_clauses
+					.span(origin)
+					.primary_label()
+					.with_message(format!(
+						"impl has extra requirement `{requirement}`"
+					)),
+			)
 			.with_label(
 				self.decls
 					.declaration_span(expected_decl.loc)

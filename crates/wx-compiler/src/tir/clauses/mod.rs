@@ -1,20 +1,27 @@
-//! Clauses: as written (bounds), as statements about types, and as what
-//! each scope assumes.
+//! Clauses: as written, as statements about types, and as what each scope
+//! assumes.
 //!
-//! A clause is one statement a bound makes about types: `T: Tr` (a
-//! `TraitClause`) or `<T as Tr>::A == X` (an `EqualityClause`). Its
-//! declaration assumes it; a use of the declaration proves it. (rustc's term:
-//! a predicate that can stand in a `where` clause, as opposed to one that is
-//! only ever proved, such as well-formedness.)
+//! A source clause is one clause as written, names resolved, spans kept:
+//! `T: Container where { Item = U }` on a parameter, its trait with its
+//! bindings (`Item = U`, `Item: Marker`, `const LEN: u8`, each a source
+//! binding). It is what diagnostics point at, stored once in the
+//! `SourceClauseArena`.
 //!
-//! Each written bound is stored once in the `BoundArena`, with its spans. A
-//! declaration's written bounds become its clauses (`BoundClauses`): flat runs
-//! in the `ClauseArena`, one per scope (an `AssumptionEnv`, whatever subjects they
-//! are about) or per associated declaration, nested bounds as clauses on
-//! projections and each
-//! trait's own clauses (its supertraits) substituted for `Self`. They are
-//! built in two passes: memberships before any equality's value is resolved,
-//! so a sibling's value can name members they supply, then equalities.
+//! A clause is one statement about types, a source clause flattened: `T: Tr`
+//! (a `TraitClause`), `<T as Tr>::A == X` (an `EqualityClause`), or a
+//! constant's value representable as a type (a `RepresentableClause`). It
+//! carries no span; it points back at its source clause. A declaration's
+//! source clauses become its clauses (`PublishedClauses`): flat runs in the
+//! `ClauseArena`, nested bindings as clauses on projections and each trait's
+//! own clauses (its supertraits) substituted for `Self`. They are built in two
+//! passes: memberships before any equality's value is resolved, so a
+//! sibling's value can name members they supply, then equalities. (rustc's
+//! term: a predicate that can stand in a `where` clause, as opposed to one
+//! that is only ever proved, such as well-formedness.)
+//!
+//! The same clauses play two roles. Inside their declaration they are
+//! assumed: an assumption env holds them. At a use of it they are proved: a
+//! frame's requirements.
 //!
 //! Proving a use's clauses reads the tables directly
 //! (`Solver::satisfies_clauses`). `ClauseTables` answers the two questions
@@ -63,49 +70,50 @@ use super::signatures::{
 	AssocTypeSignature, QueryInfo, Semantics, SemanticsBuilder,
 	SignatureStatus, TraitSignature,
 };
-mod normalization;
-
 use super::types::{
 	GenericEnvArena, GenericEnvIdx, GenericEnvOwner, Substitution, Type,
 	TypeIndex, TypeInterner,
 };
 
-index_newtype!(BoundId);
+mod normalization;
+
+index_newtype!(SourceClauseId);
 index_newtype!(AssumptionEnvIdx);
 
-/// One binding within a source bound. The index is stable because an
+/// One binding within a source clause. The index is stable because an
 /// occurrence's completed binding slice is immutable after publication.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub(super) struct BindingRef {
-	pub(super) bound: BoundId,
+	pub(super) bound: SourceClauseId,
 	pub(super) index: u32,
 }
 
-/// One resolved trait bound as written, including its source location.
+/// One source clause: a trait as written about a subject, names resolved,
+/// with its bindings and its source location.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
-pub(super) struct SourceTraitBound {
+pub(super) struct SourceClause {
 	pub(super) trait_index: TraitIdx,
 	pub(super) span: SourceSpan,
-	pub(super) bindings: Box<[SourceAssocBinding]>,
+	pub(super) bindings: Box<[SourceBinding]>,
 }
 
-/// One entry of a written bound's binding block: `Assoc = Type`, `Assoc:
-/// Bounds` or `const NAME: Type`.
+/// One source binding, an entry of a source clause's binding block: `Assoc =
+/// Type`, `Assoc: Traits` or `const NAME: Type`.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
-pub(super) struct SourceAssocBinding {
+pub(super) struct SourceBinding {
 	pub(super) name: Spanned<SymbolU32>,
 	pub(super) kind: BindingRequirement,
 }
 
 /// What an entry states, about the member it names under the trait that
-/// declares it: the bound's own trait, or one of its supertraits.
+/// declares it: the source clause's own trait, or one of its supertraits.
 #[cfg_attr(any(debug_assertions, test), derive(serde::Serialize))]
 pub(super) enum BindingRequirement {
 	/// `Assoc = Type`.
 	Equals(TypeProjectionTarget, Spanned<TypeIndex>),
 	/// `Assoc: Bounds`.
-	Bound(TypeProjectionTarget, Box<[BoundId]>),
+	Bound(TypeProjectionTarget, Box<[SourceClauseId]>),
 	/// `const NAME: Type`: the constant's value is representable as the type.
 	Representable(ConstantTarget, Spanned<TypeIndex>),
 }
@@ -119,8 +127,8 @@ pub(super) enum BindingRequirement {
 pub(super) struct TraitClause {
 	pub(super) subject: TypeIndex,
 	pub(super) trait_index: TraitIdx,
-	pub(super) source: BoundId,
-	pub(super) origin: BoundId,
+	pub(super) source: SourceClauseId,
+	pub(super) origin: SourceClauseId,
 }
 
 /// The clause that `subject`'s value of the trait constant `constant` is `ty`
@@ -134,7 +142,7 @@ pub(super) struct RepresentableClause {
 	pub(super) target: ConstantTarget,
 	pub(super) ty: TypeIndex,
 	pub(super) source: BindingRef,
-	pub(super) origin: BoundId,
+	pub(super) origin: SourceClauseId,
 }
 
 /// The clause `projection == value`, stated by a bound.
@@ -145,7 +153,7 @@ pub(super) struct EqualityClause {
 	pub(super) projection: TypeIndex,
 	pub(super) value: TypeIndex,
 	pub(super) source: BindingRef,
-	pub(super) origin: BoundId,
+	pub(super) origin: SourceClauseId,
 }
 
 /// One fact a bound states. Every kind lives in the one `ClauseArena`, and a
@@ -187,16 +195,16 @@ impl ClauseRange {
 	}
 }
 
-/// The clauses one subject's bounds state: a parameter's (`T: Tr where { A =
-/// X, A: B }`), or an associated type declaration's (`type A: B`, about
-/// `<Self as Tr>::A`).
-/// Each written bound becomes a flat run of clauses, its nested bounds as
+/// The clauses one subject's source clauses state: a parameter's (`T: Tr
+/// where { A = X, A: B }`), or an associated type declaration's (`type A: B`,
+/// about `<Self as Tr>::A`).
+/// Each source clause becomes a flat run of clauses, its nested bindings as
 /// clauses on projections and each trait's own clauses (its supertraits, and
 /// theirs) substituted for `Self`. They are published in two stages: the
 /// memberships before any value is resolved, so a sibling's value can name
 /// members they supply, then the whole run once the values are.
 #[derive(Clone, Copy)]
-pub(super) enum BoundClauses {
+pub(super) enum PublishedClauses {
 	/// The memberships only: a read may conclude neither a proof nor a
 	/// failure from what the values will decide. Not an answer
 	/// (`SolverError::Pending`); ask again once construction has advanced.
@@ -206,7 +214,7 @@ pub(super) enum BoundClauses {
 	Final(ClauseRange),
 }
 
-impl BoundClauses {
+impl PublishedClauses {
 	/// A subject whose bounds are not published yet.
 	pub(super) const PENDING: Self = Self::Provisional(ClauseRange::EMPTY);
 	/// A subject that assumes nothing.
@@ -328,7 +336,7 @@ impl ClauseArena {
 #[derive(Clone, Copy)]
 pub(super) struct AssumptionEnv {
 	pub(super) parent: Option<AssumptionEnvIdx>,
-	pub(super) clauses: BoundClauses,
+	pub(super) clauses: PublishedClauses,
 	/// A trait's own `Self: Trait`, which no clause states.
 	pub(super) reflexive: Option<(TypeIndex, TraitIdx)>,
 }
@@ -344,7 +352,7 @@ pub(super) struct AssumptionEnv {
 struct FrameClauses {
 	written: AssumptionEnvIdx,
 	completion: FrameCompletion,
-	requirements: BoundClauses,
+	requirements: PublishedClauses,
 }
 
 /// How far a frame's completed env is (`Semantics::completed_env`).
@@ -377,13 +385,13 @@ impl AssumptionEnvArena {
 		Self {
 			envs: vec![AssumptionEnv {
 				parent: None,
-				clauses: BoundClauses::NONE,
+				clauses: PublishedClauses::NONE,
 				reflexive: None,
 			}],
 			frames: vec![FrameClauses {
 				written: AssumptionEnvIdx::ROOT,
 				completion: FrameCompletion::Completed(AssumptionEnvIdx::ROOT),
-				requirements: BoundClauses::NONE,
+				requirements: PublishedClauses::NONE,
 			}],
 		}
 	}
@@ -400,7 +408,7 @@ impl AssumptionEnvArena {
 		);
 		self.envs.push(AssumptionEnv {
 			parent: Some(parent),
-			clauses: BoundClauses::PENDING,
+			clauses: PublishedClauses::PENDING,
 			reflexive,
 		});
 		env
@@ -420,9 +428,9 @@ impl AssumptionEnvArena {
 			written: env,
 			completion: FrameCompletion::Unasked,
 			requirements: if own {
-				BoundClauses::PENDING
+				PublishedClauses::PENDING
 			} else {
-				BoundClauses::NONE
+				PublishedClauses::NONE
 			},
 		});
 	}
@@ -466,8 +474,11 @@ impl AssumptionEnvArena {
 	}
 
 	/// The clauses `frame`'s item states, as written: what a use of it
-	/// proves. `BoundClauses::NONE` for an item that writes no bound.
-	pub(super) fn requirements(&self, frame: GenericEnvIdx) -> BoundClauses {
+	/// proves. `PublishedClauses::NONE` for an item that writes no bound.
+	pub(super) fn requirements(
+		&self,
+		frame: GenericEnvIdx,
+	) -> PublishedClauses {
 		self.frames[usize::from(frame)].requirements
 	}
 
@@ -476,7 +487,7 @@ impl AssumptionEnvArena {
 	pub(super) fn publish(
 		&mut self,
 		frame: GenericEnvIdx,
-		clauses: BoundClauses,
+		clauses: PublishedClauses,
 	) {
 		self.set_requirements(frame, clauses);
 		let env = self.written(frame);
@@ -488,11 +499,11 @@ impl AssumptionEnvArena {
 	pub(super) fn set_requirements(
 		&mut self,
 		frame: GenericEnvIdx,
-		clauses: BoundClauses,
+		clauses: PublishedClauses,
 	) {
 		let entry = &mut self.frames[usize::from(frame)];
 		debug_assert!(
-			matches!(entry.requirements, BoundClauses::Provisional(_)),
+			matches!(entry.requirements, PublishedClauses::Provisional(_)),
 			"only an item with clauses of its own publishes them"
 		);
 		entry.requirements = clauses;
@@ -505,7 +516,7 @@ impl AssumptionEnvArena {
 	pub(super) fn clauses_mut(
 		&mut self,
 		env: AssumptionEnvIdx,
-	) -> &mut BoundClauses {
+	) -> &mut PublishedClauses {
 		&mut self.envs[usize::from(env)].clauses
 	}
 
@@ -520,26 +531,27 @@ impl AssumptionEnvArena {
 	}
 }
 
+/// Every source clause, by `SourceClauseId`.
 #[derive(Default)]
-pub(super) struct BoundArena {
-	bounds: Vec<BoundEntry>,
+pub(super) struct SourceClauseArena {
+	entries: Vec<SourceClauseEntry>,
 }
 
 /// Construction state belongs to the arena, not to a written requirement.
 /// A reservation carries only the identity and location needed by membership
 /// lookup; the AST retains the unresolved binding expressions.
-enum BoundEntry {
+enum SourceClauseEntry {
 	Reserved {
 		trait_index: TraitIdx,
 		span: SourceSpan,
 	},
-	Resolved(SourceTraitBound),
+	Resolved(SourceClause),
 }
 
-impl BoundArena {
-	fn next_id(&self) -> BoundId {
-		BoundId::new(
-			u32::try_from(self.bounds.len())
+impl SourceClauseArena {
+	fn next_id(&self) -> SourceClauseId {
+		SourceClauseId::new(
+			u32::try_from(self.entries.len())
 				.expect("bound arena exceeded u32 index capacity"),
 		)
 	}
@@ -548,45 +560,46 @@ impl BoundArena {
 		&mut self,
 		trait_index: TraitIdx,
 		span: SourceSpan,
-	) -> BoundId {
+	) -> SourceClauseId {
 		let id = self.next_id();
-		self.bounds.push(BoundEntry::Reserved { trait_index, span });
+		self.entries
+			.push(SourceClauseEntry::Reserved { trait_index, span });
 		id
 	}
 
 	#[cfg(test)]
-	pub(super) fn ids(&self) -> impl Iterator<Item = BoundId> + '_ {
-		(0..self.bounds.len()).map(|index| BoundId::new(index as u32))
+	pub(super) fn ids(&self) -> impl Iterator<Item = SourceClauseId> + '_ {
+		(0..self.entries.len()).map(|index| SourceClauseId::new(index as u32))
 	}
 
-	pub(super) fn span(&self, id: BoundId) -> SourceSpan {
-		match &self.bounds[usize::from(id)] {
-			BoundEntry::Reserved { span, .. } => *span,
-			BoundEntry::Resolved(bound) => bound.span,
+	pub(super) fn span(&self, id: SourceClauseId) -> SourceSpan {
+		match &self.entries[usize::from(id)] {
+			SourceClauseEntry::Reserved { span, .. } => *span,
+			SourceClauseEntry::Resolved(bound) => bound.span,
 		}
 	}
 
-	pub(super) fn trait_index(&self, id: BoundId) -> TraitIdx {
-		match &self.bounds[usize::from(id)] {
-			BoundEntry::Reserved { trait_index, .. } => *trait_index,
-			BoundEntry::Resolved(bound) => bound.trait_index,
+	pub(super) fn trait_index(&self, id: SourceClauseId) -> TraitIdx {
+		match &self.entries[usize::from(id)] {
+			SourceClauseEntry::Reserved { trait_index, .. } => *trait_index,
+			SourceClauseEntry::Resolved(bound) => bound.trait_index,
 		}
 	}
 
-	pub(super) fn fill(&mut self, id: BoundId, bound: SourceTraitBound) {
-		let slot = &mut self.bounds[usize::from(id)];
-		let BoundEntry::Reserved { trait_index, span } = slot else {
+	pub(super) fn fill(&mut self, id: SourceClauseId, bound: SourceClause) {
+		let slot = &mut self.entries[usize::from(id)];
+		let SourceClauseEntry::Reserved { trait_index, span } = slot else {
 			panic!("source bounds are immutable after publication")
 		};
 		debug_assert_eq!(*trait_index, bound.trait_index);
 		debug_assert!(*span == bound.span);
-		*slot = BoundEntry::Resolved(bound);
+		*slot = SourceClauseEntry::Resolved(bound);
 	}
 
-	pub(super) fn get(&self, id: BoundId) -> &SourceTraitBound {
-		match &self.bounds[usize::from(id)] {
-			BoundEntry::Resolved(bound) => bound,
-			BoundEntry::Reserved { .. } => {
+	pub(super) fn get(&self, id: SourceClauseId) -> &SourceClause {
+		match &self.entries[usize::from(id)] {
+			SourceClauseEntry::Resolved(bound) => bound,
+			SourceClauseEntry::Reserved { .. } => {
 				panic!("source bound has not finished resolving")
 			}
 		}
@@ -594,14 +607,14 @@ impl BoundArena {
 
 	/// The bound at `id` if it finished resolving: a bound a signature
 	/// cycle cut short stays reserved.
-	pub(super) fn resolved(&self, id: BoundId) -> Option<&SourceTraitBound> {
-		match &self.bounds[usize::from(id)] {
-			BoundEntry::Resolved(bound) => Some(bound),
-			BoundEntry::Reserved { .. } => None,
+	pub(super) fn resolved(&self, id: SourceClauseId) -> Option<&SourceClause> {
+		match &self.entries[usize::from(id)] {
+			SourceClauseEntry::Resolved(bound) => Some(bound),
+			SourceClauseEntry::Reserved { .. } => None,
 		}
 	}
 
-	pub(super) fn binding(&self, reference: BindingRef) -> &SourceAssocBinding {
+	pub(super) fn binding(&self, reference: BindingRef) -> &SourceBinding {
 		&self.get(reference.bound).bindings[reference.index as usize]
 	}
 }
@@ -625,11 +638,11 @@ impl Semantics {
 		strings: &StringInterner,
 		out: &mut Vec<Clause>,
 		subject: TypeIndex,
-		ids: &[BoundId],
+		ids: &[SourceClauseId],
 		name: SymbolU32,
 	) {
 		let mut builder = ValueClauseBuilder {
-			bounds: &self.bounds,
+			source_clauses: &self.source_clauses,
 			clauses: &self.clauses,
 			assumption_envs: &self.assumption_envs,
 			traits: &self.traits,
@@ -652,7 +665,7 @@ impl Semantics {
 			self.diagnostics.push(report_conflicting_assoc_type_binding(
 				strings,
 				&self.decls,
-				&self.bounds,
+				&self.source_clauses,
 				name,
 				conflict,
 			));
@@ -666,7 +679,7 @@ struct AssocBindingConflict {
 	first: BindingRef,
 	second: BindingRef,
 	/// The written bound whose expansion brought the two values together.
-	merge_point: BoundId,
+	merge_point: SourceClauseId,
 }
 
 /// The value pass over written bounds: the clauses resolved values decide,
@@ -675,7 +688,7 @@ struct AssocBindingConflict {
 /// reads finished tables and borrows what it walks. A trait still being built
 /// has no final `Self` clauses yet, and lends none.
 struct ValueClauseBuilder<'a> {
-	bounds: &'a BoundArena,
+	source_clauses: &'a SourceClauseArena,
 	clauses: &'a ClauseArena,
 	assumption_envs: &'a AssumptionEnvArena,
 	traits: &'a [TraitSignature],
@@ -690,8 +703,13 @@ impl ValueClauseBuilder<'_> {
 	/// The equalities and representability clauses the written bound `id`
 	/// states about `subject`, its nested bounds' included, then its trait's
 	/// own, as brought in by `origin`.
-	fn collect(&mut self, subject: TypeIndex, id: BoundId, origin: BoundId) {
-		let bound = self.bounds.get(id);
+	fn collect(
+		&mut self,
+		subject: TypeIndex,
+		id: SourceClauseId,
+		origin: SourceClauseId,
+	) {
+		let bound = self.source_clauses.get(id);
 		for (index, binding) in bound.bindings.iter().enumerate() {
 			let source = BindingRef {
 				bound: id,
@@ -978,7 +996,7 @@ impl<'a> ClauseTables<'a> {
 /// One subject whose clauses can describe a receiver (`declarations_of`).
 #[derive(Clone, Copy)]
 pub(super) struct DeclarationSource {
-	pub(super) clauses: BoundClauses,
+	pub(super) clauses: PublishedClauses,
 	/// For an associated declaration, its trait's `Self` read as the
 	/// projection's base. `None` for a scope's assumption env, whose clauses
 	/// name the receiver in its own terms.
@@ -1080,7 +1098,7 @@ impl Iterator for DeclarationSources<'_, '_> {
 					clauses: self.tables.assoc_types
 						[usize::from(assoc_type_index)]
 					.as_ref()
-					.map_or(BoundClauses::PENDING, |signature| {
+					.map_or(PublishedClauses::PENDING, |signature| {
 						signature.clauses
 					}),
 					context: Some(SelfSubstitution {
@@ -1176,11 +1194,11 @@ impl Readiness {
 	}
 }
 
-impl From<BoundClauses> for Readiness {
-	fn from(clauses: BoundClauses) -> Self {
+impl From<PublishedClauses> for Readiness {
+	fn from(clauses: PublishedClauses) -> Self {
 		match clauses {
-			BoundClauses::Provisional(_) => Readiness::Pending,
-			BoundClauses::Final(_) => Readiness::Ready,
+			PublishedClauses::Provisional(_) => Readiness::Pending,
+			PublishedClauses::Final(_) => Readiness::Ready,
 		}
 	}
 }
@@ -1303,7 +1321,7 @@ pub(super) fn report_duplicate_assoc_type_binding(
 fn report_conflicting_assoc_type_binding(
 	strings: &StringInterner,
 	decls: &Declarations,
-	arena: &BoundArena,
+	arena: &SourceClauseArena,
 	subject: SymbolU32,
 	conflict: AssocBindingConflict,
 ) -> Diagnostic<FileId> {
@@ -1376,10 +1394,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 	fn trait_clause_env(
 		&mut self,
 		sema: &mut Semantics,
-		bound: BoundId,
+		bound: SourceClauseId,
 	) -> Option<GenericEnvIdx> {
-		let trait_index = sema.bounds.trait_index(bound);
-		self.trait_env(sema, trait_index, sema.bounds.span(bound))
+		let trait_index = sema.source_clauses.trait_index(bound);
+		self.trait_env(sema, trait_index, sema.source_clauses.span(bound))
 	}
 
 	/// The frame of `trait_index`, once its signature is available. While it
@@ -1418,8 +1436,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 		sema: &mut Semantics,
 		out: &mut Vec<TraitClause>,
 		subject: TypeIndex,
-		bound: BoundId,
-		origin: BoundId,
+		bound: SourceClauseId,
+		origin: SourceClauseId,
 	) {
 		let Some(env) = self.trait_clause_env(sema, bound) else {
 			return;
@@ -1484,10 +1502,10 @@ mod tests {
 			projection: TypeIndex::UNIT,
 			value,
 			source: BindingRef {
-				bound: BoundId::new(0),
+				bound: SourceClauseId::new(0),
 				index,
 			},
-			origin: BoundId::new(0),
+			origin: SourceClauseId::new(0),
 		}
 	}
 

@@ -415,7 +415,7 @@ impl Semantics {
 								let diagnostic = self.cycle_diagnostic(
 									strings,
 									cycle,
-									self.bounds.span(bound),
+									self.source_clauses.span(bound),
 								);
 								self.diagnostics.push(diagnostic);
 								Ok(())

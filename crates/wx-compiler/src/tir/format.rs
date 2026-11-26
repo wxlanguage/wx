@@ -20,7 +20,7 @@ use std::fmt::Write as _;
 use crate::ast::{Ownership, StringInterner};
 
 use super::clauses::{
-	BindingRequirement, BoundArena, BoundId, SourceTraitBound,
+	BindingRequirement, SourceClause, SourceClauseArena, SourceClauseId,
 };
 use super::decls::{
 	ConstIdx, DeclKind, Declarations, MemberKind, MemberOwner, TraitIdx,
@@ -51,7 +51,7 @@ pub struct TypeFormatter<'a> {
 /// only their originating source occurrences.
 pub struct BoundFormatter<'a> {
 	type_formatter: TypeFormatter<'a>,
-	bounds: &'a BoundArena,
+	source_clauses: &'a SourceClauseArena,
 }
 
 impl Semantics {
@@ -74,7 +74,7 @@ impl Semantics {
 	) -> BoundFormatter<'a> {
 		BoundFormatter {
 			type_formatter: self.type_formatter(strings),
-			bounds: &self.bounds,
+			source_clauses: &self.source_clauses,
 		}
 	}
 }
@@ -83,7 +83,10 @@ impl Semantics {
 	/// The bounds written on `definition`, as written: a type parameter's,
 	/// an associated type declaration's, a trait's or a typeset's
 	/// supertraits. What they imply is left out.
-	pub fn written_bounds(&self, definition: Definition) -> Vec<BoundId> {
+	pub fn written_bounds(
+		&self,
+		definition: Definition,
+	) -> Vec<SourceClauseId> {
 		match definition {
 			Definition::TypeParam { env, index } => {
 				let subject =
@@ -94,7 +97,7 @@ impl Semantics {
 				.assoc_types[usize::from(index)]
 			.as_ref()
 			.map_or_else(Vec::new, |signature| {
-				signature.declared_bounds.to_vec()
+				signature.declared_clauses.to_vec()
 			}),
 			Definition::Item(loc) => match self.declaration_kind(loc) {
 				DeclKind::AssocType(index) => self.written_bounds(
@@ -110,7 +113,10 @@ impl Semantics {
 		}
 	}
 
-	fn supertraits_written_on(&self, trait_index: TraitIdx) -> Vec<BoundId> {
+	fn supertraits_written_on(
+		&self,
+		trait_index: TraitIdx,
+	) -> Vec<SourceClauseId> {
 		let env = self.traits[usize::from(trait_index)].env;
 		self.bounds_written_on(env, self.generic_envs.param_types(env)[0])
 	}
@@ -122,7 +128,7 @@ impl Semantics {
 		&self,
 		env: GenericEnvIdx,
 		subject: TypeIndex,
-	) -> Vec<BoundId> {
+	) -> Vec<SourceClauseId> {
 		let range = self.assumption_envs.requirements(env).range();
 		let mut bounds = Vec::new();
 		for clause in self.clauses.traits(range) {
@@ -138,7 +144,7 @@ impl Semantics {
 }
 
 impl BoundFormatter<'_> {
-	pub fn display_bounds(&self, bounds: &[BoundId]) -> String {
+	pub fn display_bounds(&self, bounds: &[SourceClauseId]) -> String {
 		let mut buffer = String::new();
 		self.write_bounds(&mut buffer, bounds);
 		buffer
@@ -146,8 +152,10 @@ impl BoundFormatter<'_> {
 
 	/// Writes `bounds` joined by ` + `, leaving out one a signature cycle cut
 	/// short.
-	fn write_bounds(&self, f: &mut String, bounds: &[BoundId]) {
-		let resolved = bounds.iter().filter_map(|&id| self.bounds.resolved(id));
+	fn write_bounds(&self, f: &mut String, bounds: &[SourceClauseId]) {
+		let resolved = bounds
+			.iter()
+			.filter_map(|&id| self.source_clauses.resolved(id));
 		for (i, bound) in resolved.enumerate() {
 			if i > 0 {
 				f.push_str(" + ");
@@ -156,7 +164,7 @@ impl BoundFormatter<'_> {
 		}
 	}
 
-	fn write_bound(&self, f: &mut String, bound: &SourceTraitBound) {
+	fn write_bound(&self, f: &mut String, bound: &SourceClause) {
 		let symbol = self.type_formatter.decls.name(bound.trait_index).inner;
 		f.push_str(self.type_formatter.strings.resolve(symbol).unwrap());
 		if bound.bindings.is_empty() {
@@ -609,7 +617,11 @@ mod tests {
 
 		/// The bounds written on `param`, as written: every top-level bound
 		/// between its name and the next parameter's.
-		fn declared_bounds(&self, function: &str, param: &str) -> Vec<BoundId> {
+		fn declared_clauses(
+			&self,
+			function: &str,
+			param: &str,
+		) -> Vec<SourceClauseId> {
 			let (env, index) = self.parameter(function, param);
 			let names = self.sema.generic_envs.param_names(env);
 			let after = names[index].span.end;
@@ -622,19 +634,21 @@ mod tests {
 				self.sema.decls.functions[usize::from(self.function(function))]
 					.loc,
 			);
-			let written: Vec<BoundId> = self
+			let written: Vec<SourceClauseId> = self
 				.sema
-				.bounds
+				.source_clauses
 				.ids()
 				.filter(|&id| {
-					let span = self.sema.bounds.span(id);
+					let span = self.sema.source_clauses.span(id);
 					span.file_id == file_id
 						&& (after..before).contains(&span.span.start)
 				})
 				.collect();
-			let nested: Vec<BoundId> = written
+			let nested: Vec<SourceClauseId> = written
 				.iter()
-				.flat_map(|&id| self.sema.bounds.get(id).bindings.iter())
+				.flat_map(|&id| {
+					self.sema.source_clauses.get(id).bindings.iter()
+				})
 				.flat_map(|binding| match &binding.kind {
 					BindingRequirement::Bound(_, nested) => nested.to_vec(),
 					BindingRequirement::Equals(..)
@@ -770,7 +784,7 @@ mod tests {
 		for (param, expected) in [("T", ""), ("U", "A"), ("V", "B + A + B")] {
 			assert_eq!(
 				formatter
-					.display_bounds(&case.declared_bounds("subject", param)),
+					.display_bounds(&case.declared_clauses("subject", param)),
 				expected
 			);
 		}
@@ -785,7 +799,7 @@ mod tests {
 		"});
 		assert_eq!(
 			case.bound_formatter()
-				.display_bounds(&case.declared_bounds("grow", "S")[..1]),
+				.display_bounds(&case.declared_clauses("grow", "S")[..1]),
 			"Store where { Size: Unsigned }"
 		);
 	}
@@ -805,7 +819,7 @@ mod tests {
 		"});
 		assert_eq!(
 			case.bound_formatter()
-				.display_bounds(&case.declared_bounds("subject", "S")),
+				.display_bounds(&case.declared_clauses("subject", "S")),
 			"Outer where { Item: Inner where { Value = Wrapper<T> } + Leaf, Count = u32 } + Plain"
 		);
 	}

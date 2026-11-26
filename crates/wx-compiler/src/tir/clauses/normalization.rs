@@ -5,8 +5,8 @@
 //! reads the written env; everything after construction reads the completed
 //! one.
 use super::{
-	AssumptionEnvIdx, BoundClauses, Clause, ClauseRange, EqualityClause,
-	FrameCompletion, RepresentableClause, TraitClause, push_trait_clause,
+	AssumptionEnvIdx, Clause, ClauseRange, EqualityClause, FrameCompletion,
+	PublishedClauses, RepresentableClause, TraitClause, push_trait_clause,
 };
 use crate::ast::StringInterner;
 use crate::diagnostics::SourceSpan;
@@ -125,7 +125,7 @@ impl Semantics {
 		} else {
 			let rules = self.assumption_envs.push(parent_env, None);
 			*self.assumption_envs.clauses_mut(rules) =
-				BoundClauses::Final(written_own);
+				PublishedClauses::Final(written_own);
 			rules
 		};
 		self.assumption_envs
@@ -168,7 +168,7 @@ impl Semantics {
 		if !completed.proved.is_empty() {
 			let at = self.clause_span(completed.proved[0]);
 			let proved =
-				BoundClauses::Final(self.clauses.push(&completed.proved));
+				PublishedClauses::Final(self.clauses.push(&completed.proved));
 			if let Err(error) = self
 				.prove_clauses_at_their_bounds(strings, frame, rules, proved)
 			{
@@ -190,7 +190,7 @@ impl Semantics {
 			.collect();
 		let flat = self.assumption_envs.push(AssumptionEnvIdx::ROOT, reflexive);
 		*self.assumption_envs.clauses_mut(flat) =
-			BoundClauses::Final(self.clauses.push(&run));
+			PublishedClauses::Final(self.clauses.push(&run));
 		flat
 	}
 
@@ -459,7 +459,7 @@ impl Semantics {
 	/// Where `clause` is written: its bound, or its binding.
 	fn clause_span(&self, clause: Clause) -> SourceSpan {
 		match clause {
-			Clause::Trait(clause) => self.bounds.span(clause.source),
+			Clause::Trait(clause) => self.source_clauses.span(clause.source),
 			Clause::Equality(EqualityClause { source, .. })
 			| Clause::Representable(RepresentableClause { source, .. }) => {
 				self.binding_span(source)

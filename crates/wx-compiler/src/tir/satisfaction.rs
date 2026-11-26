@@ -15,8 +15,8 @@
 use codespan_reporting::diagnostic::Diagnostic;
 
 use super::clauses::{
-	AssumptionEnvIdx, BoundClauses, BoundId, Clause, EqualityClause,
-	RepresentableClause, TraitClause,
+	AssumptionEnvIdx, Clause, EqualityClause, PublishedClauses,
+	RepresentableClause, SourceClauseId, TraitClause,
 };
 use string_interner::symbol::SymbolU32;
 
@@ -155,7 +155,7 @@ impl Semantics {
 		strings: &StringInterner,
 		frame: GenericEnvIdx,
 		env: AssumptionEnvIdx,
-		proved: BoundClauses,
+		proved: PublishedClauses,
 	) -> Result<(), SolverError> {
 		let arguments: Box<[TypeIndex]> =
 			self.generic_envs.identity_args(frame).into();
@@ -179,7 +179,7 @@ impl Semantics {
 					source,
 					..
 				} => {
-					let at = self.bounds.span(source);
+					let at = self.source_clauses.span(source);
 					if self.types.has_param(reduced) {
 						let trait_name = self.decls.name(trait_index).inner;
 						let clause = format!(
@@ -304,7 +304,7 @@ impl Semantics {
 	/// Where the equality or representability clause `source` is written: from
 	/// its name to its value or type (`Item = u8`, `LEN: u8`).
 	pub(super) fn binding_span(&self, source: BindingRef) -> SourceSpan {
-		let binding = self.bounds.binding(source);
+		let binding = self.source_clauses.binding(source);
 		let (BindingRequirement::Equals(_, value)
 		| BindingRequirement::Representable(_, value)) = &binding.kind
 		else {
@@ -313,7 +313,7 @@ impl Semantics {
 			)
 		};
 		SourceSpan::new(
-			self.bounds.span(source.bound).file_id,
+			self.source_clauses.span(source.bound).file_id,
 			TextSpan::new(binding.name.span.start, value.span.end),
 		)
 	}
@@ -326,8 +326,8 @@ impl Semantics {
 		&mut self,
 		strings: &StringInterner,
 		env: AssumptionEnvIdx,
-		clauses: BoundClauses,
-	) -> Result<(BoundClauses, BoundClauses), SolverError> {
+		clauses: PublishedClauses,
+	) -> Result<(PublishedClauses, PublishedClauses), SolverError> {
 		let Some(range) = clauses.final_range() else {
 			unreachable!("normalized clauses are final")
 		};
@@ -410,8 +410,8 @@ impl Semantics {
 			}
 		}
 		Ok((
-			BoundClauses::Final(self.clauses.push(&assumed)),
-			BoundClauses::Final(self.clauses.push(&other)),
+			PublishedClauses::Final(self.clauses.push(&assumed)),
+			PublishedClauses::Final(self.clauses.push(&other)),
 		))
 	}
 
@@ -715,7 +715,7 @@ impl Semantics {
 		file_id: FileId,
 		argument: Spanned<(TypeIndex, TypeIndex)>,
 		trait_index: TraitIdx,
-		bound_id: BoundId,
+		bound_id: SourceClauseId,
 		owner: GenericEnvOwner,
 	) -> Diagnostic<FileId> {
 		let formatter = self.type_formatter(strings);
@@ -739,16 +739,19 @@ impl Semantics {
 					)),
 			)
 			.with_label(
-				self.bounds.span(bound_id).secondary_label().with_message(
-					// An impl has no name to point at; its bound is shown.
-					match owner.name(&self.decls) {
-						Some(name) => format!(
-							"required by a bound in `{}`",
-							strings.resolve(name.inner).unwrap()
-						),
-						None => "required by this bound".to_owned(),
-					},
-				),
+				self.source_clauses
+					.span(bound_id)
+					.secondary_label()
+					.with_message(
+						// An impl has no name to point at; its bound is shown.
+						match owner.name(&self.decls) {
+							Some(name) => format!(
+								"required by a bound in `{}`",
+								strings.resolve(name.inner).unwrap()
+							),
+							None => "required by this bound".to_owned(),
+						},
+					),
 			)
 	}
 
@@ -773,15 +776,20 @@ impl Semantics {
 			formatter.display_type(found),
 			formatter.display_type(expected),
 		);
-		let ast::Spanned { span, .. } = match self.bounds.binding(source).kind {
-			BindingRequirement::Equals(_, value) => value,
-			BindingRequirement::Bound(..)
-			| BindingRequirement::Representable(..) => {
-				unreachable!("an equality clause comes from a written equality")
-			}
-		};
-		let written =
-			SourceSpan::new(self.bounds.span(source.bound).file_id, span);
+		let ast::Spanned { span, .. } =
+			match self.source_clauses.binding(source).kind {
+				BindingRequirement::Equals(_, value) => value,
+				BindingRequirement::Bound(..)
+				| BindingRequirement::Representable(..) => {
+					unreachable!(
+						"an equality clause comes from a written equality"
+					)
+				}
+			};
+		let written = SourceSpan::new(
+			self.source_clauses.span(source.bound).file_id,
+			span,
+		);
 		Diagnostic::error()
 			.with_code(DiagnosticCode::AssocTypeEqualityMismatch.code())
 			.with_message(format!(
