@@ -529,11 +529,10 @@ impl BodyBuilder<'_, '_> {
 				Type::TypeProjection { .. }
 			) =>
 			{
-				match self.sema.declared_bound_member(
-					self.scope.assumption_env,
-					receiver,
-					key,
-				) {
+				// Selection matches clauses as written.
+				let written =
+					self.sema.assumption_envs.written(self.scope.generic_env);
+				match self.sema.declared_bound_member(written, receiver, key) {
 					MemberLookup::NotFound => {
 						let _ = self.sema.check_projection_member(
 							self.builder.strings,

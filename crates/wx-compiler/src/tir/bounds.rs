@@ -322,15 +322,30 @@ pub(super) struct AssumptionEnv {
 
 /// What a frame's item states (rustc's `predicates_of` and `param_env`,
 /// keyed by the item's frame): `requirements` are its own clauses as
-/// written, which a use proves, and `env` the scope it is read in. The two
-/// runs are the same but for a trait impl function's `Self` entry, whose
-/// clauses are about the impl's target: they are only in `requirements`
-/// until they are normalized, and `env` is then completed with them
-/// (`complete_frame`).
+/// written, which a use proves; `written` is the env construction made for
+/// it, its clauses as written, which path selection reads; `completion` is
+/// the env everything after construction reads, its clauses rewritten by
+/// the equalities in scope (`Semantics::completed_env`). A trait impl
+/// function's `Self` entry is in `requirements` only, never in `written`.
 #[derive(Clone, Copy)]
 struct FrameClauses {
-	env: AssumptionEnvIdx,
+	written: AssumptionEnvIdx,
+	completion: FrameCompletion,
 	requirements: BoundClauses,
+}
+
+/// How far a frame's completed env is (`Semantics::completed_env`).
+#[derive(Clone, Copy)]
+pub(super) enum FrameCompletion {
+	/// Not asked yet: only the written env exists.
+	Unasked,
+	/// Its clauses are being rewritten in `rules`, its rules as written over
+	/// its parent's completed env; a read of the frame meanwhile (a clause
+	/// normalizing back through it) sees `rules`, and the judgement it
+	/// reaches again owns that loop.
+	Rewriting { rules: AssumptionEnvIdx },
+	/// The written env itself, the parent's completed env, or a new flat one.
+	Completed(AssumptionEnvIdx),
 }
 
 /// Every scope's clauses. An item that writes no bound has no env of its
@@ -353,7 +368,8 @@ impl AssumptionEnvArena {
 				reflexive: None,
 			}],
 			frames: vec![FrameClauses {
-				env: AssumptionEnvIdx::ROOT,
+				written: AssumptionEnvIdx::ROOT,
+				completion: FrameCompletion::Completed(AssumptionEnvIdx::ROOT),
 				requirements: BoundClauses::NONE,
 			}],
 		}
@@ -388,7 +404,8 @@ impl AssumptionEnvArena {
 	) {
 		debug_assert_eq!(usize::from(frame), self.frames.len());
 		self.frames.push(FrameClauses {
-			env,
+			written: env,
+			completion: FrameCompletion::Unasked,
 			requirements: if own {
 				BoundClauses::PENDING
 			} else {
@@ -397,25 +414,42 @@ impl AssumptionEnvArena {
 		});
 	}
 
-	/// The env `frame`'s item is read in: its own, or the one it shares.
-	pub(super) fn of_frame(&self, frame: GenericEnvIdx) -> AssumptionEnvIdx {
-		self.frames[usize::from(frame)].env
+	/// The env construction made for `frame`'s item, its clauses as
+	/// written: its own, or the one it shares. Construction and path
+	/// selection read it.
+	pub(super) fn written(&self, frame: GenericEnvIdx) -> AssumptionEnvIdx {
+		self.frames[usize::from(frame)].written
 	}
 
-	/// Reads `frame`'s item in `env` from now on: an env inside its current
-	/// one, holding what construction could not state.
-	pub(super) fn complete_frame(
+	pub(super) fn completion(&self, frame: GenericEnvIdx) -> FrameCompletion {
+		self.frames[usize::from(frame)].completion
+	}
+
+	pub(super) fn set_completion(
 		&mut self,
 		frame: GenericEnvIdx,
-		env: AssumptionEnvIdx,
+		completion: FrameCompletion,
 	) {
-		let entry = &mut self.frames[usize::from(frame)];
-		debug_assert_eq!(
-			self.envs[usize::from(env)].parent,
-			Some(entry.env),
-			"a frame is completed by an env inside its own"
-		);
-		entry.env = env;
+		self.frames[usize::from(frame)].completion = completion;
+	}
+
+	/// `frame`'s completed env, for a reader that runs once every frame is
+	/// complete (bodies, lowering); any other asks
+	/// `Semantics::completed_env`.
+	pub(super) fn completed(&self, frame: GenericEnvIdx) -> AssumptionEnvIdx {
+		match self.frames[usize::from(frame)].completion {
+			FrameCompletion::Completed(env) => env,
+			FrameCompletion::Unasked | FrameCompletion::Rewriting { .. } => {
+				unreachable!(
+					"every frame is complete once declarations are checked"
+				)
+			}
+		}
+	}
+
+	/// The number of frames, for completing each of them.
+	pub(super) fn frame_count(&self) -> usize {
+		self.frames.len()
 	}
 
 	/// The clauses `frame`'s item states, as written: what a use of it
@@ -432,7 +466,7 @@ impl AssumptionEnvArena {
 		clauses: BoundClauses,
 	) {
 		self.set_requirements(frame, clauses);
-		let env = self.of_frame(frame);
+		let env = self.written(frame);
 		self.envs[usize::from(env)].clauses = clauses;
 	}
 

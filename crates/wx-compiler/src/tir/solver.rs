@@ -588,6 +588,9 @@ impl Semantics {
 			.as_ref()
 			.expect("a member with a value has a resolved impl header")
 			.type_params;
+		// Before the judgement starts: completing the impl's env is not part
+		// of judging this value.
+		let completed = self.completed_env(strings, scope);
 		self.solver
 			.verdicts
 			.insert(Definition::Member(member), Verdict::InProgress);
@@ -602,7 +605,7 @@ impl Semantics {
 		});
 		let result = self.normalize(
 			strings,
-			self.assumption_envs.of_frame(scope),
+			completed,
 			value,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
@@ -658,11 +661,7 @@ impl Semantics {
 		// Judged with the verdict already `Resolved`: an instance walk that
 		// normalizes through this member again reads its value, and finiteness
 		// sees the repeat on its own stack.
-		match self.type_is_finite(
-			strings,
-			self.assumption_envs.of_frame(scope),
-			value,
-		) {
+		match self.type_is_finite(strings, completed, value) {
 			Ok(true) => Ok(value),
 			Ok(false) => {
 				self.solver
@@ -1246,7 +1245,7 @@ impl Semantics {
 				return Ok(self.types.intern_const_ref(constant, &args));
 			}
 			// An address, never a count: a length of its type is reported
-			// where it is written (`CheckConstantType`).
+			// where it is written (`TypeObligation::ConstantType`).
 			ResolvedConstant::DataEnd(_) => None,
 		};
 		match value {
@@ -1769,8 +1768,7 @@ impl Semantics {
 		// can target (a tuple, a pointer) is no exception: it has no impl.
 		let mut assumed = Assumption::Unproven;
 		if self.types.is_param_or_projection(receiver) {
-			assumed = self.check_assumed_trait(
-				strings,
+			assumed = self.states_trait(
 				assumption_context,
 				receiver,
 				required_trait,
@@ -1819,8 +1817,7 @@ impl Semantics {
 		if normalized != receiver
 			&& self.types.is_param_or_projection(normalized)
 		{
-			assumed = assumed.max(self.check_assumed_trait(
-				strings,
+			assumed = assumed.max(self.states_trait(
 				assumption_context,
 				normalized,
 				required_trait,
@@ -1952,7 +1949,7 @@ impl Semantics {
 					.intrinsics
 					.stack_value
 					.expect("core declares `StackValue`");
-				if !self.assumes(strings, env, ty.ty(), stack_value)? {
+				if !self.assumes(env, ty.ty(), stack_value)? {
 					return Ok(Some(ty.ty()));
 				}
 			}
@@ -1994,12 +1991,7 @@ impl Semantics {
 		if self.types.is_param_or_projection(ty) {
 			// A symbolic Repr is a finished answer only under evidence of the
 			// bound. Unbounded parameters must not seed the positive cache.
-			return if self.assumes(
-				strings,
-				assumption_context,
-				ty,
-				trait_index,
-			)? {
+			return if self.assumes(assumption_context, ty, trait_index)? {
 				Ok(request.ty)
 			} else {
 				Err(SolverError::Poisoned)
@@ -2173,7 +2165,7 @@ impl Semantics {
 					.intrinsics
 					.stack_value
 					.expect("core declares `StackValue`");
-				if self.assumes(strings, env, ty.ty(), stack_value)? {
+				if self.assumes(env, ty.ty(), stack_value)? {
 					out.push(ty.ty());
 					Ok(true)
 				} else {
@@ -2342,17 +2334,9 @@ impl Semantics {
 				else {
 					return Ok(Some(TypeIndex::UNIT));
 				};
-				if self.assumes(
-					strings,
-					assumption_context,
-					pointee,
-					stack_value,
-				)? || self.assumes(
-					strings,
-					assumption_context,
-					pointee,
-					array,
-				)? {
+				if self.assumes(assumption_context, pointee, stack_value)?
+					|| self.assumes(assumption_context, pointee, array)?
+				{
 					Ok(Some(TypeIndex::UNIT))
 				} else {
 					Ok(None)
@@ -2362,21 +2346,15 @@ impl Semantics {
 		}
 	}
 
-	/// Whether the facts in scope prove `ty: required` (`check_assumed_trait`);
+	/// Whether the facts in scope prove `ty: required` (`states_trait`);
 	/// `Pending` while a table they come from is unfinished.
 	fn assumes(
-		&mut self,
-		strings: &StringInterner,
+		&self,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		required: TraitIdx,
 	) -> Result<bool, SolverError> {
-		match self.check_assumed_trait(
-			strings,
-			assumption_context,
-			ty,
-			required,
-		)? {
+		match self.states_trait(assumption_context, ty, required)? {
 			Assumption::Holds => Ok(true),
 			Assumption::Unproven => Ok(false),
 			Assumption::Pending => Err(SolverError::Pending),
@@ -2425,75 +2403,6 @@ impl Semantics {
 			Readiness::Pending => Ok(Assumption::Pending),
 			Readiness::Overflowed => Err(SolverError::Overflow),
 		}
-	}
-
-	/// Whether the facts in scope prove `ty: required`: stated of `ty`
-	/// (`states_trait`), or stated of another subject that means what `ty`
-	/// means, by assumed equalities: `T::Item: Marker` with `T::Item = U`
-	/// proves `U: Marker`. Only an abstract `ty` with an abstract meaning
-	/// takes the latter. A concrete one has its traits from impls alone, so a
-	/// clause whose subject means `i32`, or `<P as Container>::Item`, proves
-	/// nothing about it, and the answer for it never depends on
-	/// `assumption_context`.
-	///
-	/// Declaration bounds are not lent through an equality: `Item = U` with
-	/// `type Item: Marker` does not make `U: Marker`, which must be written.
-	///
-	/// Comparison reduces assumed equalities only, so it cannot depend on impl
-	/// dispatch. Completing envs replaces it
-	/// (`notes/member-selection-and-equalities.md`, decision 2).
-	pub(super) fn check_assumed_trait(
-		&mut self,
-		strings: &StringInterner,
-		assumption_context: AssumptionEnvIdx,
-		ty: TypeIndex,
-		required: TraitIdx,
-	) -> Result<Assumption, SolverError> {
-		let stated = self.states_trait(assumption_context, ty, required)?;
-		if stated == Assumption::Holds || !self.types.is_abstract(ty) {
-			return Ok(stated);
-		}
-		let mut answer = stated;
-		let subjects: Vec<TypeIndex> = self
-			.clause_tables()
-			.assumed_subjects(assumption_context, required)
-			.collect();
-		if subjects.is_empty() {
-			return Ok(answer);
-		}
-		let meaning = match self.normalize(
-			strings,
-			assumption_context,
-			ty,
-			NormalizationDepth::Deep,
-			RewriteFlags::EQUALITIES,
-		) {
-			Ok(meaning) => meaning,
-			Err(SolverError::Pending) => return Ok(Assumption::Pending),
-			Err(error) => return Err(error),
-		};
-		if !self.types.is_abstract(meaning) {
-			return Ok(answer);
-		}
-		for subject in subjects {
-			match self.normalize(
-				strings,
-				assumption_context,
-				subject,
-				NormalizationDepth::Deep,
-				RewriteFlags::EQUALITIES,
-			) {
-				Ok(candidate) if candidate == meaning => {
-					return Ok(Assumption::Holds);
-				}
-				Ok(_) => {}
-				Err(SolverError::Pending) => {
-					answer = answer.max(Assumption::Pending);
-				}
-				Err(error) => return Err(error),
-			}
-		}
-		Ok(answer)
 	}
 
 	/// Whether an impl header's complete target matches `receiver` with
@@ -2603,7 +2512,7 @@ impl Semantics {
 		if *self.solver.verdict(Definition::Requirements(impl_kind))
 			== Verdict::InProgress
 		{
-			if assumption_context == self.assumption_envs.of_frame(impl_env)
+			if assumption_context == self.completed_env(strings, impl_env)
 				&& *args == *self.generic_envs.identity_args(impl_env)
 			{
 				self.solver.reenter_requirements(impl_kind)?;
@@ -2626,7 +2535,7 @@ impl Semantics {
 	/// the definitions alone and is memoized whoever asks first. A loop is a
 	/// selection of the impl's own instantiation while this judgement runs
 	/// (`reenter_requirements`); the verdict keeps a loop it owns, at the bound
-	/// it closed in, for the impl's check to report (`CheckImplRequirements`),
+	/// it closed in, for the impl's check to report (`TypeObligation::ImplRequirements`),
 	/// and every reader of a failed verdict fails silently.
 	///
 	/// Whether the requirements hold there is no part of the verdict: in its
@@ -2662,6 +2571,8 @@ impl Semantics {
 		}
 		.ok_or(SolverError::Pending)?;
 		let args = self.generic_envs.identity_args(impl_env).to_vec();
+		// Before the judgement starts, as for a member's value.
+		let completed = self.completed_env(strings, impl_env);
 		self.solver.verdicts.insert(definition, Verdict::InProgress);
 		let index = self.solver.state.frames.len();
 		self.solver.state.frames.push(SolverFrame::Requirements {
@@ -2674,7 +2585,7 @@ impl Semantics {
 		});
 		let result = self.prove_requirements(
 			strings,
-			self.assumption_envs.of_frame(impl_env),
+			completed,
 			impl_env,
 			&args,
 			Some(index),

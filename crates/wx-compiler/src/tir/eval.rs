@@ -1596,11 +1596,9 @@ impl Semantics {
 		};
 		// Elements whose bytes are not known yet (of an abstract type) cannot
 		// be written.
-		let (layout, places) = match self.memory_values(
-			strings,
-			self.assumption_envs.of_frame(body_env(self, owner)),
-			of,
-		) {
+		let completed = self.completed_env(strings, body_env(self, owner));
+		let (layout, places) = match self.memory_values(strings, completed, of)
+		{
 			Ok(Some(layout)) => layout,
 			Ok(None) => {
 				return Err(Halt::Own(EvalError {
@@ -1668,7 +1666,7 @@ impl Semantics {
 		ty: TypeIndex,
 		span: TextSpan,
 	) -> Result<(MemoryIdx, Primitive), Halt> {
-		let scope = self.assumption_envs.of_frame(body_env(self, owner));
+		let scope = self.completed_env(strings, body_env(self, owner));
 		let Type::Pointer { memory, .. } = *self.types.resolve(ty) else {
 			unreachable!("static data is behind a pointer")
 		};
@@ -1722,9 +1720,10 @@ impl Semantics {
 		length: TypeIndex,
 	) -> Result<u64, Halt> {
 		let env = body_env(self, owner);
+		let completed = self.completed_env(strings, env);
 		match self.normalize(
 			strings,
-			self.assumption_envs.of_frame(env),
+			completed,
 			length,
 			NormalizationDepth::Shallow,
 			RewriteFlags::ALL,
@@ -1756,9 +1755,10 @@ impl Semantics {
 				args: owner.args,
 			},
 		);
+		let completed = self.completed_env(strings, env);
 		self.normalize(
 			strings,
-			self.assumption_envs.of_frame(env),
+			completed,
 			ty,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
@@ -2000,12 +2000,8 @@ impl Semantics {
 		let (ty, scope) = (signature.ty, signature.env);
 		let ty = self.instance_type(strings, owner, ty);
 		let mut scalars = Vec::new();
-		self.root_scalars(
-			strings,
-			self.assumption_envs.of_frame(scope),
-			ty,
-			&mut scalars,
-		)?;
+		let completed = self.completed_env(strings, scope);
+		self.root_scalars(strings, completed, ty, &mut scalars)?;
 		Ok(scalars)
 	}
 

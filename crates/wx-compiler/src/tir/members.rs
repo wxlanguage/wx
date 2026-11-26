@@ -456,7 +456,7 @@ impl Semantics {
 					Type::TypeProjection { .. }
 				) =>
 			{
-				obligations.push(TypeObligation::CheckProjectionMember {
+				obligations.push(TypeObligation::ProjectionMember {
 					frame: scope.generic_env,
 					projection: current,
 					key,
@@ -560,7 +560,7 @@ impl Semantics {
 		);
 		// Naming the member does not need an impl; whether `receiver`
 		// implements the trait is the declaration check's question.
-		obligations.push(TypeObligation::CheckTraitMembership {
+		obligations.push(TypeObligation::TraitMembership {
 			frame,
 			subject: receiver,
 			required: required_trait,
@@ -672,9 +672,10 @@ impl Semantics {
 		span: TextSpan,
 	) -> Result<TraitImplLookup, ()> {
 		let reference = SourceSpan::new(file_id, span);
+		let completed = self.completed_env(strings, frame);
 		match self.find_trait_impl_query(
 			strings,
-			self.assumption_envs.of_frame(frame),
+			completed,
 			receiver,
 			required_trait,
 		) {
@@ -703,7 +704,7 @@ impl Semantics {
 			Err(SolverError::Pending) => {
 				// A qualified member already has a declaration identity.
 				// Membership is checked before the owning query completes.
-				obligations.push(TypeObligation::CheckTraitMembership {
+				obligations.push(TypeObligation::TraitMembership {
 					frame,
 					subject: receiver,
 					required: required_trait,
@@ -1278,7 +1279,7 @@ impl Semantics {
 		else {
 			return Vec::new();
 		};
-		let assumption_env = self.assumption_envs.of_frame(env);
+		let assumption_env = self.completed_env(strings, env);
 		let mut found = Vec::new();
 		if receiver == TypeIndex::ERROR {
 			return found;
@@ -1779,9 +1780,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 				continue;
 			}
 			let key = BindingKey::ty(segment.ident.inner);
+			// Selection matches clauses as written, in a body too.
+			let written = sema.assumption_envs.written(scope.generic_env);
 			let lookup = self.select_associated_type(
 				sema,
-				scope.assumption_env,
+				written,
 				current,
 				key,
 				SourceSpan::new(scope.file_id, segment.ident.span),
@@ -1808,7 +1811,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			};
 			// Selection named the trait without matching an impl; that
 			// the receiver implements it is the declaration check's question.
-			obligations.push(TypeObligation::CheckTraitMembership {
+			obligations.push(TypeObligation::TraitMembership {
 				frame: scope.generic_env,
 				subject: current,
 				required: trait_index,
@@ -1896,13 +1899,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 			return Some((constant, impl_args));
 		}
 		let reference = SourceSpan::new(scope.file_id, segment.ident.span);
-		let lookup = self.select_associated_type(
-			sema,
-			scope.assumption_env,
-			receiver,
-			key,
-			reference,
-		);
+		let written = sema.assumption_envs.written(scope.generic_env);
+		let lookup = self
+			.select_associated_type(sema, written, receiver, key, reference);
 		let ApplicableMember::AbstractTraitMember {
 			trait_index,
 			declaration,
@@ -1929,7 +1928,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			);
 			return None;
 		};
-		obligations.push(TypeObligation::CheckTraitMembership {
+		obligations.push(TypeObligation::TraitMembership {
 			frame: scope.generic_env,
 			subject: receiver,
 			required: trait_index,

@@ -1,7 +1,7 @@
 # Member selection and equalities
 
 Status: both decided 2026-11-26. Decision 1 implemented; decision 2
-(option C, with its design points) not implemented.
+(option C) stage 1 implemented, stages 2 and 3 open.
 
 Signature construction records types as written: a constant in a type stays
 a reference, a projection keeps its written receiver, and every check is an
@@ -56,7 +56,7 @@ where it comes from:
 - A concrete head (`Need<T::Item>::Output`) selects by its constructor,
   whatever its arguments.
 - The help comes from the check construction already defers for a
-  projection whose bounds supply nothing (`CheckProjectionMember`, run once
+  projection whose bounds supply nothing (`TypeObligation::ProjectionMember`, run once
   every signature exists): it normalizes the projection and names its
   value, then each trait of the value that declares the member. The same
   rule held already for a value reached through an impl's definition
@@ -350,6 +350,143 @@ and whether declared bounds reach through an equality.
 9. **Conformance compares completed clauses** on both sides: the impl
    member's, and the trait member's contract instantiated for the target.
    Follows from 5: a clause exists only in normal form.
+
+#### Design (2026-11-26)
+
+**A demand-driven query per frame.** Completing a frame normalizes its
+clauses, and the solver reads other frames' envs while it does (an impl
+member's value is judged in the impl's env, impl requirements are proved
+there, constants evaluate in their owner's, finiteness reads each struct's).
+A pass in frame order would let an earlier frame read a later one's written
+env and cache the answer: order-dependent, and silent. So whoever needs a
+frame's completed env asks for it:
+
+```rust
+enum FrameCompletion {
+    /// Not asked yet: only the written env exists.
+    Unasked,
+    /// Its clauses are being rewritten; asking again closes a cycle.
+    InProgress,
+    /// The written env itself, the parent's completed env, or a new flat one.
+    Completed(AssumptionEnvIdx),
+}
+struct FrameClauses {
+    written: AssumptionEnvIdx,
+    completion: FrameCompletion,
+    requirements: BoundClauses,
+}
+```
+
+`Semantics::completed_env(strings, frame) -> Result<AssumptionEnvIdx,
+SolverError>` asks for the parent first, completes the frame, and records
+it. A frame's own completion normalizes in its scratch env and never asks
+for itself, so `InProgress` is reached only across frames: a cycle,
+reported at the bound being rewritten. `check_declarations` asks for each
+entry's frame before its obligations, as it asks `struct_is_finite`, so
+every completion runs and reports in entry order. This replaces the
+`NormalizeSelfEntry` obligation.
+
+**Written and completed envs are both kept.** Path selection (decision 1)
+matches the receiver as written against clauses as written, so it reads the
+frame's `written` env, in bodies too; otherwise `T::Item::Output` would
+resolve in a signature and fail in a body, where `T::Item: Project` reads
+`U: Project`. The solver (normalization, proofs, walks) reads the completed
+env. Construction reads only `written`; every reader after it asks the
+query.
+
+**Completing a frame `F`**, with `P` its parent's completed env:
+
+| `F` | `F`'s completed env |
+|---|---|
+| adds no facts | reuse `P` |
+| nothing in scope rewrites | its written env |
+| anything else | a new flat env: every clause in scope, rewritten |
+
+"Nothing rewrites" is decided cheaply first: no equality in scope and no
+clause about a type not rooted at a parameter. Otherwise a scratch env
+holds `F`'s written clauses chained to `P`; each clause, inherited or own,
+is rewritten (a trait or constant clause's subject and an equality's value
+in the scratch env, an equality's projection in `P`), classified, checked
+for duplicates and conflicts, and pushed as one run with no parent,
+carrying the trait's `Self: Trait` along. A flat env copies the parent's
+facts rather than chaining to them: copies exist only where facts change,
+and one rule ("a completed env that differs is flat and holds everything")
+is simpler to state, test, and read. Readers are unaffected either way:
+every reader already walks `parent`. rustc's `param_env` is the same shape,
+one normalized list per item with its parents' predicates in it.
+
+**What happens to a rewritten clause:**
+
+| Clause | Result |
+|---|---|
+| abstract subject | kept |
+| no parameter (`i32: Marker`) | proved at the bound: dropped, or reported |
+| equality, projection still abstract | kept, value rewritten |
+| equality on a projection an inherited one fixes differently | conflict at the child |
+| declared bound through an equality (`type Item: Marker`, `Item = U`) | adds `U: Marker` |
+| a parameter, not abstract (`Wrap<T>: Eq`) | E2085 until stage 2 |
+
+**Stages:**
+
+1. The query, the written/completed split, flat envs, equality rules,
+   conflicts and duplicates, lent declared bounds; `check_assumed_trait`
+   becomes `states_trait` (source 3 and its scan removed), and
+   `NormalizeSelfEntry` goes; conformance builds its contract env in the
+   impl's completed env.
+2. A subject that is not abstract becomes the requirements of the impl that
+   matches, replacing E2085; mostly worth it with general `where` clauses.
+3. `RewriteFlags` becomes normalization with or without values: nothing
+   normalizes with `EQUALITIES` alone once source 3 is gone.
+
+**Stage 1 as built** (`tir/completion.rs`). What implementing it settled:
+
+- An equality of the frame's own about the frame's own parameters keeps
+  its projection as written: the parent knows nothing about them, and the
+  frame's own rules must not apply. One about anything else (a parent's
+  parameter, a trait impl's target) is read over the parent's completed
+  env. `P: Pointer` brings `<P as StackValue>::Repr = ..`, which stays as
+  written.
+- The frame's rules are read in its written env when its parent was kept,
+  which is already its rules over its parent's completed env; only under a
+  replaced parent is one env pushed, its written clauses over the parent's
+  completed env. A `Self` entry is in neither: about a trait impl's target,
+  lookup never matches it as written.
+- A clause part whose normalization fails keeps its written form: its
+  failure is reported at the clause (a cycle, an overflow) or where it
+  belongs (`Poisoned`), and a completed env never loses a fact.
+- Constant bodies are built before any frame is complete, so building one
+  reads the written env (`written_owner_scope`), as it read the signature
+  env before; checking them reads the completed one.
+- A frame is read again while its clauses are rewritten when one of them
+  normalizes back through it: `impl<T: Loop where { Out = <S<T> as
+  Loop>::Out }> Loop for S<T>` selects itself, and proving its requirements
+  asks for its env. The read sees the rules being rewritten against
+  (`FrameCompletion::Rewriting { rules }`), and the judgement reached again
+  (here the impl's requirements) owns the loop and reports it once (E2073);
+  completion reports nothing of its own.
+- A child's equality on a projection its parent fixes is reported by the
+  equality rule itself: the projection, read over the parent's completed
+  env, reduces to the parent's value and is compared (E2083). Two of a
+  frame's own equalities that become different only once their values are
+  rewritten stay ambiguous, as two competing equalities do, rather than
+  reported.
+- A lent bound whose subject rewrites to a concrete type is proved at the
+  declared bound (`type Item: Marker`), not at the equality that lent it.
+- A trait's own clauses are completed too: `trait E: A where { X = u32 } +
+  A where { X: Mark }` reports `u32: Mark` at the bound when no impl gives
+  it, where before the bound was ignored.
+- `TypeObligation`'s variants lost their `Check` prefix once
+  `NormalizeSelfEntry` was gone.
+
+**Future: interning envs.** A parameter is `Type::TypeParam { env,
+param_index }`, so every frame has its own parameter types and two items'
+clauses almost never coincide; interning envs would share nothing, and
+flat envs are copied. rustc names a parameter by position (`ParamTy {
+index, name }`), so `T: Clone` in two impls is the same clause, and its
+`caller_bounds` are an interned list shared by every item with the same
+bounds. If wx's parameters stop depending on their frame, interning
+completed envs becomes worth it and the copies become shared. That change
+to `TypeParam` needs its own design and implementation pass.
 
 Why lookup carries evidence today: it was added in September
 (`tir-assumption-context-plan.md`, checkpoint 3), before any env was

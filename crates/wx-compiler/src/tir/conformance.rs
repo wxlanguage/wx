@@ -82,7 +82,7 @@ impl Semantics {
 		target: TypeIndex,
 	) -> Result<AssumptionEnvIdx, SolverError> {
 		let env = self.functions[usize::from(function)].type_params;
-		let impl_env = self.impl_env(function);
+		let impl_env = self.impl_env(strings, function);
 		let declaration_env =
 			self.functions[usize::from(declaration)].type_params;
 		let requirements = self.own_requirements(declaration_env);
@@ -104,7 +104,7 @@ impl Semantics {
 	/// `clauses`, written in `env`'s chain, with that chain's parameters
 	/// replaced by `arguments`: a new run, the written bounds they come from
 	/// kept.
-	fn instantiate_clauses(
+	pub(super) fn instantiate_clauses(
 		&mut self,
 		clauses: BoundClauses,
 		env: GenericEnvIdx,
@@ -172,7 +172,7 @@ impl Semantics {
 		// that is not abstract holds or not of its own, and is checked where
 		// it is written (`normalize_self_entry`). Each is read where the
 		// function is written, not under the contract's assumptions.
-		let impl_env = self.impl_env(function);
+		let impl_env = self.impl_env(strings, function);
 		let (clauses, _) =
 			self.normalize_clauses(strings, impl_env, requirements)?;
 		let arguments: Box<[TypeIndex]> =
@@ -236,7 +236,11 @@ impl Semantics {
 	/// the trait's or impl's around it, which a function without its own
 	/// parameters is read in.
 	/// The env of the impl `function` is written in.
-	fn impl_env(&self, function: FunctionIdx) -> AssumptionEnvIdx {
+	fn impl_env(
+		&mut self,
+		strings: &StringInterner,
+		function: FunctionIdx,
+	) -> AssumptionEnvIdx {
 		let env = self.functions[usize::from(function)].type_params;
 		let impl_frame = match self.generic_envs.owner(env) {
 			GenericEnvOwner::Function(_) => self
@@ -245,7 +249,7 @@ impl Semantics {
 				.expect("a function's own frame has its impl's around it"),
 			_ => env,
 		};
-		self.assumption_envs.of_frame(impl_frame)
+		self.completed_env(strings, impl_frame)
 	}
 
 	/// What `frame`'s function itself states: nothing when it has no frame
@@ -960,9 +964,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 		// bounds assumed.
 		let trait_env = sema.traits[usize::from(trait_index)].env;
 		let args = sema.generic_args.push([(target.inner, target.span)]);
+		let completed = sema.completed_env(self.strings, scope);
 		let result = sema.check_bound_requirements(
 			self.strings,
-			sema.assumption_envs.of_frame(scope),
+			completed,
 			BoundRequirements::Frame {
 				env: trait_env,
 				args,
@@ -982,7 +987,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			else {
 				continue;
 			};
-			// The value's own judgement (`CheckAssocValue`) reports a value
+			// The value's own judgement (`TypeObligation::AssocValue`) reports a value
 			// that has no meaning; one the impl omits with no default is
 			// reported missing above.
 			let value = match sema.assoc_value(
@@ -1020,9 +1025,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 					}
 					_ => at_target,
 				};
+			let completed = sema.completed_env(self.strings, scope);
 			let result = sema.check_bound_requirements(
 				self.strings,
-				sema.assumption_envs.of_frame(scope),
+				completed,
 				BoundRequirements::AssociatedType {
 					declaration: declaration_index,
 					trait_index,
@@ -1401,16 +1407,17 @@ impl<'ast> SemanticsBuilder<'ast> {
 				args: &[target],
 			},
 		);
+		let completed = sema.completed_env(self.strings, env);
 		let expected = sema.normalize(
 			self.strings,
-			sema.assumption_envs.of_frame(env),
+			completed,
 			expected,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
 		)?;
 		let found = sema.normalize(
 			self.strings,
-			sema.assumption_envs.of_frame(env),
+			completed,
 			found,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,

@@ -315,9 +315,10 @@ impl Semantics {
 		{
 			return Ok(expansion);
 		}
-		let env = self
-			.assumption_envs
-			.of_frame(self.structs[usize::from(struct_index)].type_params);
+		let env = self.completed_env(
+			strings,
+			self.structs[usize::from(struct_index)].type_params,
+		);
 		self.judge(strings, StepOwner::Definition(struct_index), env, start)
 	}
 
@@ -724,7 +725,7 @@ impl Semantics {
 		match owner {
 			StepOwner::Definition(struct_index) => self
 				.assumption_envs
-				.of_frame(self.structs[usize::from(struct_index)].type_params),
+				.completed(self.structs[usize::from(struct_index)].type_params),
 			StepOwner::Instance(key) => key.env,
 		}
 	}

@@ -48,7 +48,7 @@ impl Semantics {
 		reference: SourceSpan,
 		owner: GenericEnvOwner,
 	) {
-		obligations.push(TypeObligation::CheckBounds {
+		obligations.push(TypeObligation::Bounds {
 			frame,
 			requirements,
 			reference,
@@ -144,22 +144,19 @@ impl Semantics {
 
 /// The checks bound satisfaction owns, run by the declaration check.
 impl Semantics {
-	/// Completes `frame`'s env with what its `Self` entry, `clauses` about a
-	/// trait impl's target, means (`normalize_clauses`). What is not about an
-	/// abstract type is proved there and dropped. One that does not hold is
-	/// reported at its bound: an error without a parameter (`Bytes: Show`
-	/// never holds), and unsupported with one (`Wrap<T>: Show` would be an
+	/// Proves `proved`, clauses of `frame` that completing its env found not
+	/// to be about an abstract type, in `env`, and reports each that does not
+	/// hold at its bound: an error without a parameter (`Bytes: Show` never
+	/// holds), and unsupported with one (`Wrap<T>: Show` would be an
 	/// assumption about a type that is not abstract, which lookup never
 	/// reads).
-	pub(super) fn normalize_self_entry(
+	pub(super) fn prove_clauses_at_their_bounds(
 		&mut self,
 		strings: &StringInterner,
 		frame: GenericEnvIdx,
-		clauses: BoundClauses,
+		env: AssumptionEnvIdx,
+		proved: BoundClauses,
 	) -> Result<(), SolverError> {
-		let env = self.assumption_envs.of_frame(frame);
-		let (assumed, proved) =
-			self.normalize_clauses(strings, env, clauses)?;
 		let arguments: Box<[TypeIndex]> =
 			self.generic_envs.identity_args(frame).into();
 		let mut failures = Vec::new();
@@ -266,12 +263,6 @@ impl Semantics {
 				}
 			};
 			self.diagnostics.push(diagnostic);
-		}
-
-		if !assumed.is_empty() {
-			let completed = self.assumption_envs.push(env, None);
-			*self.assumption_envs.clauses_mut(completed) = assumed;
-			self.assumption_envs.complete_frame(frame, completed);
 		}
 		Ok(())
 	}
@@ -1078,7 +1069,7 @@ mod tests {
 				self.sema.functions[usize::from(function_index)].type_params;
 			let param =
 				self.sema.types.intern(Type::TypeParam { env, param_index });
-			(param, self.sema.assumption_envs.of_frame(env))
+			(param, self.sema.assumption_envs.completed(env))
 		}
 
 		/// Whether `receiver` implements `required_trait` under `env`.

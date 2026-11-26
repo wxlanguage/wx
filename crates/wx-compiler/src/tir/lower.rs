@@ -9854,7 +9854,7 @@ mod tests {
 		let reported = sema.diagnostics().len();
 		let take = free_function(&sema, &strings, "take");
 		let signature = &sema.functions[usize::from(take)];
-		let env = sema.assumption_envs.of_frame(signature.type_params);
+		let env = sema.assumption_envs.completed(signature.type_params);
 		let item = sema.types.list(signature.param_types)[0];
 		assert!(sema.types.has_projection(item));
 		let symbol = strings.get("WIDTH").unwrap();
