@@ -15200,6 +15200,50 @@ pub(super) mod tests {
 	}
 
 	#[test]
+	fn a_loop_through_stack_value_repr_is_reported_once() {
+		// No definition owns it: the first request to find it reports it, and
+		// the use asks the same request again.
+		let case = TestCase::new(indoc! {"
+			struct A(x: u32, y: <A as StackValue>::Repr);
+			func f(a: A) {}
+		"});
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicAssociatedType]);
+		case.diagnostics().assert_error_saying(
+			"cycle detected when normalizing `<A as StackValue>::Repr`",
+		);
+	}
+
+	#[test]
+	fn a_repr_loop_reached_inside_another_request_is_reported_once() {
+		// `B`'s representation reaches `A`'s loop while its own is in flight.
+		let case = TestCase::new(indoc! {"
+			struct A(x: u32, y: <A as StackValue>::Repr);
+			struct B(a: A);
+			func f(b: B) {}
+		"});
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicAssociatedType]);
+	}
+
+	#[test]
+	fn a_repr_loop_written_in_a_self_type_is_reported_once() {
+		// The written type's own checks find it before the receiver check,
+		// which stays silent.
+		let case = TestCase::new(indoc! {"
+			impl A {
+				func m(self: <A as StackValue>::Repr) {}
+			}
+			struct A(x: u32, y: <A as StackValue>::Repr);
+		"});
+
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::CyclicAssociatedType]);
+	}
+
+	#[test]
 	fn an_impl_requirement_naming_a_concrete_instantiation_is_owned_by_the_impl()
 	 {
 		// Only `S<u8>` loops, but judging the impl's own requirements reaches

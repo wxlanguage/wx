@@ -1049,12 +1049,7 @@ mod tests {
 			"struct A(y: <B as StackValue>::Repr);\nstruct B(a: A);",
 			"struct B(a: A);\nstruct A(y: <B as StackValue>::Repr);",
 		] {
-			check(source, |_, diagnostics| {
-				diagnostics.assert_error(DiagnosticCode::CyclicAssociatedType);
-				diagnostics.assert_absent(
-					DiagnosticCode::RecursiveTypeWithoutIndirection,
-				);
-			});
+			assert_codes(source, &[DiagnosticCode::CyclicAssociatedType]);
 		}
 	}
 

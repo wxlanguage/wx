@@ -481,12 +481,11 @@ pub(super) struct Solver {
 	/// configuration, not state; only tests change it.
 	pub(super) recursion_limit: usize,
 	pub(super) state: SolverState,
-	/// Only `Ok` answers are stored. `Pending` means a fact is not final yet,
+	/// Each request's final answer. `Pending` means a fact is not final yet,
 	/// and `Poisoned` is not a permanent verdict (a budget overflow can be
-	/// retried), so neither is remembered. Every
-	/// stored answer was final when computed, so no "facts are final" switch is
-	/// needed.
-	pub(super) normalized: FxHashMap<Normalization, TypeIndex>,
+	/// retried), so neither is remembered. Every stored answer was final when
+	/// computed, so no "facts are final" switch is needed.
+	pub(super) normalized: FxHashMap<Normalization, Normalized>,
 	/// The verdict on each definition asked about; absent is `Unchecked`. A
 	/// definition is `InProgress` exactly while its judgement's frame
 	/// (`SolverFrame::Judgement`, `SolverFrame::Requirements`) is on the stack.
@@ -814,6 +813,20 @@ impl Normalization {
 	}
 }
 
+/// A request's final answer (`Solver::normalized`). `TypeIndex` has no
+/// niche yet, so this is twice its size; once it has one, `Cyclic` takes it.
+#[derive(Clone, Copy)]
+pub(super) enum Normalized {
+	/// Its normal form, read only by a request with nothing in flight: a
+	/// nested one could skip a cycle through a frame open now.
+	Type(TypeIndex),
+	/// It requires itself through projections alone: a loop no definition
+	/// owns, so no verdict holds it. It follows from the request alone, so it
+	/// is read at any depth, and answers `Poisoned`: the request that found it
+	/// reported it.
+	Cyclic,
+}
+
 /// How far into a type a normalization reduces.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum NormalizationDepth {
@@ -1089,11 +1102,18 @@ impl Semantics {
 			facts,
 		);
 		let frame = self.solver.state.frames.len();
-		if frame == 0
-			&& let Some(&normalized) =
-				self.solver.normalized.get(&normalization)
-		{
-			return Ok(normalized);
+		match self.solver.normalized.get(&normalization).copied() {
+			// Unless a tautology is unwinding past it, which needs the frames
+			// it reads marked (`normalize_uncached`).
+			Some(Normalized::Cyclic)
+				if self.solver.state.blocked_at.is_none() =>
+			{
+				return Err(SolverError::Poisoned);
+			}
+			Some(Normalized::Type(normalized)) if frame == 0 => {
+				return Ok(normalized);
+			}
+			_ => {}
 		}
 		let outer_read = std::mem::replace(
 			&mut self.solver.state.lowest_frame_read,
@@ -1111,10 +1131,20 @@ impl Semantics {
 		// A request that started with nothing in flight leaves nothing behind.
 		debug_assert!(frame != 0 || self.solver.state.frames.is_empty());
 		debug_assert!(frame != 0 || self.solver.state.blocked_at.is_none());
-		if lowest_read >= frame
-			&& let Ok(normalized) = result
-		{
-			self.solver.normalized.insert(normalization, normalized);
+		if lowest_read >= frame {
+			match result {
+				Ok(normalized) => {
+					self.solver
+						.normalized
+						.insert(normalization, Normalized::Type(normalized));
+				}
+				Err(SolverError::Cycle(ref cycle)) if cycle.owner.is_none() => {
+					self.solver
+						.normalized
+						.insert(normalization, Normalized::Cyclic);
+				}
+				Err(_) => {}
+			}
 		}
 		result
 	}
