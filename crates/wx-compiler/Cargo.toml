@@ -29,6 +29,10 @@ name = "parser"
 harness = false
 required-features = ["bench"]
 
+[[bench]]
+name = "check"
+harness = false
+
 [dependencies]
 codespan-reporting = { workspace = true, features = ["serialization"] }
 leb128fmt = "0.1.0"

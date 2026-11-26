@@ -1,0 +1,271 @@
+// Stress for associated types: projections through bounds, equality clauses
+// that rewrite one projection to another, chains of projections, and impls
+// whose associated types are themselves generic.
+
+trait Container: StackValue {
+    type Item: StackValue;
+    func get(self: Self, index: u32) -> Self::Item;
+    func size(self: Self) -> u32;
+}
+
+trait Mapper: StackValue {
+    type In: StackValue;
+    type Out: StackValue;
+    func apply(self: Self, value: Self::In) -> Self::Out;
+}
+
+trait Reducer: StackValue {
+    type Acc: StackValue;
+    type Value: StackValue;
+    func start(self: Self) -> Self::Acc;
+    func step(self: Self, acc: Self::Acc, value: Self::Value) -> Self::Acc;
+}
+
+struct Repeat<T>(value: T, count: u32);
+struct Range(from: u32, to: u32);
+struct Mapped<C, M>(source: C, mapper: M);
+struct Zipped<A, B>(left: A, right: B);
+struct Both<A, B>(a: A, b: B);
+
+impl<T: StackValue> Container for Repeat<T> {
+    type Item = T;
+
+    func get(self: Self, index: u32) -> T {
+        _ = index;
+        self.value
+    }
+
+    func size(self: Self) -> u32 {
+        self.count
+    }
+}
+
+impl Container for Range {
+    type Item = u32;
+
+    func get(self: Self, index: u32) -> u32 {
+        self.from + index
+    }
+
+    func size(self: Self) -> u32 {
+        self.to - self.from
+    }
+}
+
+impl<
+    C: Container,
+    M: Mapper where { In = C::Item },
+> Container for Mapped<C, M> {
+    type Item = M::Out;
+
+    func get(self: Self, index: u32) -> M::Out {
+        self.mapper.apply(self.source.get(index))
+    }
+
+    func size(self: Self) -> u32 {
+        self.source.size()
+    }
+}
+
+impl<A: Container, B: Container> Container for Zipped<A, B> {
+    type Item = Both<A::Item, B::Item>;
+
+    func get(self: Self, index: u32) -> Both<A::Item, B::Item> {
+        Both{ a: self.left.get(index), b: self.right.get(index) }
+    }
+
+    func size(self: Self) -> u32 {
+        self.left.size().min(self.right.size())
+    }
+}
+
+struct Double();
+struct Widen();
+struct Half();
+struct Sum2();
+struct Compose<F, G>(f: F, g: G);
+
+impl Mapper for Double {
+    type In = u32;
+    type Out = u32;
+
+    func apply(self: Self, value: u32) -> u32 {
+        value * 2
+    }
+}
+
+impl Mapper for Widen {
+    type In = u32;
+    type Out = u64;
+
+    func apply(self: Self, value: u32) -> u64 {
+        u64_extend_u32(value)
+    }
+}
+
+impl Mapper for Half {
+    type In = u64;
+    type Out = u64;
+
+    func apply(self: Self, value: u64) -> u64 {
+        value / 2
+    }
+}
+
+impl Mapper for Sum2 {
+    type In = Both<u64, u64>;
+    type Out = u64;
+
+    func apply(self: Self, value: Both<u64, u64>) -> u64 {
+        value.a + value.b
+    }
+}
+
+impl<F: Mapper, G: Mapper where { In = F::Out }> Mapper for Compose<F, G> {
+    type In = F::In;
+    type Out = G::Out;
+
+    func apply(self: Self, value: F::In) -> G::Out {
+        self.g.apply(self.f.apply(value))
+    }
+}
+
+struct Add64();
+struct Count<T>(unused: T);
+
+impl Reducer for Add64 {
+    type Acc = u64;
+    type Value = u64;
+
+    func start(self: Self) -> u64 {
+        0
+    }
+
+    func step(self: Self, acc: u64, value: u64) -> u64 {
+        acc + value
+    }
+}
+
+impl<T: StackValue> Reducer for Count<T> {
+    type Acc = u32;
+    type Value = T;
+
+    func start(self: Self) -> u32 {
+        0
+    }
+
+    func step(self: Self, acc: u32, value: T) -> u32 {
+        _ = value;
+        acc + 1
+    }
+}
+
+func map<C: Container, M: Mapper where { In = C::Item }>(
+    source: C,
+    mapper: M,
+) -> Mapped<C, M> {
+    Mapped{ source, mapper }
+}
+
+func reduce<C: Container, R: Reducer where { Value = C::Item }>(
+    source: C,
+    reducer: R,
+) -> R::Acc {
+    loop (acc = reducer.start(), i: u32 = 0) {
+        if (i == source.size()) { break acc };
+        (reducer.step(acc, source.get(i)), i + 1)
+    }
+}
+
+func then<F: Mapper, G: Mapper where { In = F::Out }>(
+    f: F,
+    g: G,
+) -> Compose<F, G> {
+    Compose{ f, g }
+}
+
+func map_twice<
+    C: Container,
+    F: Mapper where { In = C::Item },
+    G: Mapper where { In = F::Out },
+>(source: C, f: F, g: G) -> Mapped<Mapped<C, F>, G> {
+    map(map(source, f), g)
+}
+
+func sum_of<C: Container where { Item = u64 }>(source: C) -> u64 {
+    reduce(source, Add64{})
+}
+
+func first_of<C: Container, D: Container where { Item = C::Item }>(
+    c: C,
+    d: D,
+) -> Both<C::Item, D::Item> {
+    Both{ a: c.get(0), b: d.get(0) }
+}
+
+func same_items<
+    A: Container,
+    B: Container where { Item = A::Item },
+    C: Container where { Item = B::Item },
+>(a: A, b: B, c: C) -> u32 {
+    local x: A::Item = b.get(0);
+    local y: B::Item = c.get(0);
+    local z: C::Item = a.get(0);
+    reduce(a, Count{ unused: x })
+        + reduce(b, Count{ unused: y })
+        + reduce(c, Count{ unused: z })
+}
+
+pub func pipeline_a(n: u32) -> u64 {
+    local r = Range{ from: 0, to: n };
+    local doubled = map(r, Double{});
+    local wide = map(doubled, Widen{});
+    local halved = map(wide, Half{});
+    sum_of(halved) + sum_of(map_twice(r, Widen{}, Half{}))
+}
+
+pub func pipeline_b(n: u32) -> u64 {
+    local r = Range{ from: 1, to: n };
+    local f = then(then(Double{}, Double{}), then(Widen{}, Half{}));
+    local g = then(f, Half{});
+    sum_of(map(r, f))
+        + sum_of(map(r, g))
+        + sum_of(map(Repeat{ value: n / 3, count: n }, g))
+}
+
+pub func pipeline_c(n: u32) -> u64 {
+    local r = Range{ from: 0, to: n };
+    local left = map(r, then(Double{}, Widen{}));
+    local right = map(Repeat{ value: n + 7, count: n }, Widen{});
+    local zipped = Zipped{ left, right };
+    sum_of(map(zipped, Sum2{})) + sum_of(map(map(zipped, Sum2{}), Half{}))
+}
+
+pub func pipeline_d(n: u32) -> u32 {
+    local r = Range{ from: 0, to: n };
+    local d = map(r, Double{});
+    local dd = map(d, Double{});
+    local both = first_of(d, dd);
+    same_items(r, d, dd)
+        + same_items(dd, map(dd, Double{}), Repeat{ value: both.a, count: n })
+}
+
+pub func pipeline_e(n: u32) -> u64 {
+    local r = Range{ from: 0, to: n };
+    local z1 = Zipped{
+        left: map(r, Widen{}),
+        right: map(map(r, Double{}), Widen{}),
+    };
+    local z2 = Zipped{
+        left: map(z1, Sum2{}),
+        right: map(z1, then(Sum2{}, Half{})),
+    };
+    local z3 = Zipped{
+        left: map(z2, Sum2{}),
+        right: map(z2, then(Sum2{}, Half{})),
+    };
+    sum_of(map(z3, Sum2{}))
+        + u64_extend_u32(reduce(z3, Count{ unused: z3.get(0) }))
+        + pipeline_a(n)
+        + pipeline_c(n)
+}

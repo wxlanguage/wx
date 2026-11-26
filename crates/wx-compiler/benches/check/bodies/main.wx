@@ -1,0 +1,178 @@
+// Stress for function bodies: long chains of arithmetic over inferred
+// literals, loops carrying tuple state, matches, memory reads and writes,
+// and method calls on primitives.
+
+#[memory_limits{ min_pages: 1 }]
+memory heap: u32;
+
+enum Op(value: u32) {
+    Add = 0,
+    Sub = 1,
+    Mul = 2,
+    Xor = 3,
+    Shift = 4,
+}
+
+struct Vec3(x: f64, y: f64, z: f64);
+
+impl Vec3 {
+    #[inline]
+    func add(self: Self, o: Self) -> Self {
+        Self{ x: self.x + o.x, y: self.y + o.y, z: self.z + o.z }
+    }
+
+    #[inline]
+    func sub(self: Self, o: Self) -> Self {
+        Self{ x: self.x - o.x, y: self.y - o.y, z: self.z - o.z }
+    }
+
+    #[inline]
+    func mul(self: Self, k: f64) -> Self {
+        Self{ x: self.x * k, y: self.y * k, z: self.z * k }
+    }
+
+    #[inline]
+    func dot(self: Self, o: Self) -> f64 {
+        self.x * o.x + self.y * o.y + self.z * o.z
+    }
+
+    #[inline]
+    func cross(self: Self, o: Self) -> Self {
+        Self{
+            x: self.y * o.z - self.z * o.y,
+            y: self.z * o.x - self.x * o.z,
+            z: self.x * o.y - self.y * o.x,
+        }
+    }
+
+    #[inline]
+    func length(self: Self) -> f64 {
+        self.dot(self).sqrt()
+    }
+}
+
+func apply(op: Op, a: u32, b: u32) -> u32 {
+    match (op) {
+        Op::Add => a + b,
+        Op::Sub => a - b,
+        Op::Mul => a * b,
+        Op::Xor => a ^ b,
+        Op::Shift => (a << (b & 31)) | (a >> (32 - (b & 31))),
+    }
+}
+
+func op_of(n: u32) -> Op {
+    match (n % 5) {
+        0 => Op::Add,
+        1 => Op::Sub,
+        2 => Op::Mul,
+        3 => Op::Xor,
+        _ => Op::Shift,
+    }
+}
+
+pub func mix(seed: u32, rounds: u32) -> u32 {
+    loop (a = seed, b = seed ^ 0x9e3779b9, c: u32 = 0x85ebca6b, i: u32 = 0) {
+        if (i == rounds) { break a ^ b ^ c };
+        local x = apply(op_of(a), b, c);
+        local y = apply(op_of(b), c, x);
+        local z = apply(op_of(c), x, y);
+        local t = (x * 31 + y * 17 + z * 13) ^ (x >> 7) ^ (y << 9) ^ (z >> 3);
+        local u = (t & 0xffff) * 0x45d9f3b + (t >> 16);
+        local v = if (u % 2 == 0) { u / 2 } else { u * 3 + 1 };
+        (b ^ v, c + t, a - u, i + 1)
+    }
+}
+
+pub func checksum(base: u32, len: u32) -> u32 {
+    local data: heap::*[u32] = slice_from_parts_mut(transmute(base), len);
+    loop (i: u32 = 0) {
+        if (i == len) { break };
+        data[i] = mix(i, 4) ^ (i * 2654435761);
+        continue i + 1;
+    }
+    loop (s1: u32 = 1, s2: u32 = 0, i: u32 = 0) {
+        if (i == len) { break (s2 << 16) | s1 };
+        local s1 = (s1 + data[i]) % 65521;
+        local s2 = (s2 + s1) % 65521;
+        (s1, s2, i + 1)
+    }
+}
+
+pub func sort(base: u32, len: u32) {
+    local data: heap::*[i64] = slice_from_parts_mut(transmute(base), len);
+    loop (i: u32 = 1) {
+        if (i >= len) { break };
+        local key = data[i];
+        local stop: u32 = loop (j: u32 = i) {
+            if (j == 0) { break 0 };
+            if (data[j - 1] <= key) { break j };
+            data[j] = data[j - 1];
+            continue j - 1;
+        };
+        data[stop] = key;
+        continue i + 1;
+    }
+}
+
+pub func geometry(n: f64) -> f64 {
+    loop (
+        acc = Vec3{ x: 0.0, y: 0.0, z: 0.0 },
+        total: f64 = 0.0,
+        f: f64 = 0.0,
+    ) {
+        if (f >= n) { break total + acc.length() };
+        local a = Vec3{ x: f, y: f * 0.5, z: f * 0.25 };
+        local b = Vec3{ x: 1.0 - f, y: 2.0 + f, z: f * f };
+        local c = a.cross(b).add(a.mul(0.5)).sub(b.mul(0.25));
+        local d = c.cross(a).cross(b);
+        local area = a.sub(b).cross(c.sub(b)).length() * 0.5;
+        local angle = a.dot(b) / (a.length() * b.length() + 1.0);
+        local next = acc.add(d.mul(angle)).sub(c.mul(area));
+        (next, total + area * angle + d.dot(c).abs().sqrt(), f + 1.0)
+    }
+}
+
+pub func clamp_all(lo: i32, hi: i32, n: i32) -> i32 {
+    loop (sum: i32 = 0, i: i32 = 0) {
+        if (i == n) { break sum };
+        local a = (i * 7919).clamp(lo, hi);
+        local b = (i * -104729).clamp(lo, hi).max(a);
+        local c = (a - b).min(b - a).max(lo);
+        local order: i32 = match (a.cmp(b)) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        };
+        (sum + a + b + c + order, i + 1)
+    }
+}
+
+pub func parse_digits(base: u32, len: u32) -> i64 {
+    local text: heap::&[u8] = slice_from_parts(transmute(base), len);
+    loop (value: i64 = 0, sign: i64 = 1, i: u32 = 0) {
+        if (i == len) { break value * sign };
+        local byte = text[i];
+        match (byte) {
+            0x2d => continue (value, -1, i + 1),
+            0x30 | 0x31 | 0x32 | 0x33 | 0x34 | 0x35 | 0x36 | 0x37 | 0x38 | 0x39 => {
+                local digit = i64_extend_i32(
+                    transmute::<_, i32>(transmute::<u8, u32>(byte)) - 0x30,
+                );
+                continue (value * 10 + digit, sign, i + 1)
+            },
+            0x5f => continue (value, sign, i + 1),
+            _ => break value * sign,
+        }
+    }
+}
+
+pub func everything(seed: u32) -> f64 {
+    local a = mix(seed, 16);
+    local b = checksum(1024, 64);
+    sort(4096, 32);
+    local c = parse_digits(8192, 12);
+    local d = clamp_all(-100, 100, 50);
+    local g = geometry(100.0);
+    if ((a ^ b) == 0 && c == 0 && d == 0) { g } else { g * 2.0 }
+}
