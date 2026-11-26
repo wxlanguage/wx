@@ -1,7 +1,7 @@
 # Member selection and equalities
 
-Status: both decided 2026-11-26 (decision 2: option C, with its design
-points), not implemented.
+Status: both decided 2026-11-26. Decision 1 implemented; decision 2
+(option C, with its design points) not implemented.
 
 Signature construction records types as written: a constant in a type stays
 a reference, a projection keeps its written receiver, and every check is an
@@ -55,11 +55,15 @@ where it comes from:
 
 - A concrete head (`Need<T::Item>::Output`) selects by its constructor,
   whatever its arguments.
-- The help reads the written equality for exactly that projection
-  (`Solver::projection_equality`), on the error path only: no normalization,
-  nothing stored. Left out when the equality is `Pending` or ambiguous.
-- `T::A::new` behaves the same: an abstract receiver has no inherent
-  functions, so the trait lookup fails and the help applies.
+- The help comes from the check construction already defers for a
+  projection whose bounds supply nothing (`CheckProjectionMember`, run once
+  every signature exists): it normalizes the projection and names its
+  value, then each trait of the value that declares the member. The same
+  rule held already for a value reached through an impl's definition
+  (`Wrapper::Item::Value` must be qualified); equalities now join it.
+- Constants (`T::A::LEN`) and inherent functions (`T::A::new`) behave the
+  same: the check covers both tiers, and a value whose only such member is
+  inherent gets the help without a trait to qualify.
 
 Why: construction then normalizes nothing, so it cannot reach impl values,
 compiler-answered values, field walks, or constant evaluation over
@@ -89,15 +93,23 @@ path it allows is redundant.
 Consequences:
 
 - `select_associated_type` and `select_inherent_member` drop their
-  normalization.
+  normalization; a body's value path (`T::A::new()`) selects off a
+  projection through its declared bounds only, before the shared lookup
+  that normalizes (`resolve_applicable_member`, which method calls on
+  values keep using).
+- Selection that waited for a sibling's equality (`Need<T::B>::Output`
+  with `B = i32` in the same `where`) no longer does: a written head selects
+  by its constructor, and checking normalizes the rest. "Depends on
+  unfinished bounds" remains only for a receiver read while its own clauses
+  are provisional (`T::B::Output` in `T`'s own `where`).
 - An inherent impl for specific arguments (`impl Need<i32>`) is not matched
   through an equality (`Need<T::Item>::new` with `Item = i32`). Nothing
   relies on it; if something does later, argument matching can move to
   checking.
-- Selection asks `check_assumed_trait` for an abstract receiver, and its
-  third source compares by equalities too (decision 2). Under this decision
-  selection takes only the first two: stated on the receiver's path, or of
-  the receiver as written.
+- Selection asks `Semantics::states_trait` for an abstract receiver: only
+  the first two sources of `check_assumed_trait`, stated on the receiver's
+  path or of the receiver as written. The third, comparing by equalities,
+  stays for checking until decision 2 replaces it.
 
 Not decided here: requiring the trait to be named for a projection off a
 concrete type (`<S as Tr>::A`), so adding another trait with an `A` later

@@ -521,6 +521,32 @@ impl BodyBuilder<'_, '_> {
 				learned = Some(impl_args);
 				MemberLookup::Found(found)
 			}
+			// A path's projection receiver selects through its declared
+			// bounds only, never through its value, as a type path does
+			// (`notes/member-selection-and-equalities.md`).
+			None if matches!(
+				self.sema.types.resolve(receiver),
+				Type::TypeProjection { .. }
+			) =>
+			{
+				match self.sema.declared_bound_member(
+					self.scope.assumption_env,
+					receiver,
+					key,
+				) {
+					MemberLookup::NotFound => {
+						let _ = self.sema.check_projection_member(
+							self.builder.strings,
+							self.scope.assumption_env,
+							receiver,
+							key,
+							reference,
+						);
+						return None;
+					}
+					lookup => lookup,
+				}
+			}
 			None => self.sema.resolve_applicable_member(
 				self.builder.strings,
 				self.scope.assumption_env,

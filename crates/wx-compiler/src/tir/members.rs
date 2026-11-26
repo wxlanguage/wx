@@ -446,20 +446,20 @@ impl Semantics {
 			MemberLookup::Stuck(_) => {}
 			// No name is written (`T::` unfinished): the parser reported it.
 			MemberLookup::NotFound if segment.is_missing() => {}
-			// A projection's declared bounds are only half of what it can
-			// have: its value may be a type that does. That takes impls, so
-			// the declaration check decides what to say.
+			// Its value may have the member, which is never selected through
+			// it but says how to write the path; finding the value takes
+			// equalities and impls, so the declaration check decides what to
+			// say.
 			MemberLookup::NotFound
-				if key.tier == Tier::Type
-					&& matches!(
-						self.types.resolve(current),
-						Type::TypeProjection { .. }
-					) =>
+				if matches!(
+					self.types.resolve(current),
+					Type::TypeProjection { .. }
+				) =>
 			{
 				obligations.push(TypeObligation::CheckProjectionMember {
 					frame: scope.generic_env,
 					projection: current,
-					name: segment.ident.inner,
+					key,
 					reference,
 				});
 			}
@@ -1678,21 +1678,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 			MemberLookup::NotFound => {}
 			found => return found,
 		}
-		// Only assumed equalities may rewrite the receiver here, so a concrete
-		// head can come from evidence in scope but never from selecting an impl.
-		let receiver = match sema.normalize(
-			self.strings,
-			assumption_context,
-			receiver,
-			NormalizationDepth::Deep,
-			RewriteFlags::EQUALITIES,
-		) {
-			Ok(receiver) => receiver,
-			Err(error) => return error.into(),
-		};
-		if receiver == TypeIndex::ERROR {
-			return MemberLookup::Error;
-		}
+		// The receiver as written: what it is equal to never selects a member
+		// (`notes/member-selection-and-equalities.md`).
 		let mut traits = Vec::new();
 		let mut readiness = Readiness::Ready;
 		if !sema.types.is_abstract(receiver) {
@@ -1722,8 +1709,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					Err(lookup) => return lookup,
 				};
 			for trait_index in scoped {
-				match sema.check_assumed_trait(
-					self.strings,
+				match sema.states_trait(
 					assumption_context,
 					receiver,
 					trait_index,
@@ -2006,17 +1992,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		key: BindingKey,
 	) -> Option<(MemberKind, Vec<TypeIndex>)> {
 		let reference = SourceSpan::new(scope.file_id, segment.ident.span);
-		// Only assumed equalities may rewrite the receiver here, as for an
-		// associated type; a failure is the trait selection's to report.
-		let receiver = sema
-			.normalize(
-				self.strings,
-				scope.assumption_env,
-				receiver,
-				NormalizationDepth::Deep,
-				RewriteFlags::EQUALITIES,
-			)
-			.ok()?;
+		// The receiver as written, as for an associated type.
 		let target = ImplTarget::from_type(sema.types.resolve(receiver))?;
 		let wanted: Vec<_> = sema
 			.impl_dispatch

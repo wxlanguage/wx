@@ -2383,35 +2383,23 @@ impl Semantics {
 		}
 	}
 
-	/// Whether the facts in scope prove `ty: required`, from three sources:
+	/// Whether the facts in scope state `ty: required` of `ty` as written:
 	///
 	/// 1. a declaration on `ty`'s own path states it (`type Item: Marker`);
-	/// 2. a clause in scope states it of `ty` as written;
-	/// 3. a clause states it of another subject that means what `ty` means,
-	///    by assumed equalities: `T::Item: Marker` with `T::Item = U` proves
-	///    `U: Marker`.
+	/// 2. a clause in scope states it of `ty` as written.
 	///
-	/// The first holds wherever `ty` is used; the other two are the scope's
-	/// own, and only an abstract `ty` with an abstract meaning takes them. A
-	/// concrete one has its traits from impls alone, so a clause whose subject
-	/// means `i32`, or `<P as Container>::Item`, proves nothing about it, and
-	/// the answer for it never depends on `assumption_context`.
-	///
-	/// Declaration bounds are not lent through an equality: `Item = U` with
-	/// `type Item: Marker` does not make `U: Marker`, which must be written.
-	///
-	/// Comparison reduces assumed equalities only, so it cannot depend on impl
-	/// dispatch. It reads finished declaration bounds and never demands one:
-	/// an unfinished table is `Assumption::Pending`, never an error.
-	pub(super) fn check_assumed_trait(
-		&mut self,
-		strings: &StringInterner,
+	/// The first holds wherever `ty` is used; the second is the scope's own,
+	/// and only an abstract `ty` takes it. Nothing is normalized, so a member
+	/// is selected by this alone (`notes/member-selection-and-equalities.md`).
+	/// It reads finished declaration bounds and never demands one: an
+	/// unfinished table is `Assumption::Pending`, never an error.
+	pub(super) fn states_trait(
+		&self,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		required: TraitIdx,
 	) -> Result<Assumption, SolverError> {
 		let tables = self.clause_tables();
-		// 1. Declared on `ty`'s own path.
 		let mut declared = tables.declared_traits(
 			&self.types,
 			assumption_context,
@@ -2425,51 +2413,11 @@ impl Semantics {
 		if self.types.is_abstract(ty) {
 			readiness =
 				readiness.and(tables.assumptions_readiness(assumption_context));
-			// 2. Stated of `ty` itself.
 			if tables
 				.assumed_subjects(assumption_context, required)
 				.any(|subject| subject == ty)
 			{
 				return Ok(Assumption::Holds);
-			}
-			// 3. Stated of another subject with the same, abstract, meaning.
-			let subjects: Vec<TypeIndex> = tables
-				.assumed_subjects(assumption_context, required)
-				.collect();
-			if !subjects.is_empty() {
-				let meaning = match self.normalize(
-					strings,
-					assumption_context,
-					ty,
-					NormalizationDepth::Deep,
-					RewriteFlags::EQUALITIES,
-				) {
-					Ok(meaning) => meaning,
-					Err(SolverError::Pending) => {
-						return Ok(Assumption::Pending);
-					}
-					Err(error) => return Err(error),
-				};
-				if self.types.is_abstract(meaning) {
-					for subject in subjects {
-						match self.normalize(
-							strings,
-							assumption_context,
-							subject,
-							NormalizationDepth::Deep,
-							RewriteFlags::EQUALITIES,
-						) {
-							Ok(candidate) if candidate == meaning => {
-								return Ok(Assumption::Holds);
-							}
-							Ok(_) => {}
-							Err(SolverError::Pending) => {
-								readiness = readiness.and(Readiness::Pending)
-							}
-							Err(error) => return Err(error),
-						}
-					}
-				}
 			}
 		}
 		match readiness {
@@ -2477,6 +2425,75 @@ impl Semantics {
 			Readiness::Pending => Ok(Assumption::Pending),
 			Readiness::Overflowed => Err(SolverError::Overflow),
 		}
+	}
+
+	/// Whether the facts in scope prove `ty: required`: stated of `ty`
+	/// (`states_trait`), or stated of another subject that means what `ty`
+	/// means, by assumed equalities: `T::Item: Marker` with `T::Item = U`
+	/// proves `U: Marker`. Only an abstract `ty` with an abstract meaning
+	/// takes the latter. A concrete one has its traits from impls alone, so a
+	/// clause whose subject means `i32`, or `<P as Container>::Item`, proves
+	/// nothing about it, and the answer for it never depends on
+	/// `assumption_context`.
+	///
+	/// Declaration bounds are not lent through an equality: `Item = U` with
+	/// `type Item: Marker` does not make `U: Marker`, which must be written.
+	///
+	/// Comparison reduces assumed equalities only, so it cannot depend on impl
+	/// dispatch. Completing envs replaces it
+	/// (`notes/member-selection-and-equalities.md`, decision 2).
+	pub(super) fn check_assumed_trait(
+		&mut self,
+		strings: &StringInterner,
+		assumption_context: AssumptionEnvIdx,
+		ty: TypeIndex,
+		required: TraitIdx,
+	) -> Result<Assumption, SolverError> {
+		let stated = self.states_trait(assumption_context, ty, required)?;
+		if stated == Assumption::Holds || !self.types.is_abstract(ty) {
+			return Ok(stated);
+		}
+		let mut answer = stated;
+		let subjects: Vec<TypeIndex> = self
+			.clause_tables()
+			.assumed_subjects(assumption_context, required)
+			.collect();
+		if subjects.is_empty() {
+			return Ok(answer);
+		}
+		let meaning = match self.normalize(
+			strings,
+			assumption_context,
+			ty,
+			NormalizationDepth::Deep,
+			RewriteFlags::EQUALITIES,
+		) {
+			Ok(meaning) => meaning,
+			Err(SolverError::Pending) => return Ok(Assumption::Pending),
+			Err(error) => return Err(error),
+		};
+		if !self.types.is_abstract(meaning) {
+			return Ok(answer);
+		}
+		for subject in subjects {
+			match self.normalize(
+				strings,
+				assumption_context,
+				subject,
+				NormalizationDepth::Deep,
+				RewriteFlags::EQUALITIES,
+			) {
+				Ok(candidate) if candidate == meaning => {
+					return Ok(Assumption::Holds);
+				}
+				Ok(_) => {}
+				Err(SolverError::Pending) => {
+					answer = answer.max(Assumption::Pending);
+				}
+				Err(error) => return Err(error),
+			}
+		}
+		Ok(answer)
 	}
 
 	/// Whether an impl header's complete target matches `receiver` with

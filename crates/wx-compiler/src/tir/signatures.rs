@@ -14073,7 +14073,12 @@ pub(super) mod tests {
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::TypeMemberNeedsQualification]);
 		let notes = &case.sema.diagnostics[0].notes;
-		assert_eq!(notes.len(), 2, "{notes:?}");
+		// The value first, then each trait.
+		assert_eq!(notes.len(), 3, "{notes:?}");
+		assert_eq!(
+			notes[0],
+			"`<Wrapper as Container>::Item` is `Inner` here: write `Inner::Value`"
+		);
 		for trait_name in ["Element", "Measure"] {
 			assert!(
 				notes.iter().any(|note| note.contains(&format!(
@@ -16773,6 +16778,121 @@ pub(super) mod tests {
 		}
 	}
 
+	/// A member is selected off the receiver as written: from bounds declared
+	/// for it, or its head constructor, never through an equality
+	/// (`notes/member-selection-and-equalities.md`).
+	mod member_selection_on_written_receivers {
+		use super::*;
+
+		const PRELUDE: &str = "memory heap: u32;\n\
+			trait Tr { type A; }\n\
+			trait Tr2 { type Inner: StackValue; const LEN: u32; }\n\
+			struct W();\n\
+			impl Tr2 for W { type Inner = u8; const LEN: u32 = 4; }\n\
+			impl W { func new() -> W { W() } }\n";
+
+		fn case(source: &str) -> TestCase {
+			TestCase::new(&format!("{PRELUDE}{source}"))
+		}
+
+		#[test]
+		fn an_associated_type_is_not_selected_through_an_equality() {
+			let case = case("func f<T: Tr where { A = W }>(x: T::A::Inner) {}");
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::TypeMemberNeedsQualification]);
+			case.diagnostics().assert_error_saying(
+				"`<T as Tr>::A` is `W` here: write `W::Inner`",
+			);
+		}
+
+		#[test]
+		fn an_equality_to_a_parameter_names_the_parameter() {
+			let case = case(
+				"func f<T: Tr where { A = U }, U: Tr2>(x: T::A::Inner) {}",
+			);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::TypeMemberNeedsQualification]);
+			case.diagnostics().assert_error_saying(
+				"`<T as Tr>::A` is `U` here: write `U::Inner`",
+			);
+		}
+
+		#[test]
+		fn an_associated_constant_is_not_selected_through_an_equality() {
+			let case = case(
+				"func f<T: Tr where { A = W }>(x: heap::&[u8; T::A::LEN]) {}",
+			);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::TypeMemberNeedsQualification]);
+			case.diagnostics().assert_error_saying(
+				"`<T as Tr>::A` is `W` here: write `W::LEN`",
+			);
+		}
+
+		#[test]
+		fn a_bound_selects_the_member_whatever_the_equality() {
+			let mut case = case(
+				"func f<T: Tr where { A = W } + Tr where { A: Tr2 }>(x: T::A::Inner) {}",
+			);
+			case.diagnostics().assert_none();
+			assert_eq!(case.normalized_param("f", 0), TypeIndex::U8);
+		}
+
+		#[test]
+		fn a_qualified_path_names_the_trait() {
+			let mut case = case(
+				"func f<T: Tr where { A = W }>(x: <T::A as Tr2>::Inner) {}",
+			);
+			case.diagnostics().assert_none();
+			assert_eq!(case.normalized_param("f", 0), TypeIndex::U8);
+		}
+
+		#[test]
+		fn a_projection_with_no_bound_and_no_equality_has_no_help() {
+			let case = case("func f<T: Tr>(x: T::A::Inner) {}");
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::NotATraitMember]);
+			assert!(
+				case.diagnostics().all().iter().all(|d| d
+					.notes
+					.iter()
+					.all(|note| !note.contains("write"))),
+				"{}",
+				case.diagnostics().render()
+			);
+		}
+
+		#[test]
+		fn a_path_in_a_body_follows_the_same_rule() {
+			let case = case(
+				"func f<T: Tr where { A = W }>() { local y: T::A::Inner = 0; }",
+			);
+			case.diagnostics()
+				.assert_codes(&[DiagnosticCode::TypeMemberNeedsQualification]);
+			case.diagnostics().assert_error_saying(
+				"`<T as Tr>::A` is `W` here: write `W::Inner`",
+			);
+		}
+
+		#[test]
+		fn an_inherent_function_is_not_selected_through_an_equality() {
+			let case = case(
+				"func f<T: Tr where { A = W }>() { local w: W = T::A::new(); }",
+			);
+			case.diagnostics().assert_error_saying(
+				"`<T as Tr>::A` is `W` here: write `W::new`",
+			);
+		}
+
+		#[test]
+		fn a_value_of_the_projection_uses_its_normal_form() {
+			let case = case(
+				"func f<T: Tr where { A = W }>(x: T::A) -> W { local y: T::A = W(); y }",
+			);
+			case.diagnostics().assert_none();
+		}
+	}
+
 	mod contextual_members {
 		use super::*;
 		use crate::tir::members::{
@@ -16781,21 +16901,29 @@ pub(super) mod tests {
 		};
 
 		#[test]
-		fn equivalent_subjects_support_unqualified_and_qualified_members() {
+		fn an_equal_subject_supports_only_the_qualified_member() {
+			// `Item: Project` is stated of `T::Item`, not of `U`: the
+			// unqualified `U::Output` selects nothing, the qualified one names
+			// the trait, and checking proves `U: Project` through `Item = U`.
 			let case = TestCase::checked(indoc! {"
                 trait Project { type Output: StackValue; }
                 trait Container { type Item; }
                 func f<T: Container where { Item = U } + Container where { Item: Project }, U>(x: U::Output, y: <U as Project>::Output) {}
             "});
-			assert!(
-				case.sema.diagnostics.is_empty(),
+			assert_eq!(
+				case.sema.diagnostics.len(),
+				1,
 				"{:?}",
 				case.sema.diagnostics
+			);
+			assert_eq!(
+				case.sema.diagnostics[0].code.as_deref(),
+				Some(DiagnosticCode::NotATraitMember.code())
 			);
 			let signature = case.function_signature("f");
 			assert_eq!(
 				case.sema.types.list(signature.param_types)[0],
-				case.sema.types.list(signature.param_types)[1]
+				TypeIndex::ERROR
 			);
 			let Type::TypeProjection {
 				trait_index,
@@ -16804,7 +16932,7 @@ pub(super) mod tests {
 			} = case
 				.sema
 				.types
-				.resolve(case.sema.types.list(signature.param_types)[0])
+				.resolve(case.sema.types.list(signature.param_types)[1])
 			else {
 				panic!("ordinary projection expected")
 			};
@@ -16843,7 +16971,7 @@ pub(super) mod tests {
 			let valid = TestCase::checked(indoc! {"
                 trait Project { type Output: StackValue; }
                 trait Container { type Item: Project; }
-                func f<T: Container where { Item = U } + Container where { Item: Project }, U>(x: U::Output) {}
+                func f<T: Container where { Item: Project }>(x: T::Item::Output) {}
             "});
 			assert!(
 				valid.sema.diagnostics.is_empty(),
@@ -16854,7 +16982,7 @@ pub(super) mod tests {
                 trait Left { type Output; }
                 trait Right { type Output; }
                 trait Container { type Item; }
-                func f<T: Container where { Item = U } + Container where { Item: Left + Right }, U>(x: U::Output) {}
+                func f<T: Container where { Item: Left + Right }>(x: T::Item::Output) {}
             "});
 			assert_eq!(
 				ambiguous.sema.diagnostics.len(),
@@ -16876,7 +17004,7 @@ pub(super) mod tests {
                 trait Container { type Item; }
                 struct Host<T>();
                 impl<T> Host<T> {
-                    func scoped<U: Container where { Item = T } + Container where { Item: Project }>(x: T::Output) {}
+                    func scoped<U: Container where { Item = T } + Container where { Item: Project }>(x: <T as Project>::Output) {}
                     func sibling(x: T::Output) {}
                 }
             "});
@@ -16956,7 +17084,9 @@ pub(super) mod tests {
 		}
 
 		#[test]
-		fn pending_unqualified_selection_explains_how_to_qualify() {
+		fn selection_by_a_written_head_does_not_wait_for_sibling_values() {
+			// `Need` is written, so `Project` is selected by its constructor
+			// without reading `B`'s value; checking normalizes the rest.
 			let mut case = TestCase::checked(indoc! {"
                 trait Marker {}
                 trait Container { type A; type B; }
@@ -16967,23 +17097,38 @@ pub(super) mod tests {
                 func first<T: Container where { A = Need<T::B>::Output, B = i32 }>(x: T::A) {}
                 func reversed<T: Container where { B = i32, A = Need<T::B>::Output }>(x: T::A) {}
             "});
-			assert_eq!(
-				case.sema.diagnostics.len(),
-				2,
+			assert!(
+				case.sema.diagnostics.is_empty(),
 				"{:?}",
 				case.sema.diagnostics
 			);
-			for diagnostic in &*case.sema.diagnostics {
-				assert_eq!(
-					diagnostic.code.as_deref(),
-					Some(DiagnosticCode::TypeMemberNeedsQualification.code())
-				);
-				assert!(diagnostic.notes[0].contains(" as Trait>::Output"));
-				assert_eq!(diagnostic.labels.len(), 1);
-			}
 			for name in ["first", "reversed"] {
-				assert_eq!(case.normalized_param(name, 0), TypeIndex::ERROR);
+				assert_eq!(case.normalized_param(name, 0), TypeIndex::I32);
 			}
+		}
+
+		#[test]
+		fn selection_reading_its_own_unfinished_bounds_explains_how_to_qualify()
+		{
+			// `T::B::Output` is selected while `T`'s clauses are provisional:
+			// nothing found yet may still be found once they are final.
+			let case = TestCase::checked(indoc! {"
+                trait Container { type A; type B; }
+                trait Project { type Output; }
+                func f<T: Container where { A = T::B::Output }>(x: T::A) {}
+            "});
+			assert_eq!(
+				case.sema.diagnostics.len(),
+				1,
+				"{:?}",
+				case.sema.diagnostics
+			);
+			let diagnostic = &case.sema.diagnostics[0];
+			assert_eq!(
+				diagnostic.code.as_deref(),
+				Some(DiagnosticCode::TypeMemberNeedsQualification.code())
+			);
+			assert!(diagnostic.notes[0].contains(" as Trait>::Output"));
 		}
 
 		#[test]
@@ -17025,7 +17170,7 @@ pub(super) mod tests {
 		}
 
 		#[test]
-		fn sibling_dependent_unqualified_lookup_reports_the_same_limitation() {
+		fn sibling_dependent_selection_by_a_written_head_succeeds() {
 			let mut case = TestCase::checked(indoc! {"
                 trait Marker {}
                 trait Container { type Item; }
@@ -17035,17 +17180,12 @@ pub(super) mod tests {
                 impl Project for Need<i32> { type Output = i32; }
                 func f<T: Container where { Item = Need<U::Item>::Output }, U: Container where { Item = i32 }>(x: T::Item) {}
             "});
-			assert_eq!(
-				case.sema.diagnostics.len(),
-				1,
+			assert!(
+				case.sema.diagnostics.is_empty(),
 				"{:?}",
 				case.sema.diagnostics
 			);
-			assert_eq!(
-				case.sema.diagnostics[0].code.as_deref(),
-				Some(DiagnosticCode::TypeMemberNeedsQualification.code())
-			);
-			assert_eq!(case.normalized_param("f", 0), TypeIndex::ERROR);
+			assert_eq!(case.normalized_param("f", 0), TypeIndex::I32);
 		}
 
 		#[test]

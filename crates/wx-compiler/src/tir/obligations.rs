@@ -15,10 +15,9 @@
 //! phase that follows this pass (`Semantics::check_bodies`).
 
 use codespan_reporting::diagnostic::Diagnostic;
-use string_interner::symbol::SymbolU32;
 
 use super::bounds::{AssumptionEnvIdx, BoundClauses};
-use super::decls::{AssocTypeIdx, TraitIdx};
+use super::decls::{AssocTypeIdx, BindingKey, TraitIdx};
 use super::literals::ConcreteType;
 use super::members::report_type_does_not_implement_trait;
 use super::signatures::Semantics;
@@ -140,14 +139,15 @@ pub(super) enum TypeObligation {
 		reference: SourceSpan,
 	},
 	/// `Projection::name` was written, and the projection's declared bounds do
-	/// not name `name`. Whether its *value* has such a member depends on impls,
-	/// which construction cannot read, so the type was lowered to `ERROR` and
-	/// this decides what to say: a plain "no such member", or, when the value
-	/// does have one, that the trait must be named (with the spelling).
+	/// not name `key`. A member is never selected through the projection's
+	/// value, so the type was lowered to `ERROR`; what its value has depends
+	/// on equalities and impls, which construction does not read, so this
+	/// decides what to say: a plain "no such member", or, when the value does
+	/// have one, how to write it.
 	CheckProjectionMember {
 		frame: GenericEnvIdx,
 		projection: TypeIndex,
-		name: SymbolU32,
+		key: BindingKey,
 		reference: SourceSpan,
 	},
 	/// A trait impl function's `Self` entry, `clauses` about the impl's
@@ -542,13 +542,13 @@ impl Semantics {
 			TypeObligation::CheckProjectionMember {
 				frame,
 				projection,
-				name,
+				key,
 				reference,
 			} => match self.check_projection_member(
 				strings,
 				self.assumption_envs.of_frame(frame),
 				projection,
-				name,
+				key,
 				reference,
 			) {
 				Ok(_) => Ok(()),

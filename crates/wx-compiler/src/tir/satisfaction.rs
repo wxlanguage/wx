@@ -20,7 +20,7 @@ use super::bounds::{
 };
 use string_interner::symbol::SymbolU32;
 
-use super::decls::{BindingKey, DeclKind, Declarations, TraitIdx};
+use super::decls::{BindingKey, DeclKind, Declarations, Tier, TraitIdx};
 use super::impls::ImplTarget;
 use super::members::{MemberLookup, report_no_such_type_member};
 use super::obligations::{BoundRequirements, TypeObligation};
@@ -570,22 +570,26 @@ impl Semantics {
 	}
 
 	/// `projection::name` could not be selected from the projection's declared
-	/// bounds. Resolve what the projection's value is and which traits could
-	/// supply `name` on it, as rustc does to build its suggestion. Selecting
-	/// through an impl unqualified is ambiguous by design, so a trait that
-	/// *would* work is still an error, but one that says how to write it.
-	/// Always fails: the lowered type was `ERROR`.
+	/// bounds. A member is never selected through what the projection is
+	/// equal to, by an equality or an impl's definition
+	/// (`notes/member-selection-and-equalities.md`), so this always fails: the
+	/// lowered type was `ERROR`. It decides what to say: a plain "no such
+	/// member", or, when the projection's value has one, how to write it,
+	/// naming the value and, for a trait member, the trait, as rustc does.
 	pub(super) fn check_projection_member(
 		&mut self,
 		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		projection: TypeIndex,
-		name: SymbolU32,
+		key: BindingKey,
 		reference: SourceSpan,
 	) -> Result<(), SolverError> {
-		let key = BindingKey::ty(name);
+		let noun = match key.tier {
+			Tier::Type => "associated type",
+			Tier::Value => "associated constant",
+		};
 		let ident = Spanned {
-			inner: name,
+			inner: key.symbol,
 			span: reference.span,
 		};
 		let declared_anywhere = (0..self.decls.traits.len()).any(|index| {
@@ -610,7 +614,7 @@ impl Semantics {
 						reference.file_id,
 						strings,
 						ident,
-						"associated type",
+						noun,
 					));
 				}
 				return Err(SolverError::Poisoned);
@@ -621,8 +625,17 @@ impl Semantics {
 		// impl per trait per type constructor, and `declared_bound_member` skips
 		// a trait it has already collected.
 		let mut traits: Vec<TraitIdx> = Vec::new();
+		let mut inherent = false;
 		match ImplTarget::from_type(self.types.resolve(normalized)) {
 			Some(target) => {
+				inherent =
+					self.impl_dispatch.inherent_candidates(target).iter().any(
+						|&impl_index| {
+							self.decls.inherent_impls[usize::from(impl_index)]
+								.bindings
+								.contains_key(&key)
+						},
+					);
 				for trait_index in self.trait_candidates(target) {
 					if self
 						.decls
@@ -665,28 +678,38 @@ impl Semantics {
 			}
 			None => {}
 		}
-		if traits.is_empty() {
+		if traits.is_empty() && !inherent {
 			self.diagnostics.push(report_no_such_type_member(
 				reference.file_id,
 				strings,
 				ident,
-				"associated type",
+				noun,
 			));
 			return Err(SolverError::Poisoned);
 		}
-		let name_str = strings.resolve(name).unwrap().to_string();
-		let receiver = self.type_formatter(strings).display_type(projection);
+		let name = strings.resolve(key.symbol).unwrap();
+		let formatter = self.type_formatter(strings);
+		let receiver = formatter.display_type(projection);
+		let value = formatter.display_type(normalized);
+		let message = if traits.is_empty() {
+			format!("`{name}` is not selected through `{receiver}`")
+		} else {
+			format!("ambiguous {noun} `{name}`")
+		};
 		let mut diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::TypeMemberNeedsQualification.code())
-			.with_message(format!("ambiguous associated type `{name_str}`"))
+			.with_message(message)
 			.with_label(reference.primary_label().with_message(format!(
-				"`{receiver}` is known only through an impl, so the trait must be named"
-			)));
+				"`{receiver}` declares no `{name}`; only its value does"
+			)))
+			.with_note(format!(
+				"`{receiver}` is `{value}` here: write `{value}::{name}`"
+			));
 		for trait_index in traits {
 			let trait_name =
 				strings.resolve(self.decls.name(trait_index).inner).unwrap();
 			diagnostic = diagnostic.with_note(format!(
-				"qualify the trait: `<{receiver} as {trait_name}>::{name_str}`"
+				"qualify the trait: `<{receiver} as {trait_name}>::{name}`"
 			));
 		}
 		self.diagnostics.push(diagnostic);
