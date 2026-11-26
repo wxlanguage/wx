@@ -346,7 +346,7 @@ impl BodyBuilder<'_, '_> {
 			.expect("the core must declare the `Eq` trait");
 		match self.sema.find_trait_impl_query(
 			self.builder.strings,
-			self.scope.assumption_env,
+			self.assumption_env,
 			normalized,
 			trait_index,
 		) {

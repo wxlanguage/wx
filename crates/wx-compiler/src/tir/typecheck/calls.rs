@@ -1283,7 +1283,7 @@ impl BodyBuilder<'_, '_> {
 		} else {
 			self.sema.find_trait_impl_query(
 				self.builder.strings,
-				self.scope.assumption_env,
+				self.assumption_env,
 				ty,
 				call_trait,
 			)
@@ -1300,7 +1300,7 @@ impl BodyBuilder<'_, '_> {
 					) => {
 						let args = self.sema.trait_impl_args(
 							self.builder.strings,
-							self.scope.assumption_env,
+							self.assumption_env,
 							impl_index,
 							ty,
 						);

@@ -92,6 +92,9 @@ pub(super) struct BodyContext<'a> {
 	/// free constant, the impl's or trait's `Self` scope for an associated one,
 	/// the function's own for a function's block.
 	scope: LexicalScope,
+	/// What the body may assume: its frame's normalized env, or its written
+	/// env for a constant body built before any env is normalized.
+	assumption_env: AssumptionEnvIdx,
 }
 
 /// Builds the expressions of one definition into a `Body` from its written
@@ -105,6 +108,8 @@ pub(super) struct BodyBuilder<'a, 'ast> {
 	obligations: Obligations,
 	/// Where the expressions are written (`BodyContext::scope`).
 	scope: LexicalScope,
+	/// What the body may assume (`BodyContext::assumption_env`).
+	assumption_env: AssumptionEnvIdx,
 	owner: BodyOwner,
 	/// The block scope being checked.
 	current: ScopeIdx,
@@ -169,19 +174,21 @@ impl<'a> BodyContext<'a> {
 		strings: &'a StringInterner,
 		body: &'a mut Body,
 		scope: LexicalScope,
+		assumption_env: AssumptionEnvIdx,
 	) -> Self {
 		Self {
 			sema,
 			strings,
 			body,
 			scope,
+			assumption_env,
 		}
 	}
 
 	/// What a type means in this body's scope: comparisons and literal coercion
 	/// work on normalized types.
 	fn normalized(&mut self, ty: TypeIndex) -> TypeIndex {
-		self.normalized_in(ty, self.scope.assumption_env)
+		self.normalized_in(ty, self.assumption_env)
 	}
 
 	/// What a type means in `scope`. A projection that does not normalize stays
@@ -215,7 +222,7 @@ impl<'a> BodyContext<'a> {
 		let site = SourceSpan::new(self.scope.file_id, site);
 		match self.sema.normalize(
 			self.strings,
-			self.scope.assumption_env,
+			self.assumption_env,
 			ty,
 			NormalizationDepth::Deep,
 			facts,
@@ -424,6 +431,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		sema: &'a mut Semantics,
 		builder: &'a mut SemanticsBuilder<'ast>,
 		scope: LexicalScope,
+		assumption_env: AssumptionEnvIdx,
 		owner: BodyOwner,
 	) -> Self {
 		Self {
@@ -432,6 +440,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			body: Body::default(),
 			obligations: Obligations::default(),
 			scope,
+			assumption_env,
 			owner,
 			current: ScopeIdx::ROOT,
 			open_targets: Vec::new(),
@@ -462,6 +471,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			self.builder.strings,
 			&mut self.body,
 			self.scope,
+			self.assumption_env,
 		)
 	}
 
@@ -2338,7 +2348,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			Some(method) => {
 				match self.sema.find_trait_impl_query(
 					self.builder.strings,
-					self.scope.assumption_env,
+					self.assumption_env,
 					ty,
 					method.trait_index,
 				) {
@@ -2459,7 +2469,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			) {
 			let args = self.sema.trait_impl_args(
 				self.builder.strings,
-				self.scope.assumption_env,
+				self.assumption_env,
 				impl_index,
 				ty,
 			);
@@ -2565,7 +2575,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			_ => {}
 		}
 		let concrete_types =
-			self.sema.concrete_types(self.scope.assumption_env, target);
+			self.sema.concrete_types(self.assumption_env, target);
 		if concrete_types.is_empty() {
 			let diagnostic =
 				self.context().report_unable_to_coerce(expr, target);
@@ -2581,7 +2591,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	fn coerce_constant(&mut self, expr: ExprIdx, target: TypeIndex) {
 		if self
 			.sema
-			.concrete_types(self.scope.assumption_env, target)
+			.concrete_types(self.assumption_env, target)
 			.is_empty()
 		{
 			let diagnostic =

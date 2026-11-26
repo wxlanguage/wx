@@ -397,7 +397,7 @@ impl BodyBuilder<'_, '_> {
 	) -> Option<bool> {
 		match self.sema.find_trait_impl_query(
 			self.builder.strings,
-			self.scope.assumption_env,
+			self.assumption_env,
 			ty,
 			trait_index,
 		) {
@@ -442,7 +442,7 @@ impl BodyBuilder<'_, '_> {
 		let site = SourceSpan::new(self.scope.file_id, span);
 		match self.sema.check_value_type(
 			self.builder.strings,
-			self.scope.assumption_env,
+			self.assumption_env,
 			ty,
 			site,
 		) {

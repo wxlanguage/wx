@@ -1129,6 +1129,7 @@ impl Semantics {
 		receiver: TypeIndex,
 	) -> Vec<(SymbolU32, Definition)> {
 		let scope = self.owner_scope(owner);
+		let env = self.assumption_envs.normalized(scope.generic_frame);
 		let mut found = Vec::new();
 		if receiver == TypeIndex::ERROR || self.types.needs_context(receiver) {
 			return found;
@@ -1164,7 +1165,7 @@ impl Semantics {
 		let receiver = self
 			.normalize(
 				strings,
-				scope.assumption_env,
+				env,
 				receiver,
 				NormalizationDepth::Deep,
 				RewriteFlags::EQUALITIES | RewriteFlags::DEFINITIONS,
@@ -1175,14 +1176,8 @@ impl Semantics {
 			Type::Pointer { to, .. } => to,
 			_ => receiver,
 		};
-		for key in self.member_candidates(
-			strings,
-			scope.assumption_env,
-			path,
-			Tier::Value,
-		) {
-			let Some(member) =
-				self.usable_member(strings, scope.assumption_env, path, key)
+		for key in self.member_candidates(strings, env, path, Tier::Value) {
+			let Some(member) = self.usable_member(strings, env, path, key)
 			else {
 				continue;
 			};

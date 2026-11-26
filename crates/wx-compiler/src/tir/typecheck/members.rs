@@ -538,7 +538,7 @@ impl BodyBuilder<'_, '_> {
 					MemberLookup::NotFound => {
 						let _ = self.sema.check_projection_member(
 							self.builder.strings,
-							self.scope.assumption_env,
+							self.assumption_env,
 							receiver,
 							key,
 							reference,
@@ -550,7 +550,7 @@ impl BodyBuilder<'_, '_> {
 			}
 			None => self.sema.resolve_applicable_member(
 				self.builder.strings,
-				self.scope.assumption_env,
+				self.assumption_env,
 				receiver,
 				key,
 			),
@@ -651,7 +651,7 @@ impl BodyBuilder<'_, '_> {
 				TraitMemberSelection::Impl(kind) => {
 					let args = self.sema.trait_impl_args(
 						self.builder.strings,
-						self.scope.assumption_env,
+						self.assumption_env,
 						impl_index,
 						receiver,
 					);

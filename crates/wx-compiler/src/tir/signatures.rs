@@ -287,27 +287,18 @@ impl Semantics {
 		};
 		let mut body = std::mem::take(&mut self.bodies[usize::from(index)]);
 		let scope = self.owner_scope(BodyOwner::Const(const_index));
-		BodyContext::new(self, strings, &mut body, scope).decide(obligations);
+		let env = self.assumption_envs.normalized(scope.generic_frame);
+		BodyContext::new(self, strings, &mut body, scope, env)
+			.decide(obligations);
 		self.bodies[usize::from(index)] = body;
 	}
 
-	/// The scope `owner`'s body is written and checked in: the scope its
-	/// declaration is in, and its own type parameters (a function's, a
-	/// constant's: a variant's are the root's, an associated constant's its
-	/// impl's or trait's; a global has none).
+	/// The scope `owner`'s body is written in: the scope its declaration is
+	/// in, and its own type parameters (a function's, a constant's: a
+	/// variant's are the root's, an associated constant's its impl's or
+	/// trait's; a global has none).
 	pub(super) fn owner_scope(&self, owner: BodyOwner) -> LexicalScope {
-		let scope = self.owner_scope_frame(owner);
-		LexicalScope {
-			assumption_env: self
-				.assumption_envs
-				.normalized(scope.generic_frame),
-			..scope
-		}
-	}
-
-	/// The owner's place, with its env not yet chosen (`ROOT`).
-	fn owner_scope_frame(&self, owner: BodyOwner) -> LexicalScope {
-		let (loc, env) = match owner {
+		let (loc, frame) = match owner {
 			BodyOwner::Function(index) => (
 				self.decls.functions[usize::from(index)].loc,
 				self.functions[usize::from(index)].generic_params,
@@ -324,18 +315,7 @@ impl Semantics {
 		LexicalScope {
 			file_id: self.decls.file_id(loc),
 			namespace: self.decls.scope(loc),
-			generic_frame: env,
-			assumption_env: AssumptionEnvIdx::ROOT,
-		}
-	}
-
-	/// `owner_scope` as construction reads it, in the written env: a
-	/// constant's body is built before any frame's env is normalized.
-	pub(super) fn written_owner_scope(&self, owner: BodyOwner) -> LexicalScope {
-		let scope = self.owner_scope_frame(owner);
-		LexicalScope {
-			assumption_env: self.assumption_envs.written(scope.generic_frame),
-			..scope
+			generic_frame: frame,
 		}
 	}
 
@@ -526,16 +506,15 @@ pub(super) struct SemanticsBuilder<'ast> {
 }
 
 /// Where code is written: the file its spans are in, the namespace its
-/// names resolve from, and the generic frame its parameters and assumptions
-/// come from. A lowering entering a new frame narrows `generic_frame`.
+/// names resolve from, and the generic frame its parameters come from. A
+/// lowering entering a new frame narrows `generic_frame`. What the code may
+/// assume is not part of it: construction reads the frame's written env,
+/// body checking the env its caller chose.
 #[derive(Clone, Copy)]
 pub(super) struct LexicalScope {
 	pub(super) file_id: FileId,
 	pub(super) namespace: Scope,
 	pub(super) generic_frame: GenericFrameIdx,
-	/// What the scope assumes: the env `generic_frame`'s item states its
-	/// clauses in.
-	pub(super) assumption_env: AssumptionEnvIdx,
 }
 
 #[derive(Clone, Copy)]
@@ -653,7 +632,7 @@ impl Semantics {
 		let scope = self.owner_scope(owner);
 		self.normalize(
 			strings,
-			scope.assumption_env,
+			self.assumption_envs.normalized(scope.generic_frame),
 			ty,
 			super::solver::NormalizationDepth::Deep,
 			super::solver::RewriteFlags::EQUALITIES
@@ -1887,12 +1866,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 					};
 					let owner = BodyOwner::Global(global_index);
 					let scope = sema.owner_scope(owner);
+					let env =
+						sema.assumption_envs.normalized(scope.generic_frame);
 					let ty = sema.global_value_type(global_index);
 					let reported = sema.diagnostics.len();
 					let (mut body, obligations) =
-						BodyBuilder::new(sema, self, scope, owner)
+						BodyBuilder::new(sema, self, scope, env, owner)
 							.check_body(value, ty);
-					BodyContext::new(sema, self.strings, &mut body, scope)
+					BodyContext::new(sema, self.strings, &mut body, scope, env)
 						.decide(obligations);
 					sema.global_bodies[usize::from(global_index)] =
 						Some(sema.push_body(body));
@@ -1921,12 +1902,13 @@ impl<'ast> SemanticsBuilder<'ast> {
 		};
 		let owner = BodyOwner::Function(function_index);
 		let scope = sema.owner_scope(owner);
+		let env = sema.assumption_envs.normalized(scope.generic_frame);
 		let reported = sema.diagnostics.len();
 		let (mut body, obligations) = BodyBuilder::new(
-			sema, self, scope, owner,
+			sema, self, scope, env, owner,
 		)
 		.check_function(function_index, signature, block);
-		BodyContext::new(sema, self.strings, &mut body, scope)
+		BodyContext::new(sema, self.strings, &mut body, scope, env)
 			.decide(obligations);
 		let statics = body.statics().to_vec();
 		sema.function_implementations[usize::from(function_index)] =
@@ -2160,7 +2142,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 			file_id,
 			namespace,
 			generic_frame,
-			assumption_env: sema.assumption_envs.written(generic_frame),
 		};
 		for (subject, _, occurrences) in &bounded {
 			self.fill_source_bounds(
@@ -2462,9 +2443,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 						file_id,
 						namespace,
 						generic_frame,
-						assumption_env: sema
-							.assumption_envs
-							.written(generic_frame),
 					},
 					ty,
 					policy,
@@ -2480,7 +2458,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 					file_id,
 					namespace,
 					generic_frame,
-					assumption_env: sema.assumption_envs.written(generic_frame),
 				},
 				*result,
 				InferPolicy::Reject(InferSignatureKind::ReturnType),
@@ -2556,7 +2533,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 						file_id,
 						namespace,
 						generic_frame: frame,
-						assumption_env: sema.assumption_envs.written(frame),
 					},
 					ty,
 					policy,
@@ -2596,7 +2572,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 					file_id,
 					namespace,
 					generic_frame: frame,
-					assumption_env: sema.assumption_envs.written(frame),
 				},
 				*result,
 				InferPolicy::Reject(InferSignatureKind::ReturnType),
@@ -2638,7 +2613,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 			file_id,
 			namespace,
 			generic_frame: frame,
-			assumption_env: sema.assumption_envs.written(frame),
 		};
 		let ty = match ty {
 			Some(type_expr) => {
@@ -2692,7 +2666,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 		));
 		let query = SignatureQuery::Const(const_index);
 		let entry = &self.entries[self.query_state[&query].ast_index as usize];
-		let scope = sema.written_owner_scope(BodyOwner::Const(const_index));
+		let scope = sema.owner_scope(BodyOwner::Const(const_index));
+		// Built before any frame's env is normalized: evaluating constants
+		// needs their bodies, and normalizing may evaluate.
+		let assumption_env = sema.assumption_envs.written(scope.generic_frame);
 		let ast = self.ast(entry.file_id);
 		let value = match entry.node {
 			AstNodeRef::Constant { item, .. } => match ast.item(item) {
@@ -2742,6 +2719,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					sema,
 					self,
 					scope,
+					assumption_env,
 					BodyOwner::Const(const_index),
 				)
 				.check_variant_value(&variant, previous, repr);
@@ -2751,9 +2729,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 			_ => unreachable!("a constant's entry is a constant"),
 		};
 		let ty = sema.constants[usize::from(const_index)].ty;
-		let (body, obligations) =
-			BodyBuilder::new(sema, self, scope, BodyOwner::Const(const_index))
-				.check_body(value, ty);
+		let (body, obligations) = BodyBuilder::new(
+			sema,
+			self,
+			scope,
+			assumption_env,
+			BodyOwner::Const(const_index),
+		)
+		.check_body(value, ty);
 		sema.keep_const_body(const_index, body, obligations);
 	}
 
@@ -2782,9 +2765,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 				file_id,
 				namespace,
 				generic_frame: GenericFrameIdx::ROOT,
-				assumption_env: sema
-					.assumption_envs
-					.written(GenericFrameIdx::ROOT),
 			},
 			trait_impl_index,
 			size_assoc_type_index,
@@ -2936,9 +2916,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 										file_id,
 										namespace,
 										generic_frame,
-										assumption_env: sema
-											.assumption_envs
-											.written(generic_frame),
 									},
 									body,
 									InferPolicy::Reject(
@@ -3031,9 +3008,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 						file_id,
 						namespace,
 						generic_frame: self_frame,
-						assumption_env: sema
-							.assumption_envs
-							.written(self_frame),
 					},
 					*supertraits,
 					BoundSubject::Scope(self_frame),
@@ -3109,7 +3083,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 					file_id,
 					namespace,
 					generic_frame: self_frame,
-					assumption_env: sema.assumption_envs.written(self_frame),
 				};
 				// A literal kind leaves this constant untyped; each use gives it a type.
 				let resolved_ty =
@@ -3165,9 +3138,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 						file_id,
 						namespace,
 						generic_frame: self_frame,
-						assumption_env: sema
-							.assumption_envs
-							.written(self_frame),
 					},
 					*bounds,
 					BoundSubject::Assoc(assoc_type_index),
@@ -3182,9 +3152,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 							file_id,
 							namespace,
 							generic_frame: self_frame,
-							assumption_env: sema
-								.assumption_envs
-								.written(self_frame),
 						},
 						*value,
 						InferPolicy::Reject(InferSignatureKind::AssocBinding),
@@ -3300,7 +3267,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 						file_id,
 						namespace,
 						generic_frame: frame,
-						assumption_env: sema.assumption_envs.written(frame),
 					},
 					block_index,
 					assoc_type_index,
@@ -3387,9 +3353,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 									file_id,
 									namespace,
 									generic_frame: GenericFrameIdx::ROOT,
-									assumption_env: sema
-										.assumption_envs
-										.written(GenericFrameIdx::ROOT),
 								},
 								global_decl.trait_impl_index,
 								global_decl.value_assoc_type_index,
@@ -3449,9 +3412,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 							file_id,
 							namespace,
 							generic_frame: GenericFrameIdx::ROOT,
-							assumption_env: sema
-								.assumption_envs
-								.written(GenericFrameIdx::ROOT),
 						},
 						global_decl.trait_impl_index,
 						global_decl.value_assoc_type_index,
@@ -3516,9 +3476,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 							file_id,
 							namespace,
 							generic_frame,
-							assumption_env: sema
-								.assumption_envs
-								.written(generic_frame),
 						},
 						ty_expr,
 						policy,
@@ -3609,7 +3566,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 						file_id,
 						namespace,
 						generic_frame: frame,
-						assumption_env: sema.assumption_envs.written(frame),
 					},
 					target,
 					sema.impl_dispatch.inherent_target(block_index),
@@ -3729,7 +3685,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 						file_id,
 						namespace,
 						generic_frame: frame,
-						assumption_env: sema.assumption_envs.written(frame),
 					},
 					target,
 					header.target,
@@ -3803,9 +3758,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 					file_id,
 					namespace,
 					generic_frame: GenericFrameIdx::ROOT,
-					assumption_env: sema
-						.assumption_envs
-						.written(GenericFrameIdx::ROOT),
 				};
 				let mut field_types: Vec<TypeIndex> = ast
 					.list(*repr)
@@ -3965,9 +3917,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 						file_id,
 						namespace,
 						generic_frame: self_frame,
-						assumption_env: sema
-							.assumption_envs
-							.written(self_frame),
 					},
 					*bounds,
 					BoundSubject::Scope(self_frame),
@@ -3992,9 +3941,6 @@ impl<'ast> SemanticsBuilder<'ast> {
 							file_id,
 							namespace,
 							generic_frame: GenericFrameIdx::ROOT,
-							assumption_env: sema
-								.assumption_envs
-								.written(GenericFrameIdx::ROOT),
 						},
 						m,
 						sema.impl_dispatch.trait_header(impl_index).target,

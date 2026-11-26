@@ -459,8 +459,8 @@ one normalized list per item with its parents' predicates in it.
   failure is reported at the clause (a cycle, an overflow) or where it
   belongs (`Poisoned`), and a completed env never loses a fact.
 - Constant bodies are built before any frame is complete, so building one
-  reads the written env (`written_owner_scope`), as it read the signature
-  env before; checking them reads the completed one.
+  reads the written env (the env its `BodyBuilder` is given), as it read
+  the signature env before; checking them reads the completed one.
 - A frame is read again while its clauses are rewritten when one of them
   normalizes back through it: `impl<T: Loop where { Out = <S<T> as
   Loop>::Out }> Loop for S<T>` selects itself, and proving its requirements
