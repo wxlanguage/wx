@@ -1,8 +1,9 @@
 mod body;
-mod bounds;
+mod clauses;
 mod conformance;
 mod decls;
 mod eval;
+mod finiteness;
 mod format;
 mod impls;
 mod imports;
@@ -41,7 +42,7 @@ pub use self::decls::{
 	TypeAliasIdx, TypeRole, TypesetIdx, UseItemIndex, Visibility,
 };
 pub use self::eval::{AllocIdx, ConstScalar, Val};
-pub use self::format::{BoundFormatter, TypeFormatter};
+pub use self::format::{BoundFormatter, DefinitionFormatter, TypeFormatter};
 use self::impls::ImplDispatch;
 pub use self::literals::{
 	StringLiteralError, StringLiteralErrorKind, unescape_string_literal,
@@ -49,12 +50,12 @@ pub use self::literals::{
 pub use self::resolutions::{
 	BindingName, Definition, NameResolutions, Reference, Route, Site,
 };
-pub use self::signatures::Semantics;
 use self::signatures::SemanticsBuilder;
+pub use self::signatures::{ItemPath, Semantics};
 pub use self::typecheck::{FieldListShape, positional_pattern_gap};
 pub use self::types::{
-	GenericArgs, GenericEnvIdx, GenericEnvOwner, Primitive, Type, TypeIndex,
-	TypeList,
+	GenericArgs, GenericFrameIdx, GenericFrameOwner, Primitive, Type,
+	TypeIndex, TypeList,
 };
 
 /// Checks declarations and bodies into a live [`Semantics`], which holds

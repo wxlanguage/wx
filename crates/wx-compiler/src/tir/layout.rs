@@ -33,13 +33,14 @@ use std::hash::BuildHasher;
 use hashbrown::HashTable;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
-use super::bounds::AssumptionEnvIdx;
+use super::clauses::AssumptionEnvIdx;
 use super::decls::{FieldIdx, FieldOrder, StructIdx};
+use super::finiteness::FiniteType;
 use super::signatures::Semantics;
 use super::solver::{
 	NormalizationDepth, RewriteFlags, SolverError, metadata_len,
 };
-use super::types::{Primitive, Substitution, Type, TypeIndex, TypeList};
+use super::types::{Primitive, Type, TypeIndex, TypeList};
 use crate::ast::StringInterner;
 use crate::index::index_newtype;
 
@@ -106,15 +107,16 @@ pub(super) struct Layouts {
 	hasher: FxBuildHasher,
 }
 
-/// A laid-out value, as a field contributes to its aggregate, and as a
-/// load or a store reads where its scalars are (`Layouts::scalar`).
+/// The form a value takes in linear memory: its layout and where its scalars
+/// are. What a field contributes to its aggregate, and what a load or a store
+/// reads its scalars' offsets from (`Layouts::scalar`).
 #[derive(Clone, Copy)]
-pub(super) enum Piece {
+pub(super) enum MemoryForm {
 	/// No bytes and no values.
 	Empty,
 	/// `count` values of `primitive`, one after another: one for a primitive
 	/// type or an address, two for a slice (its address and its length).
-	Primitives {
+	Scalars {
 		primitive: Primitive,
 		count: u32,
 	},
@@ -137,49 +139,57 @@ impl Layouts {
 		rows(&self.scalars, scalars.start, scalars.len)
 	}
 
-	/// How many Wasm values `piece` holds.
-	pub(super) fn scalar_count(&self, piece: Piece) -> usize {
-		match piece {
-			Piece::Empty | Piece::Array(_) => 0,
-			Piece::Primitives { count, .. } => count as usize,
-			Piece::Aggregate(index) => {
+	/// How many Wasm values `form` holds.
+	pub(super) fn scalar_count(&self, form: MemoryForm) -> usize {
+		match form {
+			MemoryForm::Empty | MemoryForm::Array(_) => 0,
+			MemoryForm::Scalars { count, .. } => count as usize,
+			MemoryForm::Aggregate(index) => {
 				self.aggregates[usize::from(index)].scalars.len as usize
 			}
 		}
 	}
 
-	/// `piece`'s Wasm value `at`: the primitive it is in memory and its
+	/// `form`'s Wasm value `at`: the primitive it is in memory and its
 	/// byte offset from the start.
-	pub(super) fn scalar(&self, piece: Piece, at: usize) -> (Primitive, u32) {
-		match piece {
-			Piece::Primitives { primitive, count } => {
+	pub(super) fn scalar(
+		&self,
+		form: MemoryForm,
+		at: usize,
+	) -> (Primitive, u32) {
+		match form {
+			MemoryForm::Scalars { primitive, count } => {
 				assert!(at < count as usize, "a scalar of the value");
 				(primitive, at as u32 * primitive.size())
 			}
-			Piece::Aggregate(index) => self.scalars(index)[at],
-			Piece::Empty | Piece::Array(_) => {
+			MemoryForm::Aggregate(index) => self.scalars(index)[at],
+			MemoryForm::Empty | MemoryForm::Array(_) => {
 				unreachable!("an empty value or an array holds no scalar")
 			}
 		}
 	}
 
-	pub(super) fn layout(&self, piece: Piece) -> Layout {
-		match piece {
-			Piece::Empty => Layout { size: 0, align: 1 },
-			Piece::Primitives { primitive, count } => Layout {
+	pub(super) fn layout(&self, form: MemoryForm) -> Layout {
+		match form {
+			MemoryForm::Empty => Layout { size: 0, align: 1 },
+			MemoryForm::Scalars { primitive, count } => Layout {
 				size: primitive.size() * count,
 				align: primitive.size(),
 			},
-			Piece::Aggregate(index) => {
+			MemoryForm::Aggregate(index) => {
 				self.aggregates[usize::from(index)].layout
 			}
-			Piece::Array(layout) => layout,
+			MemoryForm::Array(layout) => layout,
 		}
 	}
 
 	/// Places `fields` (in declaration order) in `order` and stores the
 	/// layout, once per distinct content.
-	fn place(&mut self, fields: &[Piece], order: FieldOrder) -> AggregateIdx {
+	fn place(
+		&mut self,
+		fields: &[MemoryForm],
+		order: FieldOrder,
+	) -> AggregateIdx {
 		let layouts: Vec<Layout> =
 			fields.iter().map(|&field| self.layout(field)).collect();
 		let mut placed: Vec<usize> = (0..fields.len()).collect();
@@ -198,12 +208,12 @@ impl Layouts {
 		let mut scalars = Vec::new();
 		for (&field, &base) in fields.iter().zip(&offsets) {
 			match field {
-				Piece::Empty | Piece::Array(_) => {}
-				Piece::Primitives { primitive, count } => scalars.extend(
+				MemoryForm::Empty | MemoryForm::Array(_) => {}
+				MemoryForm::Scalars { primitive, count } => scalars.extend(
 					(0..count)
 						.map(|at| (primitive, base + at * primitive.size())),
 				),
-				Piece::Aggregate(index) => scalars.extend(
+				MemoryForm::Aggregate(index) => scalars.extend(
 					self.scalars(index)
 						.iter()
 						.map(|&(primitive, offset)| (primitive, base + offset)),
@@ -283,18 +293,16 @@ impl Semantics {
 	/// compiler does not know its bytes: some part of it is abstract (a
 	/// parameter, a projection that does not reduce, an address into a memory
 	/// not known yet), or it is a reference, which Wasm keeps out of linear
-	/// memory. A struct containing itself is `Poisoned` (it is reported on
-	/// the struct), and one growing without end through its type arguments
-	/// overflows.
+	/// memory. An infinite type is `Poisoned`: finiteness reported it where
+	/// its cycle closed.
 	pub(super) fn memory_layout(
 		&mut self,
 		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<Layout>, SolverError> {
-		let piece =
-			self.piece(strings, assumption_context, ty, &mut Vec::new())?;
-		Ok(piece.map(|piece| self.solver.layouts.layout(piece)))
+		let form = self.memory_form(strings, assumption_context, ty)?;
+		Ok(form.map(|form| self.solver.layouts.layout(form)))
 	}
 
 	/// The layout of a value of `ty`, as `memory_layout` answers it, and
@@ -307,20 +315,19 @@ impl Semantics {
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<(Layout, Box<[(Primitive, u32)]>)>, SolverError> {
-		let Some(piece) =
-			self.piece(strings, assumption_context, ty, &mut Vec::new())?
+		let Some(form) = self.memory_form(strings, assumption_context, ty)?
 		else {
 			return Ok(None);
 		};
-		let values = match piece {
-			Piece::Empty => Box::default(),
-			Piece::Primitives { primitive, count } => (0..count)
+		let values = match form {
+			MemoryForm::Empty => Box::default(),
+			MemoryForm::Scalars { primitive, count } => (0..count)
 				.map(|at| (primitive, at * primitive.size()))
 				.collect(),
-			Piece::Aggregate(index) => {
+			MemoryForm::Aggregate(index) => {
 				self.solver.layouts.scalars(index).into()
 			}
-			Piece::Array(_) => {
+			MemoryForm::Array(_) => {
 				let ty = self.normalize(
 					strings,
 					assumption_context,
@@ -329,7 +336,7 @@ impl Semantics {
 					RewriteFlags::ALL,
 				)?;
 				let Type::Array { of, .. } = *self.types.resolve(ty) else {
-					unreachable!("an array's piece is an array's")
+					unreachable!("an array's form is an array's")
 				};
 				let Some((element, values)) =
 					self.memory_values(strings, assumption_context, of)?
@@ -340,7 +347,7 @@ impl Semantics {
 				};
 				let count = match element.size {
 					0 => 0,
-					size => self.solver.layouts.layout(piece).size / size,
+					size => self.solver.layouts.layout(form).size / size,
 				};
 				(0..count)
 					.flat_map(|at| {
@@ -351,19 +358,20 @@ impl Semantics {
 					.collect()
 			}
 		};
-		Ok(Some((self.solver.layouts.layout(piece), values)))
+		Ok(Some((self.solver.layouts.layout(form), values)))
 	}
 
 	/// Where a value of `ty`'s bytes and scalars are, as `memory_layout`
 	/// answers its layout; read a scalar's offset with
 	/// `Layouts::scalar`, with no copy of the aggregate's rows.
-	pub(super) fn memory_piece(
+	pub(super) fn memory_form(
 		&mut self,
 		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
-	) -> Result<Option<Piece>, SolverError> {
-		self.piece(strings, assumption_context, ty, &mut Vec::new())
+	) -> Result<Option<MemoryForm>, SolverError> {
+		let ty = self.finite(strings, assumption_context, ty)?;
+		self.finite_form(strings, ty)
 	}
 
 	/// The layout of a struct or a tuple, as `memory_layout` answers it.
@@ -374,10 +382,9 @@ impl Semantics {
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<AggregateIdx>, SolverError> {
-		let piece =
-			self.piece(strings, assumption_context, ty, &mut Vec::new())?;
-		Ok(match piece {
-			Some(Piece::Aggregate(index)) => Some(index),
+		let form = self.memory_form(strings, assumption_context, ty)?;
+		Ok(match form {
+			Some(MemoryForm::Aggregate(index)) => Some(index),
 			_ => None,
 		})
 	}
@@ -402,23 +409,15 @@ impl Semantics {
 		}))
 	}
 
-	/// `visiting` holds the aggregates being laid out, normalized: reaching
-	/// one again is a struct containing itself.
-	fn piece(
+	fn finite_form(
 		&mut self,
 		strings: &StringInterner,
-		assumption_context: AssumptionEnvIdx,
-		ty: TypeIndex,
-		visiting: &mut Vec<TypeIndex>,
-	) -> Result<Option<Piece>, SolverError> {
-		let ty = self.normalize(
-			strings,
-			assumption_context,
-			ty,
-			NormalizationDepth::Shallow,
-			RewriteFlags::ALL,
-		)?;
-		let piece = match *self.types.resolve(ty) {
+		ty: FiniteType,
+	) -> Result<Option<MemoryForm>, SolverError> {
+		let ty =
+			self.normalize_finite(strings, ty, NormalizationDepth::Shallow)?;
+		let assumption_context = ty.env();
+		let form = match *self.types.resolve(ty.ty()) {
 			Type::Error
 			| Type::Infer
 			| Type::ConstInt
@@ -429,7 +428,7 @@ impl Semantics {
 			Type::Never
 			| Type::Function { .. }
 			| Type::Memory { .. }
-			| Type::Global { .. } => Piece::Empty,
+			| Type::Global { .. } => MemoryForm::Empty,
 			Type::U8
 			| Type::I8
 			| Type::U16
@@ -439,17 +438,19 @@ impl Semantics {
 			| Type::U64
 			| Type::I64
 			| Type::F32
-			| Type::F64 => Piece::Primitives {
-				primitive: Primitive::of(ty).expect("a primitive type"),
+			| Type::F64 => MemoryForm::Scalars {
+				primitive: Primitive::of(ty.ty()).expect("a primitive type"),
 				count: 1,
 			},
 			Type::Funcref
 			| Type::TypedFuncref { .. }
 			| Type::TypeParam { .. }
 			| Type::TypeProjection { .. } => return Ok(None),
-			Type::Enum { enum_index } => {
-				let repr = self.enums[usize::from(enum_index)].repr;
-				return self.piece(strings, assumption_context, repr, visiting);
+			Type::Enum { .. } => {
+				let [repr] = self.parts(ty)[..] else {
+					unreachable!("an enum's one part is its repr")
+				};
+				return self.finite_form(strings, repr);
 			}
 			// An address, then the pointee's counts, each as wide as the
 			// memory's `Size`.
@@ -471,14 +472,14 @@ impl Semantics {
 				else {
 					return Ok(None);
 				};
-				Piece::Primitives {
+				MemoryForm::Scalars {
 					primitive,
 					count: 1 + metadata_len(&self.types, metadata) as u32,
 				}
 			}
 			// An array of a known length is its elements, one after another.
 			// A slice has no size, nor does an array of an abstract length.
-			Type::Array { of, length } => {
+			Type::Array { length, .. } => {
 				let length = self.normalize(
 					strings,
 					assumption_context,
@@ -489,9 +490,10 @@ impl Semantics {
 				let Type::Value { bits } = *self.types.resolve(length) else {
 					return Ok(None);
 				};
-				let Some(element) =
-					self.piece(strings, assumption_context, of, visiting)?
-				else {
+				let [element] = self.parts(ty)[..] else {
+					unreachable!("an array's one part is its element")
+				};
+				let Some(element) = self.finite_form(strings, element)? else {
 					return Ok(None);
 				};
 				let element = self.solver.layouts.layout(element);
@@ -499,101 +501,58 @@ impl Semantics {
 					.ok()
 					.and_then(|count| element.size.checked_mul(count))
 					.ok_or(SolverError::Overflow)?;
-				Piece::Array(Layout {
+				MemoryForm::Array(Layout {
 					size,
 					align: element.align,
 				})
 			}
 			Type::Slice { .. } => return Ok(None),
 			Type::Tuple { .. } | Type::Struct { .. } => {
-				return self.aggregate_piece(
-					strings,
-					assumption_context,
-					ty,
-					visiting,
-				);
+				return self.aggregate_form(strings, ty);
 			}
 		};
-		Ok(Some(piece))
+		Ok(Some(form))
 	}
 
-	fn aggregate_piece(
+	fn aggregate_form(
 		&mut self,
 		strings: &StringInterner,
-		assumption_context: AssumptionEnvIdx,
-		ty: TypeIndex,
-		visiting: &mut Vec<TypeIndex>,
-	) -> Result<Option<Piece>, SolverError> {
-		let ty = self.normalize(
-			strings,
-			assumption_context,
-			ty,
-			NormalizationDepth::Deep,
-			RewriteFlags::ALL,
-		)?;
-		let key = match *self.types.resolve(ty) {
+		ty: FiniteType,
+	) -> Result<Option<MemoryForm>, SolverError> {
+		let ty =
+			self.normalize_finite(strings, ty, NormalizationDepth::Deep)?;
+		let (key, order) = match *self.types.resolve(ty.ty()) {
 			Type::Struct {
 				struct_index,
 				type_args,
-			} => AggregateKey::Struct(struct_index, type_args),
-			Type::Tuple { elements } => AggregateKey::Tuple(elements),
+			} => (
+				AggregateKey::Struct(struct_index, type_args),
+				self.decls.structs[usize::from(struct_index)].order,
+			),
+			Type::Tuple { elements } => {
+				(AggregateKey::Tuple(elements), FieldOrder::Optimal)
+			}
 			_ => unreachable!("normalizing deeper keeps a struct or a tuple"),
 		};
-		let concrete =
-			!self.types.has_param(ty) && !self.types.has_projection(ty);
+		let concrete = !self.types.has_param(ty.ty())
+			&& !self.types.has_projection(ty.ty());
 		if concrete && let Some(&index) = self.solver.layouts.keys.get(&key) {
-			return Ok(Some(Piece::Aggregate(index)));
+			return Ok(Some(MemoryForm::Aggregate(index)));
 		}
-		if visiting.contains(&ty) {
-			return Err(SolverError::Poisoned);
-		}
-		if visiting.len() > self.solver.state.recursion_budget {
-			return Err(SolverError::Overflow);
-		}
-		let (order, fields) = match key {
-			AggregateKey::Struct(struct_index, type_args) => {
-				let signature = &self.structs[usize::from(struct_index)];
-				let (env, field_types) =
-					(signature.type_params, signature.field_types);
-				let args: Box<[TypeIndex]> = self.types.list(type_args).into();
-				// Read one field at a time: substituting may store more lists.
-				let mut fields = Vec::with_capacity(field_types.len());
-				for at in 0..field_types.len() {
-					let field = self.types.list(field_types)[at];
-					fields.push(self.types.substitute(
-						field,
-						Substitution {
-							envs: &self.generic_envs,
-							env,
-							args: &args,
-						},
-					));
-				}
-				(self.decls.structs[usize::from(struct_index)].order, fields)
-			}
-			AggregateKey::Tuple(elements) => {
-				(FieldOrder::Optimal, self.types.list(elements).to_vec())
-			}
-		};
-
-		visiting.push(ty);
-		let mut pieces = Vec::with_capacity(fields.len());
+		let fields = self.parts(ty);
+		let mut forms = Vec::with_capacity(fields.len());
 		for field in fields {
-			match self.piece(strings, assumption_context, field, visiting) {
-				Ok(Some(piece)) => pieces.push(piece),
-				unknown => {
-					visiting.pop();
-					return unknown;
-				}
-			}
+			let Some(form) = self.finite_form(strings, field)? else {
+				return Ok(None);
+			};
+			forms.push(form);
 		}
-		visiting.pop();
 
-		let index = self.solver.layouts.place(&pieces, order);
+		let index = self.solver.layouts.place(&forms, order);
 		if concrete {
 			self.solver.layouts.keys.insert(key, index);
 		}
-		Ok(Some(Piece::Aggregate(index)))
+		Ok(Some(MemoryForm::Aggregate(index)))
 	}
 
 	/// The primitive of an address into `memory`, its `Size`. `None` for a
@@ -733,11 +692,11 @@ mod tests {
 		path: &str,
 		index: usize,
 	) -> Result<Option<Layout>, SolverError> {
-		let scope = case.function_signature(path).type_params;
+		let frame = case.function_signature(path).generic_params;
 		let ty = case.param_types(path)[index];
 		case.sema.memory_layout(
 			&case.strings,
-			case.sema.assumption_envs.of_frame(scope),
+			case.sema.assumption_envs.normalized(frame),
 			ty,
 		)
 	}
@@ -748,12 +707,12 @@ mod tests {
 		path: &str,
 		index: usize,
 	) -> Option<AggregateIdx> {
-		let scope = case.function_signature(path).type_params;
+		let frame = case.function_signature(path).generic_params;
 		let ty = case.param_types(path)[index];
 		case.sema
 			.aggregate_layout(
 				&case.strings,
-				case.sema.assumption_envs.of_frame(scope),
+				case.sema.assumption_envs.normalized(frame),
 				ty,
 			)
 			.expect("a parameter's layout is final")
@@ -770,7 +729,7 @@ mod tests {
 	fn contents(case: &TestCase, index: AggregateIdx) -> Contents {
 		let layouts = &case.sema.solver.layouts;
 		Contents {
-			layout: layouts.layout(Piece::Aggregate(index)),
+			layout: layouts.layout(MemoryForm::Aggregate(index)),
 			field_offsets: layouts.field_offsets(index).to_vec(),
 			scalars: layouts.scalars(index).to_vec(),
 		}

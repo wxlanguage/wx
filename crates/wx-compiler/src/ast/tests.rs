@@ -237,10 +237,10 @@ fn item_kind(item: &Item) -> &'static str {
 	}
 }
 
-fn bounds(param: &TypeParam) -> Option<BoundId> {
+fn bounds(param: &GenericParam) -> Option<BoundId> {
 	match *param {
-		TypeParam::Type { bounds, .. } => bounds,
-		TypeParam::Const { .. } => None,
+		GenericParam::Type { bounds, .. } => bounds,
+		GenericParam::Const { .. } => None,
 	}
 }
 
@@ -2225,6 +2225,54 @@ fn test_line_comments_end_before_crlf() {
 	}
 }
 
+/// The doc comment of the declaration whose name is the first `name` in
+/// `source`.
+fn documentation(source: &str, name: &str) -> Option<String> {
+	let mut strings = Keyword::create_interner();
+	let mut files = Files::new();
+	let file_id = files
+		.add("main.wx".to_string(), source.to_string(), FileOrigin::Local)
+		.unwrap();
+	let parsed = Parser::parse(file_id, &files, &mut strings);
+	let at = source.find(name).expect("the name is in the source");
+	parsed
+		.comments
+		.documentation(source, TextOffset::from(at as u32))
+}
+
+#[test]
+fn documentation_joins_the_doc_lines_above_skipping_attributes() {
+	let source = indoc! {"
+        // Not documentation: a line comment ends the block.
+        /// Adds two numbers.
+        ///
+        ///  Keeps a second space.
+        #[inline]
+            pub func add(a: i32, b: i32) -> i32 { a + b }
+    "};
+	assert_eq!(
+		documentation(source, "add").as_deref(),
+		Some("Adds two numbers.\n\n Keeps a second space.")
+	);
+}
+
+#[test]
+fn documentation_ends_at_a_blank_line_and_reads_crlf_lines() {
+	let blank = "/// Detached.\n\nfunc f() {}\n";
+	assert_eq!(documentation(blank, "f()"), None);
+	let crlf = "/// One.\r\n/// Two.\r\nfunc f() {}\r\n";
+	assert_eq!(documentation(crlf, "f()").as_deref(), Some("One.\nTwo."));
+}
+
+#[test]
+fn documentation_is_only_a_comment_the_lexer_recorded() {
+	// The line above `T` starts with `///`, but it ends a string literal
+	// that spans lines, so `T` has no documentation.
+	let source =
+		"const S: [u8; 15] = \"first\n/// inner\";\nconst T: u8 = 0;\n";
+	assert_eq!(documentation(source, "T:"), None);
+}
+
 // ── Patterns ─────────────────────────────────────────────────────────────────
 
 #[test]
@@ -2904,7 +2952,7 @@ fn test_generic_signatures() {
 	let signature = case.function_signature(0);
 	let params: Vec<&str> = case
 		.ast
-		.list(signature.type_params)
+		.list(signature.generic_params)
 		.iter()
 		.map(|param| case.name(param.name().inner))
 		.collect();
@@ -2912,7 +2960,7 @@ fn test_generic_signatures() {
 	// only the bounded ones carry a bound expression
 	let bounded: Vec<bool> = case
 		.ast
-		.list(signature.type_params)
+		.list(signature.generic_params)
 		.iter()
 		.map(|param| bounds(param).is_some())
 		.collect();
@@ -2927,9 +2975,9 @@ fn a_type_parameter_and_a_binding_span_what_is_written() {
 	let case = TestCase::new(source);
 	case.diagnostics().assert_none();
 	let text = |span: TextSpan| span.extract_str(source);
-	let type_params = case.function_signature(0).type_params;
-	let params = case.ast.list(type_params);
-	let spans = case.ast.spans(type_params);
+	let generic_params = case.function_signature(0).generic_params;
+	let params = case.ast.list(generic_params);
+	let spans = case.ast.spans(generic_params);
 	assert_eq!(text(spans[0]), "T: Memory where { Size = u32 }");
 	assert_eq!(text(spans[1]), "const N: u8");
 	let Some(BoundExpression::WithBindings { bindings, .. }) =
@@ -2944,18 +2992,19 @@ fn a_type_parameter_and_a_binding_span_what_is_written() {
 fn a_constant_parameter_is_marked_and_typed() {
 	let case = TestCase::new("func f<T: Add, const N: u32>() {}");
 	case.diagnostics().assert_none();
-	let [first, second] = case.ast.list(case.function_signature(0).type_params)
+	let [first, second] =
+		case.ast.list(case.function_signature(0).generic_params)
 	else {
 		panic!("expected two parameters")
 	};
 	assert!(matches!(
 		*first,
-		TypeParam::Type {
+		GenericParam::Type {
 			bounds: Some(_),
 			..
 		}
 	));
-	let TypeParam::Const { name, ty, .. } = second else {
+	let GenericParam::Const { name, ty, .. } = second else {
 		panic!("expected a constant parameter")
 	};
 	assert_eq!(case.name(name.inner), "N");
@@ -3143,7 +3192,7 @@ fn test_generic_struct() {
 	case.diagnostics().assert_none();
 	let Item::Struct {
 		name,
-		type_params,
+		generic_params,
 		fields,
 		..
 	} = case.item(0)
@@ -3151,19 +3200,19 @@ fn test_generic_struct() {
 		panic!("expected struct item")
 	};
 	assert_eq!(case.strings.resolve(name.inner), Some("Pair"));
-	assert_eq!(type_params.len(), 2);
+	assert_eq!(generic_params.len(), 2);
 	assert_eq!(
 		case.strings
-			.resolve(case.ast.list(*type_params)[0].name().inner),
+			.resolve(case.ast.list(*generic_params)[0].name().inner),
 		Some("T")
 	);
-	assert!(bounds(&case.ast.list(*type_params)[0]).is_none());
+	assert!(bounds(&case.ast.list(*generic_params)[0]).is_none());
 	assert_eq!(
 		case.strings
-			.resolve(case.ast.list(*type_params)[1].name().inner),
+			.resolve(case.ast.list(*generic_params)[1].name().inner),
 		Some("U")
 	);
-	assert!(bounds(&case.ast.list(*type_params)[1]).is_none());
+	assert!(bounds(&case.ast.list(*generic_params)[1]).is_none());
 	assert_eq!(fields.len(), 2);
 }
 
@@ -3175,12 +3224,12 @@ fn test_generic_struct_with_bounds() {
         );
     "});
 	case.diagnostics().assert_none();
-	let Item::Struct { type_params, .. } = case.item(0) else {
+	let Item::Struct { generic_params, .. } = case.item(0) else {
 		panic!("expected struct item")
 	};
-	assert_eq!(type_params.len(), 1);
+	assert_eq!(generic_params.len(), 1);
 	assert!(matches!(
-		bounds(&case.ast.list(*type_params)[0]).map(|b| case.ast.bound(b)),
+		bounds(&case.ast.list(*generic_params)[0]).map(|b| case.ast.bound(b)),
 		Some(BoundExpression::BoundList(list)) if list.len() == 2
 	));
 }
@@ -3481,7 +3530,7 @@ fn test_where_binding_parses_as_bound_with_bindings() {
 		panic!("expected function")
 	};
 	let signature = case.ast.signature(*signature);
-	let bounds = bounds(&case.ast.list(signature.type_params)[0])
+	let bounds = bounds(&case.ast.list(signature.generic_params)[0])
 		.expect("expected bounds");
 	let BoundExpression::WithBindings { path, bindings, .. } =
 		case.ast.bound(bounds)
@@ -3504,7 +3553,7 @@ fn a_constant_binding_is_marked_const() {
 	let signature = case.ast.signature(*signature);
 	let kinds: Vec<_> = case
 		.ast
-		.list(signature.type_params)
+		.list(signature.generic_params)
 		.iter()
 		.map(|param| {
 			let bounds = bounds(param).expect("expected bounds");
@@ -3542,10 +3591,10 @@ fn self_is_a_type_parameter_name() {
 		panic!("expected function")
 	};
 	let signature = case.ast.signature(*signature);
-	assert_eq!(signature.type_params.len(), 2);
+	assert_eq!(signature.generic_params.len(), 2);
 	assert_eq!(
 		case.strings
-			.resolve(case.ast.list(signature.type_params)[0].name().inner),
+			.resolve(case.ast.list(signature.generic_params)[0].name().inner),
 		Some("Self")
 	);
 }
@@ -3693,8 +3742,8 @@ fn a_missing_bound_keeps_its_owner_and_spans_the_gap() {
 			}
 			Item::Function { signature, .. } => {
 				let signature = case.ast.signature(*signature);
-				let bound =
-					bounds(&case.ast.list(signature.type_params)[0]).unwrap();
+				let bound = bounds(&case.ast.list(signature.generic_params)[0])
+					.unwrap();
 				if let BoundExpression::WithBindings { bindings, .. } =
 					case.ast.bound(bound)
 				{
@@ -3749,9 +3798,10 @@ fn a_binding_with_nothing_after_its_name_or_its_eq_keeps_the_bound() {
 		let case = TestCase::new(source);
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::UnexpectedToken]);
-		let bound =
-			bounds(&case.ast.list(case.function_signature(0).type_params)[0])
-				.unwrap();
+		let bound = bounds(
+			&case.ast.list(case.function_signature(0).generic_params)[0],
+		)
+		.unwrap();
 		let BoundExpression::WithBindings {
 			bindings,
 			open_brace,
@@ -4234,13 +4284,15 @@ fn test_type_alias_item() {
 	assert_eq!(case.name(name.inner), "Id");
 
 	let Item::TypeAlias {
-		name, type_params, ..
+		name,
+		generic_params,
+		..
 	} = case.item(1)
 	else {
 		panic!("item 1 is {}, not a type alias", item_kind(case.item(1)))
 	};
 	assert_eq!(case.name(name.inner), "Pair");
-	assert_eq!(type_params.len(), 1);
+	assert_eq!(generic_params.len(), 1);
 }
 
 #[test]

@@ -38,7 +38,7 @@ use crate::tir::literals::{CharLiteralError, parse_char_literal};
 use crate::tir::resolutions::{Definition, Reference, Site};
 use crate::tir::signatures::Semantics;
 use crate::tir::solver::SolverError;
-use crate::tir::types::{GenericArgs, GenericEnvOwner, Type, TypeIndex};
+use crate::tir::types::{GenericArgs, GenericFrameOwner, Type, TypeIndex};
 use crate::vfs::FileId;
 
 /// Validate a positional pattern list and return the element range covered by
@@ -346,7 +346,7 @@ impl BodyBuilder<'_, '_> {
 			.expect("the core must declare the `Eq` trait");
 		match self.sema.find_trait_impl_query(
 			self.builder.strings,
-			self.scope.assumption_env,
+			self.assumption_env,
 			normalized,
 			trait_index,
 		) {
@@ -1122,13 +1122,13 @@ impl BodyBuilder<'_, '_> {
 				self.sema.diagnostics.push(diagnostic);
 			}
 			let params =
-				self.sema.structs[usize::from(struct_index)].type_params;
-			let count = self.sema.generic_envs.param_names(params).len();
+				self.sema.structs[usize::from(struct_index)].generic_params;
+			let count = self.sema.generic_frames.param_names(params).len();
 			let mut written = vec![TypeIndex::INFER; count].into_boxed_slice();
 			self.write_type_args(
 				segment,
 				params,
-				GenericEnvOwner::Struct(struct_index),
+				GenericFrameOwner::Struct(struct_index),
 				&mut written,
 			);
 			(struct_index, written)
@@ -1433,8 +1433,10 @@ impl BodyBuilder<'_, '_> {
 						let signature =
 							&self.sema.constants[usize::from(constant)];
 						let ty = signature.ty;
-						let env =
-							self.sema.assumption_envs.of_frame(signature.env);
+						let env = self
+							.sema
+							.assumption_envs
+							.normalized(signature.generic_params);
 						let ty = self.context().normalized_in(ty, env);
 						let kind = PatternKind::Constant {
 							constant,

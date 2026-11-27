@@ -1,0 +1,224 @@
+// Stress for generic items: parameterized structs and impls, trait bounds
+// with supertraits and default methods, and nested instantiations used at
+// many call sites.
+
+trait Shape: StackValue {
+    func area(self: Self) -> f64;
+    func scale(self: Self, by: f64) -> Self;
+
+    #[inline]
+    func doubled(self: Self) -> Self {
+        self.scale(2.0)
+    }
+}
+
+trait Named: Shape {
+    func id(self: Self) -> u32;
+
+    #[inline]
+    func bigger<Other: Named>(self: Self, other: Other) -> Bool {
+        self.area() > other.area()
+    }
+}
+
+struct Square(side: f64);
+struct Rect(w: f64, h: f64);
+struct Circle(r: f64);
+
+impl Shape for Square {
+    func area(self: Self) -> f64 {
+        self.side * self.side
+    }
+
+    func scale(self: Self, by: f64) -> Self {
+        Self{ side: self.side * by }
+    }
+}
+
+impl Shape for Rect {
+    func area(self: Self) -> f64 {
+        self.w * self.h
+    }
+
+    func scale(self: Self, by: f64) -> Self {
+        Self{ w: self.w * by, h: self.h * by }
+    }
+}
+
+impl Shape for Circle {
+    func area(self: Self) -> f64 {
+        3.14159 * self.r * self.r
+    }
+
+    func scale(self: Self, by: f64) -> Self {
+        Self{ r: self.r * by }
+    }
+}
+
+impl Named for Square {
+    func id(self: Self) -> u32 {
+        1
+    }
+}
+
+impl Named for Rect {
+    func id(self: Self) -> u32 {
+        2
+    }
+}
+
+impl Named for Circle {
+    func id(self: Self) -> u32 {
+        3
+    }
+}
+
+struct Pair<A, B>(first: A, second: B);
+struct Triple<A, B, C>(a: A, b: B, c: C);
+struct Wrap<T>(inner: T);
+
+impl<A: Shape, B: Shape> Shape for Pair<A, B> {
+    func area(self: Self) -> f64 {
+        self.first.area() + self.second.area()
+    }
+
+    func scale(self: Self, by: f64) -> Self {
+        Self{ first: self.first.scale(by), second: self.second.scale(by) }
+    }
+}
+
+impl<A: Named, B: Named> Named for Pair<A, B> {
+    func id(self: Self) -> u32 {
+        self.first.id() * 10 + self.second.id()
+    }
+}
+
+impl<A: Shape, B: Shape, C: Shape> Shape for Triple<A, B, C> {
+    func area(self: Self) -> f64 {
+        self.a.area() + self.b.area() + self.c.area()
+    }
+
+    func scale(self: Self, by: f64) -> Self {
+        Self{ a: self.a.scale(by), b: self.b.scale(by), c: self.c.scale(by) }
+    }
+}
+
+impl<A: Named, B: Named, C: Named> Named for Triple<A, B, C> {
+    func id(self: Self) -> u32 {
+        self.a.id() * 100 + self.b.id() * 10 + self.c.id()
+    }
+}
+
+impl<T: Shape> Shape for Wrap<T> {
+    func area(self: Self) -> f64 {
+        self.inner.area()
+    }
+
+    func scale(self: Self, by: f64) -> Self {
+        Self{ inner: self.inner.scale(by) }
+    }
+}
+
+impl<T: Named> Named for Wrap<T> {
+    func id(self: Self) -> u32 {
+        self.inner.id() + 1000
+    }
+}
+
+impl<A: StackValue, B: StackValue> Pair<A, B> {
+    #[inline]
+    func swap(self: Self) -> Pair<B, A> {
+        Pair{ first: self.second, second: self.first }
+    }
+
+    #[inline]
+    func with_first<C: StackValue>(self: Self, first: C) -> Pair<C, B> {
+        Pair{ first, second: self.second }
+    }
+}
+
+impl<T: StackValue> Wrap<T> {
+    #[inline]
+    func wrap(self: Self) -> Wrap<Wrap<T>> {
+        Wrap{ inner: self }
+    }
+
+    #[inline]
+    func pair<U: StackValue>(self: Self, other: U) -> Pair<T, U> {
+        Pair{ first: self.inner, second: other }
+    }
+}
+
+func total<A: Named, B: Named>(a: A, b: B) -> f64 {
+    if (a.bigger(b)) { a.doubled().area() } else { b.doubled().area() }
+}
+
+func total3<A: Named, B: Named, C: Named>(a: A, b: B, c: C) -> f64 {
+    total(a, b) + total(b, c) + total(Pair{ first: a, second: b }, c)
+}
+
+func nest<T: Named>(x: T) -> Wrap<Wrap<Wrap<T>>> {
+    Wrap{ inner: x }.wrap().wrap()
+}
+
+func score<T: Named>(x: T) -> f64 {
+    local w = nest(x);
+    w.area() + w.doubled().area() + w.inner.inner.area() + total(w, x)
+}
+
+pub func run_squares(s: f64) -> f64 {
+    local a = Square{ side: s };
+    local b = Rect{ w: s, h: s + 1.0 };
+    local c = Circle{ r: s };
+    total3(a, b, c) + score(a) + score(b) + score(c)
+}
+
+pub func run_pairs(s: f64) -> f64 {
+    local a = Square{ side: s };
+    local b = Rect{ w: s, h: 2.0 };
+    local c = Circle{ r: s };
+    local ab = Pair{ first: a, second: b };
+    local bc = Pair{ first: b, second: c };
+    local ca = Pair{ first: c, second: a };
+    total3(ab, bc, ca) + score(ab) + score(bc.swap()) + score(ca.with_first(b))
+}
+
+pub func run_triples(s: f64) -> f64 {
+    local a = Square{ side: s };
+    local b = Rect{ w: s, h: 3.0 };
+    local c = Circle{ r: s };
+    local t1 = Triple{ a, b, c };
+    local t2 = Triple{ a: c, b: a, c: b };
+    local t3 = Triple{
+        a: Pair{ first: a, second: c },
+        b: Wrap{ inner: b },
+        c: t1,
+    };
+    total3(t1, t2, t3) + score(t1) + score(t2) + score(t3)
+}
+
+pub func run_wraps(s: f64) -> f64 {
+    local a = Wrap{ inner: Square{ side: s } };
+    local b = a.wrap();
+    local c = b.wrap();
+    local d = Wrap{ inner: c.pair(Circle{ r: s }) };
+    total3(a, b, c) + total3(b, c, d) + score(d) + score(d.wrap())
+}
+
+pub func run_mixed(s: f64) -> f64 {
+    local p = Pair{
+        first: Wrap{ inner: Rect{ w: s, h: s } },
+        second: Triple{
+            a: Square{ side: s },
+            b: Circle{ r: s },
+            c: Rect{ w: 1.0, h: s },
+        },
+    };
+    local q = p.swap();
+    local r = Pair{ first: p, second: q };
+    total3(p, q, r)
+        + score(r)
+        + score(Wrap{ inner: r })
+        + run_wraps(s)
+        + run_triples(s)
+}

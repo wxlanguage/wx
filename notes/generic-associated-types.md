@@ -8,6 +8,10 @@ the design for when something else needs one: a trait whose impls are
 written by users with a member that takes parameters (a collection family's
 `type Of<T>`, say). Nothing planned does yet.
 
+Revisited 2026-11-25: `pointee-and-sized.md` brings the pointee-side
+`Pointee` trait back, with `type Metadata<Size: PointerSize>`, as the
+planned first user.
+
 When to revisit: after generic constants (`const N<S: PointerSize>`), which
 need the same pieces (a frame for a member's own parameters, flat
 arguments `[Self, own…]`, per-instance values) and make GATs cheap. A GAT

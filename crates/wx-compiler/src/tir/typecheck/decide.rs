@@ -78,9 +78,7 @@ impl BodyContext<'_> {
 		let name = self.sema.decls.name(constant).inner;
 		let name = self.strings.resolve(name).unwrap().to_owned();
 		let at = self.source_span(expr);
-		for concrete in
-			self.sema.concrete_types(self.scope.assumption_env, target)
-		{
+		for concrete in self.sema.concrete_types(self.assumption_env, target) {
 			let held = if kind == TypeIndex::CONST_CHAR {
 				u32::try_from(value)
 					.map_err(|_| CharMiss::OutOfRange)
@@ -156,9 +154,7 @@ impl BodyContext<'_> {
 			.unwrap()
 			.to_owned();
 		let at = self.source_span(expr);
-		for concrete in
-			self.sema.concrete_types(self.scope.assumption_env, target)
-		{
+		for concrete in self.sema.concrete_types(self.assumption_env, target) {
 			let Err(miss) = self.sema.read_float_literal(value, concrete)
 			else {
 				continue;
@@ -224,7 +220,7 @@ impl BodyContext<'_> {
 			} => (constant, self.sema.generic_args.types(type_args).to_vec()),
 			_ => unreachable!("only a constant's representability is decided"),
 		};
-		let env = self.scope.assumption_env;
+		let env = self.assumption_env;
 		match self
 			.sema
 			.untyped_value(self.strings, env, constant, &args)
@@ -277,7 +273,7 @@ impl BodyContext<'_> {
 		else {
 			unreachable!("a literal with a length becomes an array")
 		};
-		let scope = self.scope.assumption_env;
+		let scope = self.assumption_env;
 		let target_now = self.sema.normalize(
 			self.strings,
 			scope,

@@ -591,7 +591,7 @@ struct Delimited<T> {
 
 /// Generic parameters as parsed: none, or `<...>` and its span.
 struct TypeParams {
-	list: List<TypeParam>,
+	list: List<GenericParam>,
 	span: Option<TextSpan>,
 }
 
@@ -1248,7 +1248,7 @@ impl<'ctx> Parser<'ctx> {
 		let fn_span = self.lexer.next();
 		let name = self.expect_name(&[])?;
 
-		let type_params = self.parse_optional_type_params()?;
+		let generic_params = self.parse_optional_generic_params()?;
 
 		let params =
 			self.separated(PARENS, Parser::parse_function_param_item)?;
@@ -1268,8 +1268,8 @@ impl<'ctx> Parser<'ctx> {
 			inner: FunctionSignature {
 				func_at: fn_span.span.start,
 				name,
-				type_params: type_params.list,
-				type_params_span: type_params.span,
+				generic_params: generic_params.list,
+				generic_params_span: generic_params.span,
 				params: params.inner,
 				params_span: params.span,
 				result,
@@ -1337,23 +1337,25 @@ impl<'ctx> Parser<'ctx> {
 	/// Parse `<T, U: Bound1 + Bound2, const N: u32>` — generic parameter
 	/// declarations.
 	/// Generic parameters, `<T, U: Bound>`, when the next token opens them.
-	fn parse_optional_type_params(&mut self) -> Result<TypeParams, ()> {
+	fn parse_optional_generic_params(&mut self) -> Result<TypeParams, ()> {
 		if self.lexer.peek().inner != Token::LeftArrow {
 			return Ok(TypeParams {
 				list: List::EMPTY,
 				span: None,
 			});
 		}
-		let Spanned { inner, span } = self.parse_type_params()?;
+		let Spanned { inner, span } = self.parse_generic_params()?;
 		Ok(TypeParams {
 			list: inner,
 			span: Some(span),
 		})
 	}
 
-	fn parse_type_params(&mut self) -> Result<Spanned<List<TypeParam>>, ()> {
+	fn parse_generic_params(
+		&mut self,
+	) -> Result<Spanned<List<GenericParam>>, ()> {
 		let open_span = self.next_expect(Token::LeftArrow)?.span;
-		let mut params: Vec<Spanned<TypeParam>> = Vec::new();
+		let mut params: Vec<Spanned<GenericParam>> = Vec::new();
 
 		let close_end = loop {
 			let peeked = self.lexer.peek();
@@ -1389,7 +1391,7 @@ impl<'ctx> Parser<'ctx> {
 					let ty = self.parse_type_expression()?;
 					let end = self.ast.types.spans[usize::from(ty)].end;
 					(
-						TypeParam::Const {
+						GenericParam::Const {
 							const_at: const_span.start,
 							name,
 							ty,
@@ -1407,7 +1409,7 @@ impl<'ctx> Parser<'ctx> {
 					let end = bounds.map_or(name.span.end, |bounds| {
 						self.ast.bounds.spans[usize::from(bounds)].end
 					});
-					(TypeParam::Type { name, bounds }, end)
+					(GenericParam::Type { name, bounds }, end)
 				}
 			};
 			params.push(Spanned {
@@ -3955,7 +3957,7 @@ impl<'ctx> Parser<'ctx> {
 					inner: name_symbol,
 					span: name_span,
 				} = parser.expect_name(&[])?;
-				let type_params = parser.parse_optional_type_params()?;
+				let generic_params = parser.parse_optional_generic_params()?;
 				let params = parser
 					.separated(PARENS, Parser::parse_function_param_item)?;
 				let params = parser.push_delimited_nodes(params);
@@ -3977,8 +3979,8 @@ impl<'ctx> Parser<'ctx> {
 									inner: name_symbol,
 									span: name_span,
 								},
-								type_params: type_params.list,
-								type_params_span: type_params.span,
+								generic_params: generic_params.list,
+								generic_params_span: generic_params.span,
 								params: params.inner,
 								params_span: params.span,
 								result,
@@ -4004,7 +4006,7 @@ impl<'ctx> Parser<'ctx> {
 	fn parse_impl_item(parser: &mut Parser) -> Result<Spanned<Item>, ()> {
 		let impl_span = parser.lexer.next().span;
 
-		let type_params = parser.parse_optional_type_params()?;
+		let generic_params = parser.parse_optional_generic_params()?;
 
 		let first_path = parser.parse_type_path()?;
 		if let Some(Keyword::For) = parser.peek_keyword() {
@@ -4052,8 +4054,8 @@ impl<'ctx> Parser<'ctx> {
 			let span = TextSpan::new(impl_span.start, items.span.end);
 			return Ok(Spanned {
 				inner: Item::TraitImpl {
-					type_params: type_params.list,
-					type_params_span: type_params.span,
+					generic_params: generic_params.list,
+					generic_params_span: generic_params.span,
 					items: items.inner,
 					target,
 					trait_name: first_path,
@@ -4068,8 +4070,8 @@ impl<'ctx> Parser<'ctx> {
 		let span = TextSpan::new(impl_span.start, items.span.end);
 		Ok(Spanned {
 			inner: Item::InherentImpl {
-				type_params: type_params.list,
-				type_params_span: type_params.span,
+				generic_params: generic_params.list,
+				generic_params_span: generic_params.span,
 				items: items.inner,
 				target: first_path,
 			},
@@ -4310,7 +4312,7 @@ impl<'ctx> Parser<'ctx> {
 			span: name_span,
 		} = parser.expect_name(&[])?;
 
-		let type_params = parser.parse_optional_type_params()?;
+		let generic_params = parser.parse_optional_generic_params()?;
 
 		let name = Spanned {
 			inner: name_symbol,
@@ -4358,8 +4360,8 @@ impl<'ctx> Parser<'ctx> {
 				pub_at: None,
 				attributes: List::EMPTY,
 				name,
-				type_params: type_params.list,
-				type_params_span: type_params.span,
+				generic_params: generic_params.list,
+				generic_params_span: generic_params.span,
 				fields: fields.inner,
 			},
 			span,
@@ -4393,13 +4395,13 @@ impl<'ctx> Parser<'ctx> {
 			span: name_span,
 		} = parser.expect_name(&[])?;
 
-		let type_params = parser.parse_optional_type_params()?;
+		let generic_params = parser.parse_optional_generic_params()?;
 
 		// No `= TypeExpr` body — a bodiless `type Name;` declaration, only
 		// legal when tagged `#[intrinsic]` (checked in TIR). Used for
 		// primitives, which have no expressible type-expression right-hand
 		// side of their own and are never generic, so falling back to
-		// `name_span` (rather than tracking `type_params`' own end, which
+		// `name_span` (rather than tracking `generic_params`' own end, which
 		// nothing else in this parser needs either) is exact for every real
 		// use of this branch.
 		let body = if parser.lexer.peek().inner == Token::Eq {
@@ -4421,8 +4423,8 @@ impl<'ctx> Parser<'ctx> {
 					inner: name_symbol,
 					span: name_span,
 				},
-				type_params: type_params.list,
-				type_params_span: type_params.span,
+				generic_params: generic_params.list,
+				generic_params_span: generic_params.span,
 				body,
 				attributes: List::EMPTY,
 			},
@@ -4932,7 +4934,7 @@ impl<'ctx> Parser<'ctx> {
 				parser.lexer.next();
 				let name = parser.expect_name(&[])?;
 				let name_span = name.span;
-				let type_params = parser.parse_optional_type_params()?;
+				let generic_params = parser.parse_optional_generic_params()?;
 				let end = if parser.lexer.next_if(Token::Eq).is_some() {
 					let body = parser.parse_type_expression()?;
 					parser.report_crate_member_body(
@@ -4948,8 +4950,8 @@ impl<'ctx> Parser<'ctx> {
 						package_at: package_span.start,
 						attributes: List::EMPTY,
 						name,
-						type_params: type_params.list,
-						type_params_span: type_params.span,
+						generic_params: generic_params.list,
+						generic_params_span: generic_params.span,
 					},
 					end,
 				)

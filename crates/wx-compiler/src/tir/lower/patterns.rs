@@ -28,7 +28,7 @@ use crate::diagnostics::TextSpan;
 use crate::tir::body::{
 	Arm, ArmRange, ExprKind, PatIdx, PatternKind, PatternRange,
 };
-use crate::tir::bounds::AssumptionEnvIdx;
+use crate::tir::clauses::AssumptionEnvIdx;
 use crate::tir::decls::{ConstIdx, FieldIdx, MemberKind};
 use crate::tir::members::{TraitImplLookup, TraitMemberSelection};
 use crate::tir::types::Primitive;
@@ -703,7 +703,7 @@ impl Lowerer<'_> {
 				unreachable!()
 			}
 		};
-		let TraitImplLookup::Concrete { impl_index } = lookup else {
+		let TraitImplLookup::Concrete { impl_index, args } = lookup else {
 			self.unsupported(
 				state.file_id,
 				span,
@@ -727,12 +727,6 @@ impl Lowerer<'_> {
 		};
 		// `eq` has no parameters of its own, so the impl's arguments, concrete
 		// because the subject is, are the method's.
-		let args = self.sema.trait_impl_args(
-			self.strings,
-			AssumptionEnvIdx::ROOT,
-			impl_index,
-			subject.tir_ty,
-		);
 		let callee = self.instance(function, &args);
 		let callee_id = self.enqueue_from(state, callee, span)?;
 		// The checked signature's count; nothing about the callee is

@@ -38,11 +38,12 @@ use super::body::{
 	Body, ConstBody, ElementOrder, ExprIdx, ExprKind, ExprRange,
 	FunctionImplementation,
 };
-use super::bounds::AssumptionEnvIdx;
+use super::clauses::AssumptionEnvIdx;
 use super::decls::{
 	ConstIdx, EnumIdx, FunctionIdx, GlobalIdx, MemberKind, MemberOwner,
 	MemoryIdx,
 };
+use super::finiteness::FiniteType;
 use super::literals::ConcreteType;
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::numbers::DecimalFloat;
@@ -52,7 +53,7 @@ use super::solver::{
 	metadata_len,
 };
 use super::types::{
-	GenericEnvIdx, Primitive, Substitution, Type, TypeIndex, TypeList,
+	GenericFrameIdx, Primitive, Substitution, Type, TypeIndex, TypeList,
 };
 use crate::ast::{BinaryOp, StringInterner, UnaryOp};
 use crate::diagnostics::{DiagnosticCode, Diagnostics, SourceSpan, TextSpan};
@@ -317,14 +318,14 @@ fn body_of<'a>(sema: &'a Semantics, owner: Owner<'_>) -> &'a Body {
 }
 
 /// The type scope `owner`'s body is checked in: a global's is the root.
-fn body_env(sema: &Semantics, owner: Owner<'_>) -> GenericEnvIdx {
+fn body_frame(sema: &Semantics, owner: Owner<'_>) -> GenericFrameIdx {
 	match owner.body {
 		Evaluated::Constant(const_index) => {
-			sema.constants[usize::from(const_index)].env
+			sema.constants[usize::from(const_index)].generic_params
 		}
-		Evaluated::Global(_) => GenericEnvIdx::ROOT,
+		Evaluated::Global(_) => GenericFrameIdx::ROOT,
 		Evaluated::Function(function_index) => {
-			sema.functions[usize::from(function_index)].type_params
+			sema.functions[usize::from(function_index)].generic_params
 		}
 	}
 }
@@ -353,8 +354,8 @@ impl Semantics {
 		strings: &StringInterner,
 		const_index: ConstIdx,
 	) {
-		let env = self.constants[usize::from(const_index)].env;
-		if self.generic_envs.generic_count(env) > 0 {
+		let frame = self.constants[usize::from(const_index)].generic_params;
+		if self.generic_frames.generic_count(frame) > 0 {
 			if self.solver.const_values[usize::from(const_index)]
 				== ConstValueState::Unchecked
 			{
@@ -396,13 +397,7 @@ impl Semantics {
 		// A value type of other than one Wasm value is reported by the type's
 		// check (`Global::Value`'s bounds).
 		if self
-			.push_scalars(
-				strings,
-				AssumptionEnvIdx::ROOT,
-				ty,
-				&mut scalars,
-				&mut Vec::new(),
-			)
+			.root_scalars(strings, AssumptionEnvIdx::ROOT, ty, &mut scalars)
 			.is_err()
 			|| scalars.len() != 1
 		{
@@ -851,7 +846,7 @@ impl Solver {
 				matches!(frame, SolverFrame::Evaluation { instance: on, .. } if *on == instance)
 			})
 			.expect("an in-progress constant is on the stack");
-		self.state.lowest_frame_read = self.state.lowest_frame_read.min(start);
+		self.state.read_frame(start);
 		let mut members: Vec<Instance> = self.state.frames[start..]
 			.iter()
 			.filter_map(|frame| match *frame {
@@ -1601,20 +1596,19 @@ impl Semantics {
 		};
 		// Elements whose bytes are not known yet (of an abstract type) cannot
 		// be written.
-		let (layout, places) = match self.memory_values(
-			strings,
-			self.assumption_envs.of_frame(body_env(self, owner)),
-			of,
-		) {
-			Ok(Some(layout)) => layout,
-			Ok(None) => {
-				return Err(Halt::Own(EvalError {
-					span,
-					kind: EvalErrorKind::NotConst,
-				}));
-			}
-			Err(_) => return Err(Halt::Silent),
-		};
+		let normalized_env =
+			self.normalize_env(strings, body_frame(self, owner));
+		let (layout, places) =
+			match self.memory_values(strings, normalized_env, of) {
+				Ok(Some(layout)) => layout,
+				Ok(None) => {
+					return Err(Halt::Own(EvalError {
+						span,
+						kind: EvalErrorKind::NotConst,
+					}));
+				}
+				Err(_) => return Err(Halt::Silent),
+			};
 		// An offset into an allocation is a `u32`.
 		let Some(size) = count
 			.checked_mul(u64::from(layout.size))
@@ -1673,11 +1667,14 @@ impl Semantics {
 		ty: TypeIndex,
 		span: TextSpan,
 	) -> Result<(MemoryIdx, Primitive), Halt> {
-		let scope = self.assumption_envs.of_frame(body_env(self, owner));
+		let normalized_env =
+			self.normalize_env(strings, body_frame(self, owner));
 		let Type::Pointer { memory, .. } = *self.types.resolve(ty) else {
 			unreachable!("static data is behind a pointer")
 		};
-		let Some(memory_index) = self.memory_of(strings, scope, memory) else {
+		let Some(memory_index) =
+			self.memory_of(strings, normalized_env, memory)
+		else {
 			return Err(Halt::Own(EvalError {
 				span,
 				kind: EvalErrorKind::NotConst,
@@ -1685,7 +1682,7 @@ impl Semantics {
 		};
 		// The memory is known, so its `Size` is: a failure was reported.
 		let width = self
-			.address_scalar(strings, scope, memory)
+			.address_scalar(strings, normalized_env, memory)
 			.map_err(|_| Halt::Silent)?;
 		Ok((memory_index, width))
 	}
@@ -1726,10 +1723,11 @@ impl Semantics {
 		owner: Owner<'_>,
 		length: TypeIndex,
 	) -> Result<u64, Halt> {
-		let env = body_env(self, owner);
+		let frame = body_frame(self, owner);
+		let normalized_env = self.normalize_env(strings, frame);
 		match self.normalize(
 			strings,
-			self.assumption_envs.of_frame(env),
+			normalized_env,
 			length,
 			NormalizationDepth::Shallow,
 			RewriteFlags::ALL,
@@ -1752,18 +1750,19 @@ impl Semantics {
 		if owner.args.is_empty() {
 			return ty;
 		}
-		let env = body_env(self, owner);
+		let frame = body_frame(self, owner);
 		let ty = self.types.substitute(
 			ty,
 			Substitution {
-				envs: &self.generic_envs,
-				env,
+				frames: &self.generic_frames,
+				frame,
 				args: owner.args,
 			},
 		);
+		let normalized_env = self.normalize_env(strings, frame);
 		self.normalize(
 			strings,
-			self.assumption_envs.of_frame(env),
+			normalized_env,
 			ty,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
@@ -1816,24 +1815,19 @@ impl Semantics {
 				receiver,
 				trait_index,
 			)? {
-				Some(TraitImplLookup::Concrete { impl_index }) => {
+				Some(TraitImplLookup::Concrete {
+					impl_index,
+					args: impl_args,
+				}) => {
 					match self.decls.select_trait_member(
 						impl_index,
 						MemberKind::Constant(constant),
 					) {
 						TraitMemberSelection::Impl(MemberKind::Constant(
 							own,
-						)) => {
-							let impl_args = self.trait_impl_args(
-								strings,
-								AssumptionEnvIdx::ROOT,
-								impl_index,
-								receiver,
-							);
-							ResolvedConstant::Instance(
-								self.instance(own, &impl_args),
-							)
-						}
+						)) => ResolvedConstant::Instance(
+							self.instance(own, &impl_args),
+						),
 						_ if Some(constant)
 							== self.decls.intrinsics.memory_data_end
 							&& let Type::Memory { memory_index } =
@@ -2002,16 +1996,11 @@ impl Semantics {
 		owner: Owner<'_>,
 	) -> Result<Vec<Primitive>, ConstValueState> {
 		let signature = &self.constants[usize::from(const_index)];
-		let (ty, scope) = (signature.ty, signature.env);
+		let (ty, frame) = (signature.ty, signature.generic_params);
 		let ty = self.instance_type(strings, owner, ty);
 		let mut scalars = Vec::new();
-		self.push_scalars(
-			strings,
-			self.assumption_envs.of_frame(scope),
-			ty,
-			&mut scalars,
-			&mut Vec::new(),
-		)?;
+		let normalized_env = self.normalize_env(strings, frame);
+		self.root_scalars(strings, normalized_env, ty, &mut scalars)?;
 		Ok(scalars)
 	}
 
@@ -2022,41 +2011,42 @@ impl Semantics {
 	/// final state of a constant of a type the evaluator holds no values of:
 	/// no value (`!`, a function reference, an abstract type, an address into
 	/// a memory not known), or poisoned when the type, or a field's, failed to
-	/// resolve, which was reported where it is written. A struct reached
-	/// again through `visiting`, the structs being looked through as
-	/// instantiated, contains itself, which is reported on the struct.
-	fn push_scalars(
+	/// resolve, which was reported where it is written, or an infinite type,
+	/// reported where its cycle closed.
+	fn root_scalars(
 		&mut self,
 		strings: &StringInterner,
 		scope: AssumptionEnvIdx,
 		ty: TypeIndex,
 		out: &mut Vec<Primitive>,
-		visiting: &mut Vec<TypeIndex>,
 	) -> Result<(), ConstValueState> {
 		let ty = self
-			.normalize(
-				strings,
-				scope,
-				ty,
-				NormalizationDepth::Deep,
-				RewriteFlags::ALL,
-			)
+			.finite(strings, scope, ty)
+			.map_err(|_| ConstValueState::Poisoned)?;
+		self.push_scalars(strings, ty, out)
+	}
+
+	fn push_scalars(
+		&mut self,
+		strings: &StringInterner,
+		ty: FiniteType,
+		out: &mut Vec<Primitive>,
+	) -> Result<(), ConstValueState> {
+		let ty = self
+			.normalize_finite(strings, ty, NormalizationDepth::Deep)
 			.unwrap_or(ty);
-		if ty == TypeIndex::ERROR {
+		let scope = ty.env();
+		if ty.ty() == TypeIndex::ERROR {
 			return Err(ConstValueState::Poisoned);
 		}
-		if let Some(scalar) = Primitive::of(ty) {
+		if let Some(scalar) = Primitive::of(ty.ty()) {
 			out.push(scalar);
 			return Ok(());
 		}
-		match *self.types.resolve(ty) {
+		match *self.types.resolve(ty.ty()) {
 			Type::Function { .. }
 			| Type::Memory { .. }
 			| Type::Global { .. } => Ok(()),
-			Type::Enum { enum_index } => {
-				let repr = self.enums[usize::from(enum_index)].repr;
-				self.push_scalars(strings, scope, repr, out, visiting)
-			}
 			// An address, then the pointee's counts.
 			Type::Pointer { to, memory, .. } => {
 				let scalar = self.address_scalar(strings, scope, memory)?;
@@ -2070,58 +2060,14 @@ impl Semantics {
 				out.extend(std::iter::repeat_n(scalar, 1 + count));
 				Ok(())
 			}
-			Type::Tuple { elements } => {
+			Type::Enum { .. } | Type::Tuple { .. } | Type::Struct { .. } => {
 				let mut held = Ok(());
-				for at in 0..self.types.list(elements).len() {
-					let element = self.types.list(elements)[at];
-					held = merge(
-						held,
-						self.push_scalars(
-							strings, scope, element, out, visiting,
-						),
-					);
+				for part in self.parts(ty) {
+					held = merge(held, self.push_scalars(strings, part, out));
 					if held == Err(ConstValueState::Poisoned) {
 						break;
 					}
 				}
-				held
-			}
-			Type::Struct {
-				struct_index,
-				type_args,
-			} => {
-				if visiting.contains(&ty)
-					|| visiting.len() > self.solver.state.recursion_budget
-				{
-					return Err(ConstValueState::Poisoned);
-				}
-				let env = self.structs[usize::from(struct_index)].type_params;
-				visiting.push(ty);
-				let args: Box<[TypeIndex]> = self.types.list(type_args).into();
-				let mut held = Ok(());
-				let count =
-					self.structs[usize::from(struct_index)].field_types.len();
-				for at in 0..count {
-					let fields =
-						self.structs[usize::from(struct_index)].field_types;
-					let field = self.types.list(fields)[at];
-					let field = self.types.substitute(
-						field,
-						Substitution {
-							envs: &self.generic_envs,
-							env,
-							args: &args,
-						},
-					);
-					held = merge(
-						held,
-						self.push_scalars(strings, scope, field, out, visiting),
-					);
-					if held == Err(ConstValueState::Poisoned) {
-						break;
-					}
-				}
-				visiting.pop();
 				held
 			}
 			_ => Err(ConstValueState::NoValue),

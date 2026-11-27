@@ -1,0 +1,311 @@
+// Stress for aggregates: many distinct struct and enum types, nested and
+// generic, passed and returned by value (each needs its stack
+// representation), fields typed by projections (instance judging), and
+// pointers to aggregates in memory.
+
+#[memory_limits{ min_pages: 1 }]
+memory heap: u32;
+
+enum Kind(value: u8) {
+    Empty = 0,
+    Wall = 1,
+    Door = 2,
+    Water = 3,
+}
+
+enum Level(value: u32) {
+    Low = 0,
+    Mid = 1,
+    High = 2,
+}
+
+struct Vec2(x: f32, y: f32);
+struct Vec3(x: f32, y: f32, z: f32);
+struct Rgba(r: u8, g: u8, b: u8, a: u8);
+struct Cell(kind: Kind, level: Level, color: Rgba);
+struct Rect(min: Vec2, max: Vec2);
+struct Box3(min: Vec3, max: Vec3, color: Rgba);
+struct Ray(origin: Vec3, dir: Vec3, len: f32);
+struct Hit(ray: Ray, cell: Cell, at: Vec3, normal: Vec3);
+
+struct Pair<A, B>(first: A, second: B);
+struct Triple<A, B, C>(a: A, b: B, c: C);
+struct Tagged<T>(tag: Kind, value: T);
+struct Span<T>(start: T, end: T);
+struct Ptr<T>(at: heap::*T);
+struct Node<T>(value: T, next: heap::*Node<T>);
+
+trait Element: StackValue {
+    type Wide: StackValue;
+    func widen(self: Self) -> Self::Wide;
+}
+
+impl Element for u8 {
+    type Wide = u32;
+
+    func widen(self: Self) -> u32 {
+        transmute::<u8, u32>(self)
+    }
+}
+
+impl Element for f32 {
+    type Wide = Vec2;
+
+    func widen(self: Self) -> Vec2 {
+        Vec2{ x: self, y: self }
+    }
+}
+
+impl Element for Rgba {
+    type Wide = Pair<u32, u32>;
+
+    func widen(self: Self) -> Pair<u32, u32> {
+        Pair{ first: self.r.widen(), second: self.a.widen() }
+    }
+}
+
+// Fields typed by projections: each instance is judged at its arguments.
+struct Widened<E: Element>(narrow: E, wide: E::Wide);
+struct Both<E: Element, F: Element>(
+    left: Widened<E>,
+    right: Widened<F>,
+    sum: Pair<E::Wide, F::Wide>,
+);
+
+func vec2(x: f32, y: f32) -> Vec2 {
+    Vec2{ x, y }
+}
+
+func vec3(x: f32, y: f32, z: f32) -> Vec3 {
+    Vec3{ x, y, z }
+}
+
+func add3(a: Vec3, b: Vec3) -> Vec3 {
+    vec3(a.x + b.x, a.y + b.y, a.z + b.z)
+}
+
+func scale3(a: Vec3, k: f32) -> Vec3 {
+    vec3(a.x * k, a.y * k, a.z * k)
+}
+
+func gray(v: u8) -> Rgba {
+    Rgba{ r: v, g: v, b: v, a: 255 }
+}
+
+func cell(kind: Kind, level: Level, v: u8) -> Cell {
+    Cell{ kind, level, color: gray(v) }
+}
+
+func widened<E: Element>(narrow: E) -> Widened<E> {
+    Widened{ narrow, wide: narrow.widen() }
+}
+
+func both<E: Element, F: Element>(e: E, f: F) -> Both<E, F> {
+    Both{
+        left: widened(e),
+        right: widened(f),
+        sum: Pair{ first: e.widen(), second: f.widen() },
+    }
+}
+
+func pair<A: StackValue, B: StackValue>(first: A, second: B) -> Pair<A, B> {
+    Pair{ first, second }
+}
+
+func swap<A: StackValue, B: StackValue>(p: Pair<A, B>) -> Pair<B, A> {
+    Pair{ first: p.second, second: p.first }
+}
+
+func triple<A: StackValue, B: StackValue, C: StackValue>(
+    a: A,
+    b: B,
+    c: C,
+) -> Triple<A, B, C> {
+    Triple{ a, b, c }
+}
+
+func tag<T: StackValue>(tag: Kind, value: T) -> Tagged<T> {
+    Tagged{ tag, value }
+}
+
+func span<T: StackValue>(start: T, end: T) -> Span<T> {
+    Span{ start, end }
+}
+
+func cast(origin: Vec3, dir: Vec3, steps: u32) -> Hit {
+    loop (at = origin, i: u32 = 0) {
+        if (i == steps) {
+            break Hit{
+                ray: Ray{ origin, dir, len: 1.0 },
+                cell: cell(Kind::Wall, Level::High, 200),
+                at,
+                normal: scale3(dir, -1.0),
+            };
+        }
+        (add3(at, dir), i + 1)
+    }
+}
+
+func classify(c: Cell) -> u32 {
+    match (c.kind) {
+        Kind::Empty => 0,
+        Kind::Wall => match (c.level) {
+            Level::Low => 1,
+            Level::Mid => 2,
+            _ => 3,
+        },
+        Kind::Door => 4,
+        _ => 5,
+    }
+}
+
+func store<T: StackValue>(p: Ptr<T>, value: T) -> T {
+    p.at.* = value;
+    p.at.*
+}
+
+pub func scene(n: u32) -> u32 {
+    local hit = cast(vec3(0.0, 0.0, 0.0), vec3(1.0, 0.5, 0.25), n);
+    local r = Rect{ min: vec2(0.0, 0.0), max: vec2(hit.at.x, hit.at.y) };
+    local b = Box3{ min: hit.ray.origin, max: hit.at, color: hit.cell.color };
+    local cells = triple(
+        cell(Kind::Empty, Level::Low, 0),
+        cell(Kind::Door, Level::Mid, 90),
+        hit.cell,
+    );
+    classify(cells.a)
+        + classify(cells.b)
+        + classify(cells.c)
+        + classify(Cell{ kind: Kind::Water, level: Level::Low, color: b.color })
+        + transmute::<u8, u32>(b.color.r)
+        + (if (r.max.x > 1.0) { 1 } else { 0 })
+}
+
+pub func generic_values(v: u8, f: f32) -> u32 {
+    local a = both(v, f);
+    local b = both(gray(v), v);
+    local c = both(f, gray(v));
+    local d = pair(a, swap(pair(b, c)));
+    local e = triple(
+        tag(Kind::Door, d),
+        span(a, a),
+        pair(span(b, b), tag(Kind::Wall, c)),
+    );
+    local f2 = pair(e, swap(pair(e.a, e.c)));
+    a.sum.first
+        + b.left.wide.first
+        + c.right.wide.second
+        + d.second.first.sum.second.first
+        + (if (e.c.second.value.sum.first.x > 0.5) { 1 } else { 0 })
+        + f2.first.b.start.left.wide
+}
+
+// Deeper concrete aggregates: each distinct shape is judged and laid out on
+// the stack on its own.
+struct Particle(pos: Vec3, vel: Vec3, color: Rgba, life: f32);
+struct Emitter(origin: Vec3, rate: f32, kind: Kind, last: Particle);
+struct Camera(eye: Vec3, at: Vec3, up: Vec3, fov: f32);
+struct Light(pos: Vec3, color: Rgba, level: Level);
+struct Material(albedo: Rgba, rough: f32, metal: f32, kind: Kind);
+struct Surface(material: Material, normal: Vec3, uv: Vec2);
+struct Frame(camera: Camera, light: Light, surface: Surface, hit: Hit);
+struct World(frames: Pair<Frame, Frame>, emitter: Emitter, bounds: Box3);
+
+func particle(t: f32) -> Particle {
+    Particle{
+        pos: vec3(t, t, t),
+        vel: vec3(1.0, 0.0, 0.0),
+        color: gray(10),
+        life: t,
+    }
+}
+
+func emitter(t: f32) -> Emitter {
+    Emitter{
+        origin: vec3(0.0, t, 0.0),
+        rate: t,
+        kind: Kind::Water,
+        last: particle(t),
+    }
+}
+
+func camera(t: f32) -> Camera {
+    Camera{
+        eye: vec3(0.0, 0.0, t),
+        at: vec3(0.0, 0.0, 0.0),
+        up: vec3(0.0, 1.0, 0.0),
+        fov: 1.2,
+    }
+}
+
+func light(t: f32) -> Light {
+    Light{ pos: vec3(t, 10.0, t), color: gray(250), level: Level::High }
+}
+
+func material(rough: f32) -> Material {
+    Material{ albedo: gray(128), rough, metal: 0.0, kind: Kind::Wall }
+}
+
+func surface(t: f32) -> Surface {
+    Surface{
+        material: material(t),
+        normal: vec3(0.0, 1.0, 0.0),
+        uv: vec2(t, t),
+    }
+}
+
+func frame(t: f32, steps: u32) -> Frame {
+    Frame{
+        camera: camera(t),
+        light: light(t),
+        surface: surface(t),
+        hit: cast(vec3(0.0, 0.0, 0.0), vec3(t, t, t), steps),
+    }
+}
+
+func world(t: f32, steps: u32) -> World {
+    local a = frame(t, steps);
+    local b = frame(t * 2.0, steps);
+    World{
+        frames: pair(a, b),
+        emitter: emitter(t),
+        bounds: Box3{ min: a.hit.at, max: b.hit.at, color: a.light.color },
+    }
+}
+
+func brightness(f: Frame) -> u32 {
+    transmute::<u8, u32>(f.light.color.r)
+        + transmute::<u8, u32>(f.surface.material.albedo.g)
+        + classify(f.hit.cell)
+}
+
+pub func render(steps: u32) -> u32 {
+    local w = world(0.5, steps);
+    local tagged = tag(Kind::Door, w);
+    local spans = span(w.frames.first, w.frames.second);
+    local nested = triple(tagged, spans, pair(w.emitter, w.bounds));
+    local swapped = swap(pair(nested, swap(pair(w.emitter.last, w.frames))));
+    local ps =
+        triple(particle(0.1), particle(0.2), pair(particle(0.3), emitter(0.4)));
+    local lights = pair(
+        span(light(1.0), light(2.0)),
+        tag(Kind::Empty, triple(light(3.0), camera(4.0), material(0.5))),
+    );
+    brightness(w.frames.first)
+        + brightness(spans.end)
+        + brightness(swapped.second.a.value.frames.second)
+        + brightness(swapped.first.first.second)
+        + classify(nested.a.value.frames.first.hit.cell)
+        + transmute::<u8, u32>(ps.c.second.last.color.b)
+        + transmute::<u8, u32>(lights.second.value.a.color.g)
+}
+
+pub func widened_worlds(v: u8, f: f32) -> u32 {
+    local x = both(gray(v), f);
+    local y = pair(x, widened(gray(v)));
+    local z = triple(y, tag(Kind::Wall, x), span(widened(f), widened(f)));
+    local w = pair(z, swap(pair(world(f, 2), z)));
+    z.a.first.sum.first.first
+        + w.second.first.a.second.wide.second
+        + y.second.wide.first
+}

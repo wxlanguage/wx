@@ -4,6 +4,12 @@ Status: implemented (6d-1, 6d-2); 6d-3 open. Step 6d of `tir-assumption-env-plan
 (a trait impl function's `Self` entry) needs it; type alias bounds
 (`type X: Debug = u32`) would go through the same mechanism later.
 
+> Partly superseded by `member-selection-and-equalities.md` (decided
+> 2026-11-26, not implemented): every item's clauses are completed, the
+> `Self` entry becoming one case of a general `where`; an env's own
+> equalities rewrite its other clauses; a subject that is not abstract is
+> replaced by the matching impl's requirements. Marked where it applies.
+
 ## The problem
 
 ```wx
@@ -115,6 +121,8 @@ Each clause is normalized in the full env's parent:
 - **A parameter, not abstract** (`Wrap2<T>: Show`): unsupported (E2085)
   for now. Later: replaced by the requirements of the one impl that
   matches, so every kept clause is abstract.
+  *Decided in `member-selection-and-equalities.md`: replaced by the matching
+  impl's requirements, an error at the clause when none matches.*
 - An equality is kept when its projection is still abstract, compared when
   neither side has a parameter (E2083 at the equality), and otherwise an
   error (E2100, `UnassumableEquality`): `Item = u8` where `Item` is `T`
@@ -138,6 +146,11 @@ own clauses do not take part in normalizing each other.
   equalities where lookup reads them (`projection_equality`), so it needs no
   env normalization.
 - A parent never reads its child, so normalizing cannot loop.
+
+*Superseded by `member-selection-and-equalities.md`: an env's own equalities
+rewrite its other clauses (an equality's projection is normalized without
+them, so it cannot rewrite itself), and lookup no longer carries evidence
+along equalities; a completed env is flat, holding every clause in scope.*
 
 ### Rejected
 

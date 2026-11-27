@@ -20,9 +20,9 @@ use super::{
 use crate::ast::BinaryOp;
 use crate::diagnostics::TextSpan;
 use crate::tir::body::{ExprIdx, Place, PlaceIdx, PlaceKind};
-use crate::tir::bounds::AssumptionEnvIdx;
+use crate::tir::clauses::AssumptionEnvIdx;
 use crate::tir::decls::FunctionIdx;
-use crate::tir::layout::Piece;
+use crate::tir::layout::MemoryForm;
 use crate::tir::types::Primitive;
 use crate::tir::types::{GenericArgs, Type, TypeIndex};
 
@@ -40,7 +40,7 @@ struct Address {
 #[derive(Clone, Copy)]
 struct PlaceValue {
 	ty: mir::ValueType,
-	piece: Piece,
+	form: MemoryForm,
 }
 
 /// How a load or a store reads the address it accesses, once per scalar.
@@ -80,7 +80,7 @@ impl Lowerer<'_> {
 			PlaceKind::Deref { pointer, .. } => {
 				let pointer = self.lower_expr(body, state, pointer)?;
 				let memory =
-					self.substitute(data.memory, state.env, &state.args);
+					self.substitute(data.memory, state.frame, &state.args);
 				Ok(Address {
 					pointer,
 					offset: 0,
@@ -91,7 +91,7 @@ impl Lowerer<'_> {
 				let address = self.lower_place(body, state, object)?;
 				let object_ty = body.place(object).ty;
 				let object_ty =
-					self.substitute(object_ty, state.env, &state.args);
+					self.substitute(object_ty, state.frame, &state.args);
 				let object_ty =
 					self.normalize_type(object_ty, state.file_id, data.span)?;
 				let offset = match self.sema.field_offset(
@@ -141,11 +141,12 @@ impl Lowerer<'_> {
 	) -> Result<Address, ()> {
 		let (file_id, span) = (state.file_id, element.span);
 		let sequence = *body.place(object);
-		let memory = self.substitute(sequence.memory, state.env, &state.args);
+		let memory = self.substitute(sequence.memory, state.frame, &state.args);
 		let memory = self.memory_of_type(memory);
-		let sequence_ty = self.substitute(sequence.ty, state.env, &state.args);
+		let sequence_ty =
+			self.substitute(sequence.ty, state.frame, &state.args);
 		let sequence_ty = self.normalize_type(sequence_ty, file_id, span)?;
-		let element_ty = self.substitute(element.ty, state.env, &state.args);
+		let element_ty = self.substitute(element.ty, state.frame, &state.args);
 		let element_ty = self.normalize_type(element_ty, file_id, span)?;
 		let stride = match self.sema.memory_layout(
 			self.strings,
@@ -371,22 +372,22 @@ impl Lowerer<'_> {
 		place: PlaceIdx,
 	) -> Result<PlaceValue, ()> {
 		let data = *body.place(place);
-		let ty = self.substitute(data.ty, state.env, &state.args);
+		let ty = self.substitute(data.ty, state.frame, &state.args);
 		let ty = self.normalize_type(ty, state.file_id, data.span)?;
 		let lowered = self.lower_type(ty, state.file_id, data.span)?;
-		let piece = match lowered {
+		let form = match lowered {
 			mir::ValueType::Never => None,
-			_ => match self.sema.memory_piece(
+			_ => match self.sema.memory_form(
 				self.strings,
 				AssumptionEnvIdx::ROOT,
 				ty,
 			) {
-				Ok(piece) => piece,
+				Ok(form) => form,
 				// Checking reported a failure on this type.
 				Err(_) => return Err(()),
 			},
 		};
-		let Some(piece) = piece else {
+		let Some(form) = form else {
 			self.unsupported(
 				state.file_id,
 				data.span,
@@ -396,11 +397,11 @@ impl Lowerer<'_> {
 		};
 		// Lowering's shape and TIR's layout flatten a value in one order.
 		debug_assert_eq!(
-			self.sema.solver.layouts.scalar_count(piece),
+			self.sema.solver.layouts.scalar_count(form),
 			self.signatures.scalars(&lowered).len(),
 			"TIR's layout and lowering's shape hold the same scalars"
 		);
-		Ok(PlaceValue { ty: lowered, piece })
+		Ok(PlaceValue { ty: lowered, form })
 	}
 
 	/// How to read the address `pointer` computes once per scalar of
@@ -451,7 +452,7 @@ impl Lowerer<'_> {
 			.enumerate()
 			.map(|(at, &ty)| {
 				let pointer = self.read_address(state, read);
-				let (primitive, offset) = layouts.scalar(value.piece, at);
+				let (primitive, offset) = layouts.scalar(value.form, at);
 				state.push(
 					mir::ExprKind::PointerLoad {
 						pointer,
@@ -491,7 +492,7 @@ impl Lowerer<'_> {
 				let pointer = self.read_address(state, read);
 				let ty = state.locals[usize::from(local)].ty;
 				let scalar = state.push(mir::ExprKind::LocalGet { local }, ty);
-				let (primitive, offset) = layouts.scalar(value.piece, at);
+				let (primitive, offset) = layouts.scalar(value.form, at);
 				state.push(
 					mir::ExprKind::PointerStore {
 						pointer,
@@ -642,7 +643,7 @@ impl Lowerer<'_> {
 		let read = self.load(state, address, address_read, place_value);
 		let result = match operation {
 			Operation::Primitive(op) => {
-				let Piece::Primitives { primitive, .. } = place_value.piece
+				let MemoryForm::Scalars { primitive, .. } = place_value.form
 				else {
 					unreachable!("a primitive operator's place is a primitive")
 				};

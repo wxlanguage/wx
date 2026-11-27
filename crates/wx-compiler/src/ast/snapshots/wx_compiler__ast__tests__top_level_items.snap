@@ -4,7 +4,7 @@ expression: case.tree()
 ---
 (func pub add
   (attr inline)
-  (type-params (T Add + Copy) (const N u32))
+  (generic-params (T Add + Copy) (const N u32))
   (params (a T) (mut b T) (d u8) (c u16))
   (result T)
   (block
@@ -42,7 +42,7 @@ expression: case.tree()
 
 (package-const SIZE (type u32))
 
-(package-type pub Pointer (type-params M))
+(package-type pub Pointer (generic-params M))
 
 (memory heap (attr memory_limits (min_pages 1) (max_pages 10)) u32)
 
@@ -52,7 +52,7 @@ expression: case.tree()
 
 (struct Point (field pub x i32) (field y i32))
 
-(struct pub Pair (type-params T) (field a T) (field pub mut flag u8))
+(struct pub Pair (generic-params T) (field a T) (field pub mut flag u8))
 
 (enum Color (repr value u8) Red (= Green 1) Blue)
 
@@ -85,7 +85,7 @@ expression: case.tree()
     (block (* (call (. self area)) 2.0))))
 
 (impl Pair<T>
-  (type-params T)
+  (generic-params T)
   (const pub ZERO (type u8) 0)
   (func pub first
     (params (self Self))
@@ -101,6 +101,6 @@ expression: case.tree()
 
 (use (group math (as add plus) trig::*))
 
-(type Bytes (type-params (M Memory)) M::&[u8; 4])
+(type Bytes (generic-params (M Memory)) M::&[u8; 4])
 
 (type Callback func(x: u32, u8) -> (u32, u64))

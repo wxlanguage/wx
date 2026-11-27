@@ -47,7 +47,7 @@ use super::body::{
 	ExprRange, JumpTarget, LocalIdx, Obligations, ScopeIdx, ScopeKind,
 	TargetIdx, TargetKind,
 };
-use super::bounds::AssumptionEnvIdx;
+use super::clauses::AssumptionEnvIdx;
 use super::decls::{
 	BindingTarget, ConstIdx, DeclKind, FunctionIdx, ItemLoc, MemberKind,
 	StructIdx, Tier, Visibility,
@@ -70,8 +70,8 @@ use super::signatures::{
 };
 use super::solver::{NormalizationDepth, RewriteFlags, SolverError};
 use super::types::{
-	GenericArgs, GenericEnvIdx, GenericEnvOwner, ImplKind, Substitution, Type,
-	TypeIndex,
+	GenericArgs, GenericFrameIdx, GenericFrameOwner, ImplKind, Substitution,
+	Type, TypeIndex,
 };
 use crate::ast::{
 	self, AST, ArgumentList, BinaryOp, Keyword, Ownership, Spanned,
@@ -92,6 +92,9 @@ pub(super) struct BodyContext<'a> {
 	/// free constant, the impl's or trait's `Self` scope for an associated one,
 	/// the function's own for a function's block.
 	scope: LexicalScope,
+	/// What the body may assume: its frame's normalized env, or its written
+	/// env for a constant body built before any env is normalized.
+	assumption_env: AssumptionEnvIdx,
 }
 
 /// Builds the expressions of one definition into a `Body` from its written
@@ -105,6 +108,8 @@ pub(super) struct BodyBuilder<'a, 'ast> {
 	obligations: Obligations,
 	/// Where the expressions are written (`BodyContext::scope`).
 	scope: LexicalScope,
+	/// What the body may assume (`BodyContext::assumption_env`).
+	assumption_env: AssumptionEnvIdx,
 	owner: BodyOwner,
 	/// The block scope being checked.
 	current: ScopeIdx,
@@ -169,19 +174,21 @@ impl<'a> BodyContext<'a> {
 		strings: &'a StringInterner,
 		body: &'a mut Body,
 		scope: LexicalScope,
+		assumption_env: AssumptionEnvIdx,
 	) -> Self {
 		Self {
 			sema,
 			strings,
 			body,
 			scope,
+			assumption_env,
 		}
 	}
 
 	/// What a type means in this body's scope: comparisons and literal coercion
 	/// work on normalized types.
 	fn normalized(&mut self, ty: TypeIndex) -> TypeIndex {
-		self.normalized_in(ty, self.scope.assumption_env)
+		self.normalized_in(ty, self.assumption_env)
 	}
 
 	/// What a type means in `scope`. A projection that does not normalize stays
@@ -215,7 +222,7 @@ impl<'a> BodyContext<'a> {
 		let site = SourceSpan::new(self.scope.file_id, site);
 		match self.sema.normalize(
 			self.strings,
-			self.scope.assumption_env,
+			self.assumption_env,
 			ty,
 			NormalizationDepth::Deep,
 			facts,
@@ -299,8 +306,9 @@ impl<'a> BodyContext<'a> {
 		let ty = self.sema.types.substitute(
 			ty,
 			Substitution {
-				envs: &self.sema.generic_envs,
-				env: self.sema.structs[usize::from(struct_index)].type_params,
+				frames: &self.sema.generic_frames,
+				frame: self.sema.structs[usize::from(struct_index)]
+					.generic_params,
 				args,
 			},
 		);
@@ -423,6 +431,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		sema: &'a mut Semantics,
 		builder: &'a mut SemanticsBuilder<'ast>,
 		scope: LexicalScope,
+		assumption_env: AssumptionEnvIdx,
 		owner: BodyOwner,
 	) -> Self {
 		Self {
@@ -431,6 +440,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			body: Body::default(),
 			obligations: Obligations::default(),
 			scope,
+			assumption_env,
 			owner,
 			current: ScopeIdx::ROOT,
 			open_targets: Vec::new(),
@@ -461,6 +471,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			self.builder.strings,
 			&mut self.body,
 			self.scope,
+			self.assumption_env,
 		)
 	}
 
@@ -1163,7 +1174,10 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			| DeclKind::EnumVariant(const_index) => {
 				let signature = &self.sema.constants[usize::from(const_index)];
 				let ty = signature.ty;
-				let env = self.sema.assumption_envs.of_frame(signature.env);
+				let env = self
+					.sema
+					.assumption_envs
+					.normalized(signature.generic_params);
 				let ty = self.context().normalized_in(ty, env);
 				let kind = ExprKind::Const {
 					constant: const_index,
@@ -1231,8 +1245,8 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			&& (first == Keyword::SelfPascal.symbol()
 				|| self
 					.sema
-					.generic_envs
-					.resolve(self.scope.generic_env, first)
+					.generic_frames
+					.resolve(self.scope.generic_frame, first)
 					.is_some())
 		{
 			let receiver = self.builder.resolve_type_path(
@@ -1272,8 +1286,8 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				key.symbol_kind(&self.sema.decls)
 		{
 			let params =
-				self.sema.structs[usize::from(struct_index)].type_params;
-			let count = self.sema.generic_envs.param_names(params).len();
+				self.sema.structs[usize::from(struct_index)].generic_params;
+			let count = self.sema.generic_frames.param_names(params).len();
 			if count > 0 {
 				if stop + 1 != prefix.len() {
 					return Err(self.unsupported(
@@ -1548,7 +1562,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 				self.sema.types.has_error(self.body.ty(argument.value))
 			});
 		self.settle_uninferred(
-			target.generic_env,
+			target.generic_frame,
 			segment.ident.span,
 			already_reported,
 			&mut type_args,
@@ -1589,14 +1603,14 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		segment: &ast::PathSegment,
 		expected: TypeIndex,
 	) -> Box<[TypeIndex]> {
-		let params_env =
-			self.sema.structs[usize::from(struct_index)].type_params;
-		let count = self.sema.generic_envs.param_names(params_env).len();
+		let params_frame =
+			self.sema.structs[usize::from(struct_index)].generic_params;
+		let count = self.sema.generic_frames.param_names(params_frame).len();
 		let mut type_args = vec![TypeIndex::INFER; count].into_boxed_slice();
 		self.write_type_args(
 			segment,
-			params_env,
-			GenericEnvOwner::Struct(struct_index),
+			params_frame,
+			GenericFrameOwner::Struct(struct_index),
 			&mut type_args,
 		);
 		if expected == TypeIndex::INFER {
@@ -1622,22 +1636,22 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	}
 
 	/// Writes the type arguments written on `segment` for the parameters of
-	/// `params_env` into their slots of `type_args`, the flat list of its
+	/// `params_frame` into their slots of `type_args`, the flat list of its
 	/// chain. A `_` written as a whole argument leaves its slot as it is (`_`
 	/// inside one, `W<_>`, is written); a wrong count makes every slot of the
 	/// frame `ERROR`.
 	fn write_type_args(
 		&mut self,
 		segment: &ast::PathSegment,
-		params_env: GenericEnvIdx,
-		owner: GenericEnvOwner,
+		params_frame: GenericFrameIdx,
+		owner: GenericFrameOwner,
 		type_args: &mut [TypeIndex],
 	) {
 		if segment.type_args.is_empty() {
 			return;
 		}
-		let start = self.sema.generic_envs.parent_count(params_env);
-		let len = self.sema.generic_envs.param_names(params_env).len();
+		let start = self.sema.generic_frames.parent_count(params_frame);
+		let len = self.sema.generic_frames.param_names(params_frame).len();
 		let slots = &mut type_args[start..start + len];
 		// Every written argument is resolved, extra ones too, for their own
 		// diagnostics.
@@ -1661,7 +1675,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			self.scope,
 			self.builder.asts,
 			segment,
-			params_env,
+			params_frame,
 			owner,
 		) {
 			slots.fill(TypeIndex::ERROR);
@@ -1679,11 +1693,11 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		type_args: &[TypeIndex],
 		given: &[GivenArgument],
 	) -> GenericArgs {
-		let env = target.generic_env;
-		let written_from = (env != GenericEnvIdx::ROOT
-			&& self.sema.generic_envs.owner(env) == target.kind.owner())
-		.then(|| self.sema.generic_envs.parent_count(env));
-		let identity = self.sema.generic_envs.identity_args(env);
+		let frame = target.generic_frame;
+		let written_from = (frame != GenericFrameIdx::ROOT
+			&& self.sema.generic_frames.owner(frame) == target.kind.owner())
+		.then(|| self.sema.generic_frames.parent_count(frame));
+		let identity = self.sema.generic_frames.identity_args(frame);
 		let body = &self.body;
 		let ast = self.ast();
 		let span_of = |slot: usize| {
@@ -1718,34 +1732,34 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		segment: &ast::PathSegment,
 		args: GenericArgs,
 	) {
-		let mut frame = target.generic_env;
-		while frame != GenericEnvIdx::ROOT {
-			let start = self.sema.generic_envs.parent_count(frame);
+		let mut frame = target.generic_frame;
+		while frame != GenericFrameIdx::ROOT {
+			let start = self.sema.generic_frames.parent_count(frame);
 			if start >= proven {
-				let own = self.sema.generic_envs.param_names(frame).len();
+				let own = self.sema.generic_frames.param_names(frame).len();
 				self.sema.record_bounds_check(
 					&mut self.obligations.types,
-					self.scope.generic_env,
+					self.scope.generic_frame,
 					BoundRequirements::Frame {
-						env: frame,
+						frame,
 						args: args.prefix(start + own),
 					},
 					SourceSpan::new(self.scope.file_id, segment.ident.span),
-					self.sema.generic_envs.owner(frame),
+					self.sema.generic_frames.owner(frame),
 				);
 			}
-			frame = self.sema.generic_envs.parent(frame).unwrap();
+			frame = self.sema.generic_frames.parent(frame).unwrap();
 		}
 	}
 
-	/// Makes `ERROR` each argument in the flat `args` for `params_env`'s
+	/// Makes `ERROR` each argument in the flat `args` for `params_frame`'s
 	/// chain that is still not fully known (an `INFER` anywhere in it), and
 	/// reports its parameter. Nothing is reported when `already_reported`
 	/// (an `ERROR` expectation, an argument that failed, a mismatched item):
 	/// whatever failed has said why, and may be why nothing was learned.
 	fn settle_uninferred(
 		&mut self,
-		params_env: GenericEnvIdx,
+		params_frame: GenericFrameIdx,
 		span: TextSpan,
 		already_reported: bool,
 		args: &mut [TypeIndex],
@@ -1760,12 +1774,14 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			}
 			let frame = self
 				.sema
-				.generic_envs
-				.chain(params_env)
-				.find(|&frame| self.sema.generic_envs.parent_count(frame) <= at)
+				.generic_frames
+				.chain(params_frame)
+				.find(|&frame| {
+					self.sema.generic_frames.parent_count(frame) <= at
+				})
 				.unwrap();
-			let index = at - self.sema.generic_envs.parent_count(frame);
-			let name = self.sema.generic_envs.param_names(frame)[index].inner;
+			let index = at - self.sema.generic_frames.parent_count(frame);
+			let name = self.sema.generic_frames.param_names(frame)[index].inner;
 			let name = self.builder.strings.resolve(name).unwrap();
 			self.sema.diagnostics.push(
 				Diagnostic::error()
@@ -1793,7 +1809,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	) -> Option<(StructIdx, Box<[TypeIndex]>)> {
 		let site = SourceSpan::new(self.scope.file_id, segment.ident.span);
 		let Some((impl_kind, target)) =
-			self.sema.resolve_impl_self(self.scope.generic_env)
+			self.sema.resolve_impl_self(self.scope.generic_frame)
 		else {
 			// A trait's `Self` is the type implementing it, which is not
 			// known to be a struct; elsewhere `Self` names nothing.
@@ -2332,7 +2348,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			Some(method) => {
 				match self.sema.find_trait_impl_query(
 					self.builder.strings,
-					self.scope.assumption_env,
+					self.assumption_env,
 					ty,
 					method.trait_index,
 				) {
@@ -2444,19 +2460,13 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		ty: TypeIndex,
 		span: TextSpan,
 	) -> SelectedMethod {
-		if let TraitImplLookup::Concrete { impl_index } = lookup
+		if let TraitImplLookup::Concrete { impl_index, args } = lookup
 			&& let TraitMemberSelection::Impl(
 				MemberKind::Method(function) | MemberKind::Function(function),
 			) = self.sema.decls.select_trait_member(
 				impl_index,
 				MemberKind::Method(method.method),
 			) {
-			let args = self.sema.trait_impl_args(
-				self.builder.strings,
-				self.scope.assumption_env,
-				impl_index,
-				ty,
-			);
 			return SelectedMethod::Concrete {
 				function,
 				type_args: self
@@ -2559,7 +2569,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 			_ => {}
 		}
 		let concrete_types =
-			self.sema.concrete_types(self.scope.assumption_env, target);
+			self.sema.concrete_types(self.assumption_env, target);
 		if concrete_types.is_empty() {
 			let diagnostic =
 				self.context().report_unable_to_coerce(expr, target);
@@ -2575,7 +2585,7 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 	fn coerce_constant(&mut self, expr: ExprIdx, target: TypeIndex) {
 		if self
 			.sema
-			.concrete_types(self.scope.assumption_env, target)
+			.concrete_types(self.assumption_env, target)
 			.is_empty()
 		{
 			let diagnostic =
@@ -3166,7 +3176,7 @@ mod tests {
 	use super::super::resolutions::{NameResolutions, Reference, Site};
 	use super::super::signatures::Semantics;
 	use super::super::solver::{NormalizationDepth, RewriteFlags};
-	use super::super::types::{GenericEnvIdx, Type, TypeIndex};
+	use super::super::types::{GenericFrameIdx, Type, TypeIndex};
 	use crate::ast::{self, Spanned, StringInterner};
 	use crate::diagnostics::TextOffset;
 	use crate::diagnostics::{DiagnosticCode, TextSpan};
@@ -6344,13 +6354,16 @@ mod tests {
 	}
 
 	/// The scope and type of the first parameter of the function `name`.
-	fn first_param(case: &TestCase, name: &str) -> (GenericEnvIdx, TypeIndex) {
+	fn first_param(
+		case: &TestCase,
+		name: &str,
+	) -> (GenericFrameIdx, TypeIndex) {
 		let DeclKind::Function(index) = case.resolve(name) else {
 			panic!("expected `{name}` to be a function");
 		};
 		let signature = &case.sema.functions[usize::from(index)];
 		(
-			signature.type_params,
+			signature.generic_params,
 			case.sema.types.list(signature.param_types)[0],
 		)
 	}
@@ -6372,7 +6385,7 @@ mod tests {
 			case.sema
 				.normalize(
 					&case.strings,
-					case.sema.assumption_envs.of_frame(scope),
+					case.sema.assumption_envs.normalized(scope),
 					ty,
 					NormalizationDepth::Deep,
 					facts,

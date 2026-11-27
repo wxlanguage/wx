@@ -99,6 +99,10 @@ fn main() {
 			clap::Command::new("lsp")
 				.about("Start the WX language server over stdio"),
 		)
+		.subcommand(clap::Command::new("mcp").about(
+			"Start the Model Context Protocol server over stdio, for agents \
+			 to inspect WX packages",
+		))
 		.get_matches();
 
 	match matches.subcommand() {
@@ -126,7 +130,22 @@ fn main() {
 			cmd_format(path, files.as_deref(), check);
 		}
 		Some(("lsp", _)) => cmd_lsp(),
+		Some(("mcp", _)) => cmd_mcp(),
 		_ => unreachable!(),
+	}
+}
+
+/// Serves the MCP server over stdio until the client disconnects. Tools
+/// answer one at a time, so a current-thread runtime is enough; timers are
+/// enabled because the protocol layer uses them.
+fn cmd_mcp() {
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+	if let Err(error) = runtime.block_on(wx_mcp::serve_stdio()) {
+		eprintln!("error: {error}");
+		std::process::exit(1);
 	}
 }
 

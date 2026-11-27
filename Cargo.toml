@@ -10,8 +10,9 @@ members = ["crates/*"]
 exclude = ["crates/wx-lsp-wasm"]
 package.license = "MIT"
 package.edition = "2024"
-# Found the minimum version with https://github.com/foresterre/cargo-msrv
-package.rust-version = "1.85.1"
+# Set by `rmcp` (`wx-mcp`), which the `wx` binary links, and by let chains,
+# which compiler crates use and which are stable since 1.88.
+package.rust-version = "1.88"
 package.authors = ["Artem Melnyk <melkam464@gmail.com>"]
 
 # Insta benefits from being compiled in release mode

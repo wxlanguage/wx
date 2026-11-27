@@ -1,6 +1,8 @@
 //! Renders resolved types and declared bounds into source-like text.
 //! [`BoundFormatter`] reads source occurrences from the bound arena and
 //! delegates equality types to [`TypeFormatter`], sharing one output buffer.
+//! [`DefinitionFormatter`] renders whole definitions (signatures, owners,
+//! compact summaries) on top of both.
 //!
 //! A separate borrowing entity (the legacy `TypeFormatter<'a>`'s own
 //! shape), not methods directly on `Semantics`: formatting is a
@@ -10,17 +12,19 @@
 //! `self` right after — the same reason the legacy one existed as its own
 //! type rather than living on the (bigger, `&mut`-heavy) `Builder`.
 //!
-//! Borrows `types`/`decls`/`strings` plus `generic_envs` for generic parameter
+//! Borrows `types`/`decls`/`strings` plus `generic_frames` for generic parameter
 //! names. Struct, enum, function, trait, and memory names come directly
 //! from their definitions, without forcing signature resolution.
 //! The formatter currently wraps `Semantics`'s pieces.
+
+mod definitions;
 
 use std::fmt::Write as _;
 
 use crate::ast::{Ownership, StringInterner};
 
-use super::bounds::{
-	BindingRequirement, BoundArena, BoundId, SourceTraitBound,
+use super::clauses::{
+	BindingRequirement, SourceClause, SourceClauseArena, SourceClauseId,
 };
 use super::decls::{
 	ConstIdx, DeclKind, Declarations, MemberKind, MemberOwner, TraitIdx,
@@ -28,8 +32,10 @@ use super::decls::{
 use super::resolutions::Definition;
 use super::signatures::Semantics;
 use super::types::{
-	GenericEnvArena, GenericEnvIdx, Type, TypeIndex, TypeInterner,
+	GenericFrameArena, GenericFrameIdx, Type, TypeIndex, TypeInterner,
 };
+
+pub use self::definitions::DefinitionFormatter;
 
 /// The bytes a type may take in a message, as rustc shortens a long type.
 const TYPE_DISPLAY_BUDGET: usize = 64;
@@ -38,7 +44,7 @@ pub struct TypeFormatter<'a> {
 	pub(super) types: &'a TypeInterner,
 	pub(super) decls: &'a Declarations,
 	pub(super) strings: &'a StringInterner,
-	pub(super) generic_envs: &'a GenericEnvArena,
+	pub(super) generic_frames: &'a GenericFrameArena,
 	/// How many bytes a type may take before the rest of it is written as
 	/// `...`. A type can be far larger than its interned form (a doubling
 	/// chain of shared parts is a handful of types and 2^n leaves), so this
@@ -51,7 +57,7 @@ pub struct TypeFormatter<'a> {
 /// only their originating source occurrences.
 pub struct BoundFormatter<'a> {
 	type_formatter: TypeFormatter<'a>,
-	bounds: &'a BoundArena,
+	source_clauses: &'a SourceClauseArena,
 }
 
 impl Semantics {
@@ -63,7 +69,7 @@ impl Semantics {
 			types: &self.types,
 			decls: &self.decls,
 			strings,
-			generic_envs: &self.generic_envs,
+			generic_frames: &self.generic_frames,
 			budget: TYPE_DISPLAY_BUDGET,
 		}
 	}
@@ -74,7 +80,7 @@ impl Semantics {
 	) -> BoundFormatter<'a> {
 		BoundFormatter {
 			type_formatter: self.type_formatter(strings),
-			bounds: &self.bounds,
+			source_clauses: &self.source_clauses,
 		}
 	}
 }
@@ -83,18 +89,21 @@ impl Semantics {
 	/// The bounds written on `definition`, as written: a type parameter's,
 	/// an associated type declaration's, a trait's or a typeset's
 	/// supertraits. What they imply is left out.
-	pub fn written_bounds(&self, definition: Definition) -> Vec<BoundId> {
+	pub fn written_bounds(
+		&self,
+		definition: Definition,
+	) -> Vec<SourceClauseId> {
 		match definition {
-			Definition::TypeParam { env, index } => {
+			Definition::TypeParam { frame, index } => {
 				let subject =
-					self.generic_envs.param_types(env)[index as usize];
-				self.bounds_written_on(env, subject)
+					self.generic_frames.param_types(frame)[index as usize];
+				self.bounds_written_on(frame, subject)
 			}
 			Definition::Member(MemberKind::AssociatedType(index)) => self
 				.assoc_types[usize::from(index)]
 			.as_ref()
 			.map_or_else(Vec::new, |signature| {
-				signature.declared_bounds.to_vec()
+				signature.declared_clauses.to_vec()
 			}),
 			Definition::Item(loc) => match self.declaration_kind(loc) {
 				DeclKind::AssocType(index) => self.written_bounds(
@@ -110,20 +119,23 @@ impl Semantics {
 		}
 	}
 
-	fn supertraits_written_on(&self, trait_index: TraitIdx) -> Vec<BoundId> {
-		let env = self.traits[usize::from(trait_index)].env;
-		self.bounds_written_on(env, self.generic_envs.param_types(env)[0])
+	fn supertraits_written_on(
+		&self,
+		trait_index: TraitIdx,
+	) -> Vec<SourceClauseId> {
+		let frame = self.traits[usize::from(trait_index)].generic_params;
+		self.bounds_written_on(frame, self.generic_frames.param_types(frame)[0])
 	}
 
-	/// The bounds `env`'s item writes on `subject`, in written order: the
+	/// The bounds `frame`'s item writes on `subject`, in written order: the
 	/// clauses about it that a bound written there states itself, not one
 	/// it brings in from a supertrait.
 	fn bounds_written_on(
 		&self,
-		env: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		subject: TypeIndex,
-	) -> Vec<BoundId> {
-		let range = self.assumption_envs.requirements(env).range();
+	) -> Vec<SourceClauseId> {
+		let range = self.assumption_envs.requirements(frame).range();
 		let mut bounds = Vec::new();
 		for clause in self.clauses.traits(range) {
 			if clause.subject == subject
@@ -138,7 +150,7 @@ impl Semantics {
 }
 
 impl BoundFormatter<'_> {
-	pub fn display_bounds(&self, bounds: &[BoundId]) -> String {
+	pub fn display_bounds(&self, bounds: &[SourceClauseId]) -> String {
 		let mut buffer = String::new();
 		self.write_bounds(&mut buffer, bounds);
 		buffer
@@ -146,8 +158,10 @@ impl BoundFormatter<'_> {
 
 	/// Writes `bounds` joined by ` + `, leaving out one a signature cycle cut
 	/// short.
-	fn write_bounds(&self, f: &mut String, bounds: &[BoundId]) {
-		let resolved = bounds.iter().filter_map(|&id| self.bounds.resolved(id));
+	fn write_bounds(&self, f: &mut String, bounds: &[SourceClauseId]) {
+		let resolved = bounds
+			.iter()
+			.filter_map(|&id| self.source_clauses.resolved(id));
 		for (i, bound) in resolved.enumerate() {
 			if i > 0 {
 				f.push_str(" + ");
@@ -156,7 +170,7 @@ impl BoundFormatter<'_> {
 		}
 	}
 
-	fn write_bound(&self, f: &mut String, bound: &SourceTraitBound) {
+	fn write_bound(&self, f: &mut String, bound: &SourceClause) {
 		let symbol = self.type_formatter.decls.name(bound.trait_index).inner;
 		f.push_str(self.type_formatter.strings.resolve(symbol).unwrap());
 		if bound.bindings.is_empty() {
@@ -348,9 +362,9 @@ impl TypeFormatter<'_> {
 				self.write_type_args(f, limit, type_args);
 			}
 			Type::TypeParam {
-				env, param_index, ..
+				frame, param_index, ..
 			} => {
-				let symbol = self.generic_envs.param_names(*env)
+				let symbol = self.generic_frames.param_names(*frame)
 					[*param_index as usize]
 					.inner;
 				f.push_str(self.strings.resolve(symbol).unwrap());
@@ -476,7 +490,7 @@ mod tests {
 	use crate::tir::resolutions::NameResolutions;
 	use crate::tir::signatures::tests::source_graph;
 	use crate::tir::signatures::{QueryInfo, SemanticsBuilder};
-	use crate::tir::types::GenericEnvIdx;
+	use crate::tir::types::GenericFrameIdx;
 
 	/// A `Semantics` with every signature built and no body checked, and
 	/// its interner.
@@ -579,13 +593,14 @@ mod tests {
 			&self,
 			function: &str,
 			name: &str,
-		) -> (GenericEnvIdx, usize) {
-			let env = self.sema.functions[usize::from(self.function(function))]
-				.type_params;
+		) -> (GenericFrameIdx, usize) {
+			let frame = self.sema.functions
+				[usize::from(self.function(function))]
+			.generic_params;
 			let index = self
 				.sema
-				.generic_envs
-				.param_names(env)
+				.generic_frames
+				.param_names(frame)
 				.iter()
 				.position(|param| {
 					self.strings.resolve(param.inner) == Some(name)
@@ -595,7 +610,7 @@ mod tests {
 						"expected `{function}` to have a type parameter `{name}`"
 					)
 				});
-			(env, index)
+			(frame, index)
 		}
 
 		fn type_formatter(&self) -> TypeFormatter<'_> {
@@ -604,14 +619,18 @@ mod tests {
 
 		fn type_param(&self, function: &str, name: &str) -> TypeIndex {
 			let (env, index) = self.parameter(function, name);
-			self.sema.generic_envs.param_types(env)[index]
+			self.sema.generic_frames.param_types(env)[index]
 		}
 
 		/// The bounds written on `param`, as written: every top-level bound
 		/// between its name and the next parameter's.
-		fn declared_bounds(&self, function: &str, param: &str) -> Vec<BoundId> {
+		fn declared_clauses(
+			&self,
+			function: &str,
+			param: &str,
+		) -> Vec<SourceClauseId> {
 			let (env, index) = self.parameter(function, param);
-			let names = self.sema.generic_envs.param_names(env);
+			let names = self.sema.generic_frames.param_names(env);
 			let after = names[index].span.end;
 			let before = names
 				.get(index + 1)
@@ -622,19 +641,21 @@ mod tests {
 				self.sema.decls.functions[usize::from(self.function(function))]
 					.loc,
 			);
-			let written: Vec<BoundId> = self
+			let written: Vec<SourceClauseId> = self
 				.sema
-				.bounds
+				.source_clauses
 				.ids()
 				.filter(|&id| {
-					let span = self.sema.bounds.span(id);
+					let span = self.sema.source_clauses.span(id);
 					span.file_id == file_id
 						&& (after..before).contains(&span.span.start)
 				})
 				.collect();
-			let nested: Vec<BoundId> = written
+			let nested: Vec<SourceClauseId> = written
 				.iter()
-				.flat_map(|&id| self.sema.bounds.get(id).bindings.iter())
+				.flat_map(|&id| {
+					self.sema.source_clauses.get(id).bindings.iter()
+				})
 				.flat_map(|binding| match &binding.kind {
 					BindingRequirement::Bound(_, nested) => nested.to_vec(),
 					BindingRequirement::Equals(..)
@@ -770,7 +791,7 @@ mod tests {
 		for (param, expected) in [("T", ""), ("U", "A"), ("V", "B + A + B")] {
 			assert_eq!(
 				formatter
-					.display_bounds(&case.declared_bounds("subject", param)),
+					.display_bounds(&case.declared_clauses("subject", param)),
 				expected
 			);
 		}
@@ -785,7 +806,7 @@ mod tests {
 		"});
 		assert_eq!(
 			case.bound_formatter()
-				.display_bounds(&case.declared_bounds("grow", "S")[..1]),
+				.display_bounds(&case.declared_clauses("grow", "S")[..1]),
 			"Store where { Size: Unsigned }"
 		);
 	}
@@ -805,7 +826,7 @@ mod tests {
 		"});
 		assert_eq!(
 			case.bound_formatter()
-				.display_bounds(&case.declared_bounds("subject", "S")),
+				.display_bounds(&case.declared_clauses("subject", "S")),
 			"Outer where { Item: Inner where { Value = Wrapper<T> } + Leaf, Count = u32 } + Plain"
 		);
 	}

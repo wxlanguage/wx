@@ -51,6 +51,9 @@ clear over either a quick workaround or speculative abstraction.
 - `crates/wx-fmt/` and `crates/wx-lsp/`: shared formatter and language server.
 - `crates/wx-lint/`: lints over a checked package, configured by `wx.json`'s `lint`
   section; the CLI and language server run them after checking.
+- `crates/wx-mcp/`: the `wx mcp` Model Context Protocol server, inspection-only
+  tools for agents over a checked package; it shares the compiler's queries and
+  rendering with the language server, not its protocol code.
 - `examples/`: WX packages and runnable applications; some are experiments.
 - `crates/*-wasm/`, `web/`, `web-next/`: browser wrappers and playgrounds.
 - `editors/`: separate Git submodules; changes there belong to their own repos.

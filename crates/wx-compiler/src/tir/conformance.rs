@@ -27,9 +27,10 @@
 //! parameters. Its own clauses are proved there, and its signature is
 //! compared there.
 
-use super::bounds::{
-	AssumptionEnvIdx, BoundClauses, BoundId, Clause, EqualityClause,
-	RepresentableClause, TraitClause,
+use super::clauses::{
+	AssumptionEnvIdx, Clause, EqualityClause, PublishedClauses,
+	RepresentableClause, RewriteScope, RewrittenClauses, SourceClauseId,
+	TraitClause,
 };
 use super::decls::{
 	AstNodeRef, BindingKey, ConstIdx, DeclKind, FunctionIdx, MemberIdx,
@@ -44,7 +45,7 @@ use super::solver::{
 	UnsatisfiedClause,
 };
 use super::types::{
-	GenericEnvIdx, GenericEnvOwner, Substitution, Type, TypeIndex,
+	GenericFrameIdx, GenericFrameOwner, Substitution, Type, TypeIndex,
 };
 use crate::ast::{self, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
@@ -68,54 +69,70 @@ impl Semantics {
 	}
 
 	/// The env a caller through the trait sees `function` in: the impl's
-	/// env around it, and what the clauses the declaration itself states
-	/// mean with `Self` as `target` and the declaration's parameters as the
-	/// function's, by position (`normalize_clauses`, as the function's own
-	/// `Self` entry is read). It exists for the check alone; its index is
-	/// new, so its cache entries alias no declaration's. A function whose
-	/// declaration states nothing is read in its impl's.
+	/// env around it, and the clauses the declaration itself states with
+	/// `Self` as `target` and the declaration's parameters as the
+	/// function's, by position, rewritten as a frame's own are when its env
+	/// is normalized. It exists for the check alone; its index is new, so its
+	/// cache entries alias no declaration's. A function whose declaration
+	/// states nothing is read in its impl's.
 	fn contract_env(
 		&mut self,
 		strings: &StringInterner,
 		declaration: FunctionIdx,
 		function: FunctionIdx,
 		target: TypeIndex,
-	) -> Result<AssumptionEnvIdx, SolverError> {
-		let env = self.functions[usize::from(function)].type_params;
-		let impl_env = self.impl_env(function);
-		let declaration_env =
-			self.functions[usize::from(declaration)].type_params;
-		let requirements = self.own_requirements(declaration_env);
+	) -> AssumptionEnvIdx {
+		let frame = self.functions[usize::from(function)].generic_params;
+		let impl_env = self.impl_env(strings, function);
+		let declaration_frame =
+			self.functions[usize::from(declaration)].generic_params;
+		let requirements = self.own_requirements(declaration_frame);
 		if requirements.is_empty() {
-			return Ok(impl_env);
+			return impl_env;
 		}
 		let arguments: Box<[TypeIndex]> = std::iter::once(target)
-			.chain(self.own_params(env).iter().copied())
+			.chain(self.own_params(frame).iter().copied())
 			.collect();
-		let clauses =
-			self.instantiate_clauses(requirements, declaration_env, &arguments);
-		let (assumed, _) =
-			self.normalize_clauses(strings, impl_env, clauses)?;
-		let contract = self.assumption_envs.push(impl_env, None);
-		*self.assumption_envs.clauses_mut(contract) = assumed;
-		Ok(contract)
+		let clauses = self.instantiate_clauses(
+			requirements,
+			declaration_frame,
+			&arguments,
+		);
+		let own = clauses
+			.final_range()
+			.expect("instantiated clauses are final");
+		let rewriting_env =
+			self.assumption_envs.push_final(impl_env, None, own);
+		let scope = RewriteScope {
+			own_frame: self.own_frame(frame),
+			rewriting_env,
+			parent_env: impl_env,
+		};
+		let mut rewritten = RewrittenClauses::default();
+		self.rewrite_own_clauses(strings, scope, own, &mut rewritten);
+		self.lend_declared_bounds(strings, scope, own, &mut rewritten);
+		if !rewritten.changed {
+			return rewriting_env;
+		}
+		let run = self.clauses.push(&rewritten.assumed);
+		self.assumption_envs.push_final(impl_env, None, run)
 	}
 
-	/// `clauses`, written in `env`'s chain, with that chain's parameters
+	/// `clauses`, written in `frame`'s chain, with that chain's parameters
 	/// replaced by `arguments`: a new run, the written bounds they come from
 	/// kept.
-	fn instantiate_clauses(
+	pub(super) fn instantiate_clauses(
 		&mut self,
-		clauses: BoundClauses,
-		env: GenericEnvIdx,
+		clauses: PublishedClauses,
+		frame: GenericFrameIdx,
 		arguments: &[TypeIndex],
-	) -> BoundClauses {
+	) -> PublishedClauses {
 		let Some(range) = clauses.final_range() else {
 			unreachable!("every signature exists when declarations are checked")
 		};
 		let substitution = Substitution {
-			envs: &self.generic_envs,
-			env,
+			frames: &self.generic_frames,
+			frame,
 			args: arguments,
 		};
 		let instantiated: Vec<Clause> = self
@@ -147,7 +164,7 @@ impl Semantics {
 				}
 			})
 			.collect();
-		BoundClauses::Final(self.clauses.push(&instantiated))
+		PublishedClauses::Final(self.clauses.push(&instantiated))
 	}
 
 	/// Proves the clauses `function`'s own env states in `contract`, where
@@ -163,27 +180,37 @@ impl Semantics {
 		(declaration, function): (FunctionIdx, FunctionIdx),
 		contract: AssumptionEnvIdx,
 	) -> Result<bool, SolverError> {
-		let env = self.functions[usize::from(function)].type_params;
-		let requirements = self.own_requirements(env);
+		let frame = self.functions[usize::from(function)].generic_params;
+		let requirements = self.own_requirements(frame);
 		if requirements.is_empty() {
 			return Ok(true);
 		}
-		// Only what the function assumes is compared: a clause about a type
-		// that is not abstract holds or not of its own, and is checked where
-		// it is written (`normalize_self_entry`). Each is read where the
-		// function is written, not under the contract's assumptions.
-		let impl_env = self.impl_env(function);
-		let (clauses, _) =
-			self.normalize_clauses(strings, impl_env, requirements)?;
+		// Only what the function assumes is compared, as its normalized env
+		// reads it: a clause about a type that is not abstract holds or not
+		// of its own, and normalizing its env proves it at its bound. Each is read
+		// where the function is written, not under the contract's
+		// assumptions.
+		let scope = RewriteScope {
+			own_frame: Some(frame),
+			rewriting_env: self.normalize_env(strings, frame),
+			parent_env: self.impl_env(strings, function),
+		};
+		let Some(own) = requirements.final_range() else {
+			unreachable!("every signature exists when declarations are checked")
+		};
+		let mut rewritten = RewrittenClauses::default();
+		self.rewrite_own_clauses(strings, scope, own, &mut rewritten);
+		let clauses =
+			PublishedClauses::Final(self.clauses.push(&rewritten.assumed));
 		let arguments: Box<[TypeIndex]> =
-			self.generic_envs.identity_args(env).into();
+			self.generic_frames.identity_args(frame).into();
 		let mut failures = Vec::new();
 		let holds = self.satisfies_clauses(
 			strings,
 			contract,
 			clauses,
 			Subjects::All,
-			(env, &arguments),
+			(frame, &arguments),
 			Some(&mut failures),
 			None,
 		)?;
@@ -236,33 +263,46 @@ impl Semantics {
 	/// the trait's or impl's around it, which a function without its own
 	/// parameters is read in.
 	/// The env of the impl `function` is written in.
-	fn impl_env(&self, function: FunctionIdx) -> AssumptionEnvIdx {
-		let env = self.functions[usize::from(function)].type_params;
-		let impl_frame = match self.generic_envs.owner(env) {
-			GenericEnvOwner::Function(_) => self
-				.generic_envs
-				.parent(env)
+	fn impl_env(
+		&mut self,
+		strings: &StringInterner,
+		function: FunctionIdx,
+	) -> AssumptionEnvIdx {
+		let frame = self.functions[usize::from(function)].generic_params;
+		let impl_frame = match self.generic_frames.owner(frame) {
+			GenericFrameOwner::Function(_) => self
+				.generic_frames
+				.parent(frame)
 				.expect("a function's own frame has its impl's around it"),
-			_ => env,
+			_ => frame,
 		};
-		self.assumption_envs.of_frame(impl_frame)
+		self.normalize_env(strings, impl_frame)
 	}
 
 	/// What `frame`'s function itself states: nothing when it has no frame
 	/// of its own and `frame` is its impl's or its trait's.
-	fn own_requirements(&self, frame: GenericEnvIdx) -> BoundClauses {
-		match self.generic_envs.owner(frame) {
-			GenericEnvOwner::Function(_) => {
+	fn own_requirements(&self, frame: GenericFrameIdx) -> PublishedClauses {
+		match self.generic_frames.owner(frame) {
+			GenericFrameOwner::Function(_) => {
 				self.assumption_envs.requirements(frame)
 			}
-			_ => BoundClauses::NONE,
+			_ => PublishedClauses::NONE,
 		}
 	}
 
-	fn own_params(&self, frame: GenericEnvIdx) -> &[TypeIndex] {
-		match self.generic_envs.owner(frame) {
-			GenericEnvOwner::Function(_) => {
-				self.generic_envs.param_types(frame)
+	/// `frame` when it is its function's own, not its impl's or trait's.
+	fn own_frame(&self, frame: GenericFrameIdx) -> Option<GenericFrameIdx> {
+		matches!(
+			self.generic_frames.owner(frame),
+			GenericFrameOwner::Function(_)
+		)
+		.then_some(frame)
+	}
+
+	fn own_params(&self, frame: GenericFrameIdx) -> &[TypeIndex] {
+		match self.generic_frames.owner(frame) {
+			GenericFrameOwner::Function(_) => {
+				self.generic_frames.param_types(frame)
 			}
 			_ => &[],
 		}
@@ -356,7 +396,7 @@ impl Semantics {
 		strings: &StringInterner,
 		trait_index: TraitIdx,
 		(declaration, function): (FunctionIdx, FunctionIdx),
-		origin: BoundId,
+		origin: SourceClauseId,
 		failure: &UnsatisfiedClause,
 	) {
 		let read = match *failure {
@@ -404,9 +444,14 @@ impl Semantics {
 				"impl has stricter requirements than trait `{}`",
 				self.trait_name(strings, trait_index),
 			))
-			.with_label(self.bounds.span(origin).primary_label().with_message(
-				format!("impl has extra requirement `{requirement}`"),
-			))
+			.with_label(
+				self.source_clauses
+					.span(origin)
+					.primary_label()
+					.with_message(format!(
+						"impl has extra requirement `{requirement}`"
+					)),
+			)
 			.with_label(
 				self.decls
 					.declaration_span(expected_decl.loc)
@@ -942,10 +987,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 		let header = sema.trait_impls[usize::from(impl_index)]
 			.as_ref()
 			.expect("every signature exists when declarations are checked");
-		let (scope, target) = (header.type_params, header.target);
+		let (frame, target) = (header.generic_params, header.target);
 		let file_id = sema.decls.trait_impls[usize::from(impl_index)].file_id;
 		let at_target = SourceSpan::new(file_id, target.span);
-		let owner = GenericEnvOwner::Trait(trait_index);
+		let owner = GenericFrameOwner::Trait(trait_index);
 
 		self.check_members(
 			sema,
@@ -958,13 +1003,14 @@ impl<'ast> SemanticsBuilder<'ast> {
 		// The supertraits are the clauses on the trait's `Self`; the target
 		// must satisfy them where the impl is written, with its parameters'
 		// bounds assumed.
-		let trait_env = sema.traits[usize::from(trait_index)].env;
+		let trait_frame = sema.traits[usize::from(trait_index)].generic_params;
 		let args = sema.generic_args.push([(target.inner, target.span)]);
+		let normalized_env = sema.normalize_env(self.strings, frame);
 		let result = sema.check_bound_requirements(
 			self.strings,
-			sema.assumption_envs.of_frame(scope),
+			normalized_env,
 			BoundRequirements::Frame {
-				env: trait_env,
+				frame: trait_frame,
 				args,
 			},
 			at_target,
@@ -982,7 +1028,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			else {
 				continue;
 			};
-			// The value's own judgement (`CheckAssocValue`) reports a value
+			// The value's own judgement (`TypeObligation::AssocValue`) reports a value
 			// that has no meaning; one the impl omits with no default is
 			// reported missing above.
 			let value = match sema.assoc_value(
@@ -1020,9 +1066,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 					}
 					_ => at_target,
 				};
+			let normalized_env = sema.normalize_env(self.strings, frame);
 			let result = sema.check_bound_requirements(
 				self.strings,
-				sema.assumption_envs.of_frame(scope),
+				normalized_env,
 				BoundRequirements::AssociatedType {
 					declaration: declaration_index,
 					trait_index,
@@ -1196,12 +1243,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 		function: FunctionIdx,
 		target: TypeIndex,
 	) -> Result<(), SolverError> {
-		let declaration_env =
-			sema.functions[usize::from(declaration)].type_params;
-		let env = sema.functions[usize::from(function)].type_params;
+		let declaration_frame =
+			sema.functions[usize::from(declaration)].generic_params;
+		let frame = sema.functions[usize::from(function)].generic_params;
 		let (expected_own, own) = (
-			sema.own_params(declaration_env).len(),
-			sema.own_params(env).len(),
+			sema.own_params(declaration_frame).len(),
+			sema.own_params(frame).len(),
 		);
 		if expected_own != own {
 			sema.report_count_mismatch(
@@ -1215,7 +1262,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			return Ok(());
 		}
 		let contract =
-			sema.contract_env(self.strings, declaration, function, target)?;
+			sema.contract_env(self.strings, declaration, function, target);
 		if !sema.check_own_bounds(
 			self.strings,
 			trait_index,
@@ -1248,7 +1295,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 			return Ok(());
 		}
 		let arguments: Box<[TypeIndex]> = std::iter::once(target)
-			.chain(sema.own_params(env).iter().copied())
+			.chain(sema.own_params(frame).iter().copied())
 			.collect();
 		// The result is compared as one more position, after the parameters.
 		for position in 0..=params {
@@ -1304,8 +1351,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 			let expected = sema.types.substitute(
 				expected,
 				Substitution {
-					envs: &sema.generic_envs,
-					env: declaration_env,
+					frames: &sema.generic_frames,
+					frame: declaration_frame,
 					args: &arguments,
 				},
 			);
@@ -1389,28 +1436,29 @@ impl<'ast> SemanticsBuilder<'ast> {
 		target: TypeIndex,
 	) -> Result<(), SolverError> {
 		let expected_signature = &sema.constants[usize::from(declaration)];
-		let (expected, declaration_env) =
-			(expected_signature.ty, expected_signature.env);
+		let (expected, declaration_frame) =
+			(expected_signature.ty, expected_signature.generic_params);
 		let signature = &sema.constants[usize::from(constant)];
-		let (found, env) = (signature.ty, signature.env);
+		let (found, frame) = (signature.ty, signature.generic_params);
 		let expected = sema.types.substitute(
 			expected,
 			Substitution {
-				envs: &sema.generic_envs,
-				env: declaration_env,
+				frames: &sema.generic_frames,
+				frame: declaration_frame,
 				args: &[target],
 			},
 		);
+		let normalized_env = sema.normalize_env(self.strings, frame);
 		let expected = sema.normalize(
 			self.strings,
-			sema.assumption_envs.of_frame(env),
+			normalized_env,
 			expected,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
 		)?;
 		let found = sema.normalize(
 			self.strings,
-			sema.assumption_envs.of_frame(env),
+			normalized_env,
 			found,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
@@ -2142,6 +2190,42 @@ mod tests {
 			case.sema.diagnostics[0].labels[0].message,
 			"impl has extra requirement `<U as Container>::Item == u16`"
 		);
+	}
+
+	/// The declaration's `Item: PartialEq` reads `V: PartialEq` by its own
+	/// `Item = V`, so the function's `V: PartialEq` follows.
+	#[test]
+	fn a_contract_reads_its_clauses_by_its_own_equalities() {
+		let case = TestCase::new(&format!(
+			"{PRELUDE}{ORDERING}{}",
+			indoc! {"
+				trait Store {
+					func take<U: StackValue + Container where { Item = V } + Container where { Item: PartialEq }, V>(x: U);
+				}
+				impl Store for Bag {
+					func take<U: StackValue + Container where { Item = V }, V: PartialEq>(x: U) {}
+				}
+			"}
+		));
+		case.diagnostics().assert_none();
+	}
+
+	/// The function's `Item: PartialEq` reads `V: PartialEq` by its own
+	/// `Item = V`, which the declaration states.
+	#[test]
+	fn an_impl_function_reads_its_clauses_by_its_own_equalities() {
+		let case = TestCase::new(&format!(
+			"{PRELUDE}{ORDERING}{}",
+			indoc! {"
+				trait Store {
+					func take<U: StackValue + Container where { Item = V }, V: PartialEq>(x: U);
+				}
+				impl Store for Bag {
+					func take<U: StackValue + Container where { Item = V } + Container where { Item: PartialEq }, V>(x: U) {}
+				}
+			"}
+		));
+		case.diagnostics().assert_none();
 	}
 
 	/// A bound nested on a projection is proved like one on the parameter:

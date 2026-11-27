@@ -1,0 +1,13 @@
+{
+  "mcp": {
+    "servers": {
+      "wx": {
+        "type": "local",
+        "command": [
+          "wx",
+          "mcp"
+        ]
+      }
+    }
+  }
+}

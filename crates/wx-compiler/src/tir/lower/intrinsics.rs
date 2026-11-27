@@ -1,7 +1,7 @@
 //! Expand compiler-provided function implementations, never source names.
 
 use super::{Body, ExprIdx, FunctionInstance, FunctionState, Lowerer, mir};
-use crate::tir::bounds::AssumptionEnvIdx;
+use crate::tir::clauses::AssumptionEnvIdx;
 use crate::tir::intrinsics::Intrinsic;
 use crate::tir::types::Type;
 

@@ -3,13 +3,13 @@ use std::fmt;
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::bounds::{AssumptionEnvIdx, BindingRef, Readiness};
+use super::clauses::{AssumptionEnvIdx, BindingRef, Readiness};
 use super::decls::{ConstIdx, TypesetIdx};
 use super::eval::ResolvedConstant;
 use super::numbers::{DecimalFloat, FloatRangeError};
 use super::signatures::Semantics;
 use super::solver::{NormalizationDepth, RewriteFlags, SolverError};
-use super::types::{GenericEnvOwner, Substitution, Type, TypeIndex};
+use super::types::{GenericFrameOwner, Substitution, Type, TypeIndex};
 use crate::ast::{Spanned, StringInterner, UnaryOp};
 use crate::{
 	diagnostics::{DiagnosticCode, SourceSpan, TextOffset, TextSpan},
@@ -648,7 +648,7 @@ impl Semantics {
 				if clause.target.constant == constant
 					&& source.names(
 						&self.types,
-						&self.generic_envs,
+						&self.generic_frames,
 						clause.subject,
 						subject,
 					) {
@@ -663,8 +663,8 @@ impl Semantics {
 				Some(context) => self.types.substitute(
 					assumed,
 					Substitution {
-						envs: &self.generic_envs,
-						env: context.env,
+						frames: &self.generic_frames,
+						frame: context.frame,
 						args: &[context.receiver],
 					},
 				),
@@ -779,7 +779,7 @@ impl Semantics {
 		(subject, constant): (TypeIndex, ConstIdx),
 		ty: TypeIndex,
 		value: Option<i128>,
-		source: Option<(BindingRef, GenericEnvOwner)>,
+		source: Option<(BindingRef, GenericFrameOwner)>,
 	) -> Diagnostic<FileId> {
 		let read = self.types.intern_const_ref(constant, &[subject]);
 		let formatter = self.type_formatter(strings);

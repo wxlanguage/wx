@@ -469,9 +469,9 @@ impl PatternContext<'_> {
 			FieldOwner::Struct(index) => {
 				let signature = &self.sema.structs[usize::from(index)];
 				let ty = self.sema.types.list(signature.field_types)[field];
-				let env = signature.type_params;
+				let frame = signature.generic_params;
 				let args = self.sema.types.list(fields.args).to_vec();
-				self.sema.substitute_type(ty, env, &args)
+				self.sema.substitute_type(ty, frame, &args)
 			}
 			FieldOwner::Enum(index) => self
 				.sema

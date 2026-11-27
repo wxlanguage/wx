@@ -15,10 +15,9 @@
 //! phase that follows this pass (`Semantics::check_bodies`).
 
 use codespan_reporting::diagnostic::Diagnostic;
-use string_interner::symbol::SymbolU32;
 
-use super::bounds::{AssumptionEnvIdx, BoundClauses};
-use super::decls::{AssocTypeIdx, TraitIdx};
+use super::clauses::AssumptionEnvIdx;
+use super::decls::{AssocTypeIdx, BindingKey, TraitIdx};
 use super::literals::ConcreteType;
 use super::members::report_type_does_not_implement_trait;
 use super::signatures::Semantics;
@@ -27,8 +26,8 @@ use super::solver::{
 	SolverError, Verdict,
 };
 use super::types::{
-	GenericArgs, GenericEnvIdx, GenericEnvOwner, ImplKind, Substitution, Type,
-	TypeIndex,
+	GenericArgs, GenericFrameIdx, GenericFrameOwner, ImplKind, Substitution,
+	Type, TypeIndex,
 };
 use crate::ast::StringInterner;
 use crate::diagnostics::{DiagnosticCode, SourceSpan};
@@ -43,7 +42,7 @@ pub(super) enum BoundRequirements {
 	/// written in the declaration, so it may name any of them. A failure is
 	/// reported where the argument its clause is about is given.
 	Frame {
-		env: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		args: GenericArgs,
 	},
 	/// The declared bounds of `declaration`, a member of `trait_index`, whose
@@ -62,20 +61,20 @@ pub(super) enum TypeObligation {
 	/// A method receives its enclosing `Self` by value or through exactly
 	/// one pointer. Compare after signatures exist so aliases and associated
 	/// types have their meaning, rather than inspecting the written syntax.
-	CheckReceiverType {
-		frame: GenericEnvIdx,
+	ReceiverType {
+		frame: GenericFrameIdx,
 		ty: TypeIndex,
 		self_type: TypeIndex,
 		reference: SourceSpan,
 	},
-	CheckBounds {
-		frame: GenericEnvIdx,
+	Bounds {
+		frame: GenericFrameIdx,
 		requirements: BoundRequirements,
 		reference: SourceSpan,
-		owner: GenericEnvOwner,
+		owner: GenericFrameOwner,
 	},
-	CheckTraitMembership {
-		frame: GenericEnvIdx,
+	TraitMembership {
+		frame: GenericFrameIdx,
 		subject: TypeIndex,
 		required: TraitIdx,
 		reference: SourceSpan,
@@ -83,29 +82,29 @@ pub(super) enum TypeObligation {
 	/// A written type is normalized once, so a cycle or an exhausted budget
 	/// inside it is found even if nothing ever reads the type. The result is
 	/// discarded: the stored type stays as written.
-	CheckWellFormed {
-		frame: GenericEnvIdx,
+	WellFormed {
+		frame: GenericFrameIdx,
 		ty: TypeIndex,
 		reference: SourceSpan,
 	},
 	/// An impl member's value (its own, or the trait default it inherits) has a
-	/// meaning. Unlike `CheckWellFormed`, the judgement is the solver's, made
+	/// meaning. Unlike `TypeObligation::WellFormed`, the judgement is the solver's, made
 	/// once whoever asks first (`Verdict`); this check reports the failure
 	/// the member owns, so a loop through definitions is reported once, where
 	/// it is defined, and readers of a poisoned value stay silent. `reference`
 	/// is the written value, or the impl's target for an inherited default.
-	CheckAssocValue {
+	AssocValue {
 		member: ImplMember,
 		reference: SourceSpan,
 	},
 	/// A generic impl's requirements have a meaning: proving them for its own
 	/// parameters in its own scope does not need the impl itself. Like
-	/// `CheckAssocValue`, the judgement is the solver's, made once whoever
+	/// `TypeObligation::AssocValue`, the judgement is the solver's, made once whoever
 	/// asks first; this check reports a loop the impl owns, once, at the bound
 	/// it closed in, and every selection of the impl stays silent.
 	/// `reference` is the impl's target, for a judgement that ran out of
 	/// budget.
-	CheckImplRequirements {
+	ImplRequirements {
 		impl_kind: ImplKind,
 		reference: SourceSpan,
 	},
@@ -113,8 +112,8 @@ pub(super) enum TypeObligation {
 	/// written: an array's length as its memory's `Size`. An abstract type is
 	/// any member of the typesets its bounds name, so the value must be
 	/// representable as every one of them, and the type works with each.
-	CheckConstantRepresentable {
-		frame: GenericEnvIdx,
+	ConstantRepresentable {
+		frame: GenericFrameIdx,
 		ty: TypeIndex,
 		bits: u64,
 		reference: SourceSpan,
@@ -124,8 +123,8 @@ pub(super) enum TypeObligation {
 	/// mismatch, even one whose value would be representable. Both types are
 	/// compared normalized with every fact, so a constant either names is read;
 	/// a constant's body therefore records it for after the values exist.
-	CheckConstantType {
-		frame: GenericEnvIdx,
+	ConstantType {
+		frame: GenericFrameIdx,
 		/// The `Type::ConstRef` the length names.
 		length: TypeIndex,
 		expected: TypeIndex,
@@ -134,29 +133,21 @@ pub(super) enum TypeObligation {
 	/// A type held by value (a parameter's, a result's, a function type's
 	/// part, a local's) is a `StackValue`. A field, a tuple's element and a
 	/// type argument need nothing: their container states what it needs.
-	CheckValueType {
-		frame: GenericEnvIdx,
+	ValueType {
+		frame: GenericFrameIdx,
 		ty: TypeIndex,
 		reference: SourceSpan,
 	},
 	/// `Projection::name` was written, and the projection's declared bounds do
-	/// not name `name`. Whether its *value* has such a member depends on impls,
-	/// which construction cannot read, so the type was lowered to `ERROR` and
-	/// this decides what to say: a plain "no such member", or, when the value
-	/// does have one, that the trait must be named (with the spelling).
-	CheckProjectionMember {
-		frame: GenericEnvIdx,
+	/// not name `key`. A member is never selected through the projection's
+	/// value, so the type was lowered to `ERROR`; what its value has depends
+	/// on equalities and impls, which construction does not read, so this
+	/// decides what to say: a plain "no such member", or, when the value does
+	/// have one, how to write it.
+	ProjectionMember {
+		frame: GenericFrameIdx,
 		projection: TypeIndex,
-		name: SymbolU32,
-		reference: SourceSpan,
-	},
-	/// A trait impl function's `Self` entry, `clauses` about the impl's
-	/// target, is normalized into what the function assumes
-	/// (`normalize_self_entry`). First in the function's run, so its other
-	/// checks read the completed env; `reference` is the entry's `Self`.
-	NormalizeSelfEntry {
-		frame: GenericEnvIdx,
-		clauses: BoundClauses,
+		key: BindingKey,
 		reference: SourceSpan,
 	},
 }
@@ -209,13 +200,13 @@ impl Semantics {
 		obligation: &TypeObligation,
 	) -> Result<(), ()> {
 		match *obligation {
-			TypeObligation::CheckReceiverType {
+			TypeObligation::ReceiverType {
 				frame,
 				ty,
 				self_type,
 				reference,
 			} => {
-				let env = self.assumption_envs.of_frame(frame);
+				let env = self.normalize_env(strings, frame);
 				let normalized = (|| {
 					let ty = self.normalize(
 						strings,
@@ -261,44 +252,46 @@ impl Semantics {
 				}
 				Ok(())
 			}
-			TypeObligation::CheckBounds {
+			TypeObligation::Bounds {
 				frame,
 				requirements,
 				reference,
 				owner,
-			} => match self.check_bound_requirements(
-				strings,
-				self.assumption_envs.of_frame(frame),
-				requirements,
-				reference,
-				owner,
-			) {
-				Ok(_) => Ok(()),
-				Err(SolverError::Cycle(cycle)) => {
-					let diagnostic =
-						self.cycle_diagnostic(strings, &cycle, reference);
-					self.diagnostics.push(diagnostic);
-					Ok(())
+			} => {
+				let env = self.normalize_env(strings, frame);
+				match self.check_bound_requirements(
+					strings,
+					env,
+					requirements,
+					reference,
+					owner,
+				) {
+					Ok(_) => Ok(()),
+					Err(SolverError::Cycle(cycle)) => {
+						let diagnostic =
+							self.cycle_diagnostic(strings, &cycle, reference);
+						self.diagnostics.push(diagnostic);
+						Ok(())
+					}
+					Err(SolverError::Overflow) => {
+						self.diagnostics
+							.push(self.overflow_diagnostic(reference));
+						Ok(())
+					}
+					Err(SolverError::Poisoned) => Ok(()),
+					Err(SolverError::Pending) => Err(()),
 				}
-				Err(SolverError::Overflow) => {
-					self.diagnostics.push(self.overflow_diagnostic(reference));
-					Ok(())
-				}
-				Err(SolverError::Poisoned) => Ok(()),
-				Err(SolverError::Pending) => Err(()),
-			},
-			TypeObligation::CheckTraitMembership {
+			}
+			TypeObligation::TraitMembership {
 				frame,
 				subject,
 				required,
 				reference,
 			} => {
-				match self.find_trait_impl_query(
-					strings,
-					self.assumption_envs.of_frame(frame),
-					subject,
-					required,
-				) {
+				let env = self.normalize_env(strings, frame);
+				match self
+					.find_trait_impl_query(strings, env, subject, required)
+				{
 					Ok(Some(_)) => Ok(()),
 					Ok(None) => {
 						let diagnostic = report_type_does_not_implement_trait(
@@ -326,14 +319,15 @@ impl Semantics {
 					Err(SolverError::Pending) => Err(()),
 				}
 			}
-			TypeObligation::CheckWellFormed {
+			TypeObligation::WellFormed {
 				frame,
 				ty,
 				reference,
 			} => {
+				let env = self.normalize_env(strings, frame);
 				match self.normalize(
 					strings,
-					self.assumption_envs.of_frame(frame),
+					env,
 					ty,
 					NormalizationDepth::Deep,
 					RewriteFlags::ALL,
@@ -356,7 +350,7 @@ impl Semantics {
 			}
 			// A judgement the definition owns: its verdict holds the failure,
 			// whoever asked first.
-			TypeObligation::CheckAssocValue { member, reference } => {
+			TypeObligation::AssocValue { member, reference } => {
 				// This check owns the judgement, so it asks once (which computes
 				// and memoizes the verdict) and reports the failure the verdict
 				// kept for it. A failure another definition owns was reported
@@ -368,6 +362,8 @@ impl Semantics {
 					Err(_) => {
 						match self.solver.verdict(Definition::Member(member)) {
 							Verdict::Resolved => Ok(()),
+							// Reported by finiteness, where the cycle closed.
+							Verdict::Infinite => Ok(()),
 							Verdict::Overflowed => {
 								self.diagnostics
 									.push(self.overflow_diagnostic(reference));
@@ -390,11 +386,11 @@ impl Semantics {
 					}
 				}
 			}
-			TypeObligation::CheckImplRequirements {
+			TypeObligation::ImplRequirements {
 				impl_kind,
 				reference,
 			} => {
-				// Like `CheckAssocValue`: ask once, then report the failure the
+				// Like `TypeObligation::AssocValue`: ask once, then report the failure the
 				// impl's own verdict holds. Every selection of a failed impl
 				// stays silent.
 				match self.requirements_verdict(strings, impl_kind) {
@@ -419,12 +415,17 @@ impl Semantics {
 								let diagnostic = self.cycle_diagnostic(
 									strings,
 									cycle,
-									self.bounds.span(bound),
+									self.source_clauses.span(bound),
 								);
 								self.diagnostics.push(diagnostic);
 								Ok(())
 							}
 							Verdict::Poisoned => Ok(()),
+							Verdict::Infinite => {
+								unreachable!(
+									"only a member's value is judged finite"
+								)
+							}
 							Verdict::Unchecked | Verdict::InProgress => {
 								unreachable!(
 									"a finished judgement has a verdict"
@@ -434,68 +435,15 @@ impl Semantics {
 					}
 				}
 			}
-			TypeObligation::CheckConstantRepresentable {
+			TypeObligation::ConstantRepresentable {
 				frame,
 				ty,
 				bits,
-				reference,
-			} => match self.check_constant_representable(
-				strings,
-				self.assumption_envs.of_frame(frame),
-				ty,
-				bits,
-				reference,
-			) {
-				Ok(_) => Ok(()),
-				Err(SolverError::Cycle(cycle)) => {
-					let diagnostic =
-						self.cycle_diagnostic(strings, &cycle, reference);
-					self.diagnostics.push(diagnostic);
-					Ok(())
-				}
-				Err(SolverError::Overflow) => {
-					self.diagnostics.push(self.overflow_diagnostic(reference));
-					Ok(())
-				}
-				Err(SolverError::Poisoned) => Ok(()),
-				Err(SolverError::Pending) => Err(()),
-			},
-			TypeObligation::CheckConstantType {
-				frame,
-				length,
-				expected,
-				reference,
-			} => match self.check_constant_type(
-				strings,
-				self.assumption_envs.of_frame(frame),
-				length,
-				expected,
-				reference,
-			) {
-				Ok(_) => Ok(()),
-				Err(SolverError::Cycle(cycle)) => {
-					let diagnostic =
-						self.cycle_diagnostic(strings, &cycle, reference);
-					self.diagnostics.push(diagnostic);
-					Ok(())
-				}
-				Err(SolverError::Overflow) => {
-					self.diagnostics.push(self.overflow_diagnostic(reference));
-					Ok(())
-				}
-				Err(SolverError::Poisoned) => Ok(()),
-				Err(SolverError::Pending) => Err(()),
-			},
-			TypeObligation::CheckValueType {
-				frame,
-				ty,
 				reference,
 			} => {
-				match self.check_value_type(
-					strings,
-					self.assumption_envs.of_frame(frame),
-					ty,
-					reference,
+				let env = self.normalize_env(strings, frame);
+				match self.check_constant_representable(
+					strings, env, ty, bits, reference,
 				) {
 					Ok(_) => Ok(()),
 					Err(SolverError::Cycle(cycle)) => {
@@ -513,51 +461,81 @@ impl Semantics {
 					Err(SolverError::Pending) => Err(()),
 				}
 			}
-			TypeObligation::NormalizeSelfEntry {
+			TypeObligation::ConstantType {
 				frame,
-				clauses,
+				length,
+				expected,
 				reference,
-			} => match self.normalize_self_entry(strings, frame, clauses) {
-				Ok(()) => Ok(()),
-				Err(SolverError::Cycle(cycle)) => {
-					let diagnostic =
-						self.cycle_diagnostic(strings, &cycle, reference);
-					self.diagnostics.push(diagnostic);
-					Ok(())
+			} => {
+				let env = self.normalize_env(strings, frame);
+				match self.check_constant_type(
+					strings, env, length, expected, reference,
+				) {
+					Ok(_) => Ok(()),
+					Err(SolverError::Cycle(cycle)) => {
+						let diagnostic =
+							self.cycle_diagnostic(strings, &cycle, reference);
+						self.diagnostics.push(diagnostic);
+						Ok(())
+					}
+					Err(SolverError::Overflow) => {
+						self.diagnostics
+							.push(self.overflow_diagnostic(reference));
+						Ok(())
+					}
+					Err(SolverError::Poisoned) => Ok(()),
+					Err(SolverError::Pending) => Err(()),
 				}
-				Err(SolverError::Overflow) => {
-					self.diagnostics.push(self.overflow_diagnostic(reference));
-					Ok(())
+			}
+			TypeObligation::ValueType {
+				frame,
+				ty,
+				reference,
+			} => {
+				let env = self.normalize_env(strings, frame);
+				match self.check_value_type(strings, env, ty, reference) {
+					Ok(_) => Ok(()),
+					Err(SolverError::Cycle(cycle)) => {
+						let diagnostic =
+							self.cycle_diagnostic(strings, &cycle, reference);
+						self.diagnostics.push(diagnostic);
+						Ok(())
+					}
+					Err(SolverError::Overflow) => {
+						self.diagnostics
+							.push(self.overflow_diagnostic(reference));
+						Ok(())
+					}
+					Err(SolverError::Poisoned) => Ok(()),
+					Err(SolverError::Pending) => Err(()),
 				}
-				Err(SolverError::Poisoned) => Ok(()),
-				Err(SolverError::Pending) => Err(()),
-			},
-			TypeObligation::CheckProjectionMember {
+			}
+			TypeObligation::ProjectionMember {
 				frame,
 				projection,
-				name,
+				key,
 				reference,
-			} => match self.check_projection_member(
-				strings,
-				self.assumption_envs.of_frame(frame),
-				projection,
-				name,
-				reference,
-			) {
-				Ok(_) => Ok(()),
-				Err(SolverError::Cycle(cycle)) => {
-					let diagnostic =
-						self.cycle_diagnostic(strings, &cycle, reference);
-					self.diagnostics.push(diagnostic);
-					Ok(())
+			} => {
+				let env = self.normalize_env(strings, frame);
+				match self.check_projection_member(
+					strings, env, projection, key, reference,
+				) {
+					Ok(_) => Ok(()),
+					Err(SolverError::Cycle(cycle)) => {
+						let diagnostic =
+							self.cycle_diagnostic(strings, &cycle, reference);
+						self.diagnostics.push(diagnostic);
+						Ok(())
+					}
+					Err(SolverError::Overflow) => {
+						self.diagnostics
+							.push(self.overflow_diagnostic(reference));
+						Ok(())
+					}
+					Err(SolverError::Poisoned) => Ok(()),
+					Err(SolverError::Pending) => Err(()),
 				}
-				Err(SolverError::Overflow) => {
-					self.diagnostics.push(self.overflow_diagnostic(reference));
-					Ok(())
-				}
-				Err(SolverError::Poisoned) => Ok(()),
-				Err(SolverError::Pending) => Err(()),
-			},
+			}
 		}
 	}
 }
@@ -700,16 +678,16 @@ impl Semantics {
 			unreachable!("a length checked for its type names a constant")
 		};
 		let signature = &self.constants[usize::from(constant)];
-		let (mut ty, frame) = (signature.ty, signature.env);
-		let mut env = self.assumption_envs.of_frame(frame);
+		let (mut ty, frame) = (signature.ty, signature.generic_params);
+		let mut env = self.normalize_env(strings, frame);
 		// With its arguments, the declared type is read where it is named.
 		if !type_args.is_empty() {
 			let args: Box<[TypeIndex]> = self.types.list(type_args).into();
 			ty = self.types.substitute(
 				ty,
 				Substitution {
-					envs: &self.generic_envs,
-					env: frame,
+					frames: &self.generic_frames,
+					frame,
 					args: &args,
 				},
 			);

@@ -17,7 +17,9 @@ use crate::vfs::FileId;
 use smallvec::SmallVec;
 
 use super::body::BodyOwner;
-use super::bounds::{AssumptionEnvIdx, Readiness, report_not_a_binding_member};
+use super::clauses::{
+	AssumptionEnvIdx, Readiness, report_not_a_binding_member,
+};
 use super::decls::{
 	AssocTypeIdx, AstNodeRef, BindingKey, ConstIdx, DeclKind, Declarations,
 	Declared, FieldIdx, FieldOwner, FunctionIdx, InherentImplIdx, MemberKind,
@@ -35,7 +37,8 @@ use super::solver::{
 	Assumption, NormalizationDepth, RewriteFlags, SolverError,
 };
 use super::types::{
-	GenericEnvIdx, GenericEnvOwner, Substitution, Type, TypeIndex, TypeInterner,
+	GenericFrameIdx, GenericFrameOwner, ImplArgs, Substitution, Type,
+	TypeIndex, TypeInterner,
 };
 
 /// What type-relative member applicability found.
@@ -104,7 +107,7 @@ type Candidates = SmallVec<[ApplicableMember; 1]>;
 
 /// A member found through impl dispatch or trait bounds. Trait candidates
 /// retain the declaration; a concrete impl can provide a different definition.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) enum ApplicableMember {
 	Inherent {
 		impl_index: InherentImplIdx,
@@ -115,10 +118,12 @@ pub(super) enum ApplicableMember {
 		trait_index: TraitIdx,
 		declaration: MemberKind,
 	},
-	/// A concrete trait impl applies; its member may use the trait declaration.
+	/// A concrete trait impl applies, at `args`; its member may use the trait
+	/// declaration.
 	TraitImplMember {
 		trait_index: TraitIdx,
 		impl_index: TraitImplIdx,
+		args: ImplArgs,
 		declaration: MemberKind,
 	},
 }
@@ -126,8 +131,8 @@ pub(super) enum ApplicableMember {
 impl ApplicableMember {
 	/// The trait constant a representability clause can read, for a constant's
 	/// member.
-	pub(super) fn constant_declaration(self) -> Option<ConstantTarget> {
-		match self {
+	pub(super) fn constant_declaration(&self) -> Option<ConstantTarget> {
+		match *self {
 			Self::AbstractTraitMember {
 				trait_index,
 				declaration: MemberKind::Constant(constant),
@@ -145,8 +150,8 @@ impl ApplicableMember {
 	}
 
 	/// Only a trait-associated type has a projection declaration.
-	pub(super) fn type_declaration(self) -> Option<TypeProjectionTarget> {
-		match self {
+	pub(super) fn type_declaration(&self) -> Option<TypeProjectionTarget> {
+		match *self {
 			Self::AbstractTraitMember {
 				trait_index,
 				declaration: MemberKind::AssociatedType(assoc_type_index),
@@ -164,8 +169,8 @@ impl ApplicableMember {
 	}
 
 	/// Returns the definition used for a value member.
-	pub(super) fn selected_kind(self, decls: &Declarations) -> MemberKind {
-		match self {
+	pub(super) fn selected_kind(&self, decls: &Declarations) -> MemberKind {
+		match *self {
 			Self::Inherent { kind, .. } => kind,
 			Self::TraitImplMember {
 				impl_index,
@@ -249,8 +254,12 @@ impl Declarations {
 pub(super) enum TraitImplLookup {
 	/// Concrete receiver, with a registered `impl required_trait for
 	/// receiver` (`impls.rs`'s dispatch) — `TraitImplIdx` names it, in
-	/// case it overrides the member being looked up.
-	Concrete { impl_index: TraitImplIdx },
+	/// case it overrides the member being looked up — and the impl's
+	/// arguments for the receiver, flat over its chain.
+	Concrete {
+		impl_index: TraitImplIdx,
+		args: ImplArgs,
+	},
 	/// Membership supplied by the caller's assumptions, including evidence
 	/// on an equivalent subject. No concrete provider was selected; dispatch
 	/// remains symbolic until instantiation.
@@ -315,7 +324,10 @@ impl Semantics {
 				receiver,
 				trait_index,
 			)? {
-				Some(TraitImplLookup::Concrete { impl_index }) => {
+				Some(TraitImplLookup::Concrete {
+					impl_index,
+					args: impl_args,
+				}) => {
 					// A function item's `impl Call` is the compiler's: it
 					// declares `Args` and `Result`, and the call runs the item.
 					if let Type::Function {
@@ -337,13 +349,7 @@ impl Semantics {
 							MemberKind::Function(own) | MemberKind::Method(own),
 						) => ResolvedFunction::Instance {
 							function: own,
-							args: self
-								.trait_impl_args(
-									strings,
-									AssumptionEnvIdx::ROOT,
-									impl_index,
-									receiver,
-								)
+							args: impl_args
 								.iter()
 								.chain(&args[1..])
 								.copied()
@@ -446,20 +452,20 @@ impl Semantics {
 			MemberLookup::Stuck(_) => {}
 			// No name is written (`T::` unfinished): the parser reported it.
 			MemberLookup::NotFound if segment.is_missing() => {}
-			// A projection's declared bounds are only half of what it can
-			// have: its value may be a type that does. That takes impls, so
-			// the declaration check decides what to say.
+			// Its value may have the member, which is never selected through
+			// it but says how to write the path; finding the value takes
+			// equalities and impls, so the declaration check decides what to
+			// say.
 			MemberLookup::NotFound
-				if key.tier == Tier::Type
-					&& matches!(
-						self.types.resolve(current),
-						Type::TypeProjection { .. }
-					) =>
+				if matches!(
+					self.types.resolve(current),
+					Type::TypeProjection { .. }
+				) =>
 			{
-				obligations.push(TypeObligation::CheckProjectionMember {
-					frame: scope.generic_env,
+				obligations.push(TypeObligation::ProjectionMember {
+					frame: scope.generic_frame,
 					projection: current,
-					name: segment.ident.inner,
+					key,
 					reference,
 				});
 			}
@@ -500,7 +506,7 @@ impl Semantics {
 			.resolve_trait_qualified_type_member(
 				strings,
 				obligations,
-				scope.generic_env,
+				scope.generic_frame,
 				receiver,
 				required_trait,
 				BindingKey::value(segment.ident.inner),
@@ -537,7 +543,7 @@ impl Semantics {
 		&mut self,
 		strings: &StringInterner,
 		obligations: &mut Vec<TypeObligation>,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 		key: BindingKey,
@@ -560,7 +566,7 @@ impl Semantics {
 		);
 		// Naming the member does not need an impl; whether `receiver`
 		// implements the trait is the declaration check's question.
-		obligations.push(TypeObligation::CheckTraitMembership {
+		obligations.push(TypeObligation::TraitMembership {
 			frame,
 			subject: receiver,
 			required: required_trait,
@@ -573,7 +579,7 @@ impl Semantics {
 		&mut self,
 		strings: &StringInterner,
 		obligations: &mut Vec<TypeObligation>,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 		name: Spanned<SymbolU32>,
@@ -600,10 +606,11 @@ impl Semantics {
 			name.span,
 		)?;
 		let member = match found {
-			TraitImplLookup::Concrete { impl_index, .. } => {
+			TraitImplLookup::Concrete { impl_index, args } => {
 				ApplicableMember::TraitImplMember {
 					trait_index: required_trait,
 					impl_index,
+					args,
 					declaration,
 				}
 			}
@@ -665,16 +672,17 @@ impl Semantics {
 		&mut self,
 		strings: &StringInterner,
 		obligations: &mut Vec<TypeObligation>,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		receiver: TypeIndex,
 		required_trait: TraitIdx,
 		file_id: FileId,
 		span: TextSpan,
 	) -> Result<TraitImplLookup, ()> {
 		let reference = SourceSpan::new(file_id, span);
+		let normalized_env = self.normalize_env(strings, frame);
 		match self.find_trait_impl_query(
 			strings,
-			self.assumption_envs.of_frame(frame),
+			normalized_env,
 			receiver,
 			required_trait,
 		) {
@@ -703,7 +711,7 @@ impl Semantics {
 			Err(SolverError::Pending) => {
 				// A qualified member already has a declaration identity.
 				// Membership is checked before the owning query completes.
-				obligations.push(TypeObligation::CheckTraitMembership {
+				obligations.push(TypeObligation::TraitMembership {
 					frame,
 					subject: receiver,
 					required: required_trait,
@@ -816,10 +824,11 @@ impl Semantics {
 				receiver,
 				trait_index,
 			) {
-				Ok(Some(TraitImplLookup::Concrete { impl_index, .. })) => {
+				Ok(Some(TraitImplLookup::Concrete { impl_index, args })) => {
 					candidates.push(ApplicableMember::TraitImplMember {
 						trait_index,
 						impl_index,
+						args,
 						declaration,
 					});
 				}
@@ -874,10 +883,10 @@ impl Semantics {
 		Self::classify(candidates)
 	}
 
-	fn classify(candidates: Candidates) -> MemberLookup {
-		match *candidates {
-			[] => MemberLookup::NotFound,
-			[candidate] => MemberLookup::Found(candidate),
+	fn classify(mut candidates: Candidates) -> MemberLookup {
+		match candidates.len() {
+			0 => MemberLookup::NotFound,
+			1 => MemberLookup::Found(candidates.remove(0)),
 			_ => MemberLookup::Ambiguous(
 				candidates.into_vec().into_boxed_slice(),
 			),
@@ -1125,6 +1134,7 @@ impl Semantics {
 		receiver: TypeIndex,
 	) -> Vec<(SymbolU32, Definition)> {
 		let scope = self.owner_scope(owner);
+		let env = self.assumption_envs.normalized(scope.generic_frame);
 		let mut found = Vec::new();
 		if receiver == TypeIndex::ERROR || self.types.needs_context(receiver) {
 			return found;
@@ -1160,7 +1170,7 @@ impl Semantics {
 		let receiver = self
 			.normalize(
 				strings,
-				scope.assumption_env,
+				env,
 				receiver,
 				NormalizationDepth::Deep,
 				RewriteFlags::EQUALITIES | RewriteFlags::DEFINITIONS,
@@ -1171,14 +1181,8 @@ impl Semantics {
 			Type::Pointer { to, .. } => to,
 			_ => receiver,
 		};
-		for key in self.member_candidates(
-			strings,
-			scope.assumption_env,
-			path,
-			Tier::Value,
-		) {
-			let Some(member) =
-				self.usable_member(strings, scope.assumption_env, path, key)
+		for key in self.member_candidates(strings, env, path, Tier::Value) {
+			let Some(member) = self.usable_member(strings, env, path, key)
 			else {
 				continue;
 			};
@@ -1186,7 +1190,7 @@ impl Semantics {
 			else {
 				continue;
 			};
-			if self.member_accessible(member, key, scope.namespace)
+			if self.member_accessible(&member, key, scope.namespace)
 				&& matches!(
 					self.receiver_fit(receiver, method),
 					ReceiverFit::Direct | ReceiverFit::Shared { .. }
@@ -1222,13 +1226,13 @@ impl Semantics {
 			else {
 				continue;
 			};
-			let (env, pattern) = (header.type_params, header.target.inner);
-			let count = self.generic_envs.generic_count(env);
+			let (frame, pattern) = (header.generic_params, header.target.inner);
+			let count = self.generic_frames.generic_count(frame);
 			let mut impl_args =
 				vec![TypeIndex::INFER; count].into_boxed_slice();
 			self.types.learn(
-				&self.generic_envs,
-				env,
+				&self.generic_frames,
+				frame,
 				&mut impl_args,
 				pattern,
 				receiver,
@@ -1236,8 +1240,8 @@ impl Semantics {
 			let instantiated = self.types.substitute(
 				pattern,
 				Substitution {
-					envs: &self.generic_envs,
-					env,
+					frames: &self.generic_frames,
+					frame,
 					args: &impl_args,
 				},
 			);
@@ -1278,7 +1282,7 @@ impl Semantics {
 		else {
 			return Vec::new();
 		};
-		let assumption_env = self.assumption_envs.of_frame(env);
+		let assumption_env = self.normalize_env(strings, env);
 		let mut found = Vec::new();
 		if receiver == TypeIndex::ERROR {
 			return found;
@@ -1307,7 +1311,7 @@ impl Semantics {
 				if let [(impl_index, kind, _)] = candidates[..]
 					&& used_as.takes_member(kind)
 					&& self.member_accessible(
-						ApplicableMember::Inherent { impl_index, kind },
+						&ApplicableMember::Inherent { impl_index, kind },
 						key,
 						namespace,
 					) {
@@ -1321,7 +1325,7 @@ impl Semantics {
 		{
 			if let Some(member) =
 				self.usable_member(strings, assumption_env, receiver, key)
-				&& self.member_accessible(member, key, namespace)
+				&& self.member_accessible(&member, key, namespace)
 			{
 				let kind = member.selected_kind(&self.decls);
 				if used_as.takes_member(kind) {
@@ -1340,8 +1344,9 @@ impl Semantics {
 		Some(match definition {
 			Definition::Item(loc) => match self.declaration_kind(loc) {
 				DeclKind::Struct(index) => {
-					let params = self.structs[usize::from(index)].type_params;
-					let count = self.generic_envs.param_names(params).len();
+					let params =
+						self.structs[usize::from(index)].generic_params;
+					let count = self.generic_frames.param_names(params).len();
 					self.types
 						.intern_struct(index, &vec![TypeIndex::INFER; count])
 				}
@@ -1354,8 +1359,8 @@ impl Semantics {
 						None => {
 							let alias = &self.type_aliases[usize::from(index)];
 							if !self
-								.generic_envs
-								.param_names(alias.type_params)
+								.generic_frames
+								.param_names(alias.generic_params)
 								.is_empty()
 							{
 								return None;
@@ -1366,8 +1371,8 @@ impl Semantics {
 				}
 				_ => return None,
 			},
-			Definition::TypeParam { env, index } => {
-				self.generic_envs.param_types(env)[index as usize]
+			Definition::TypeParam { frame, index } => {
+				self.generic_frames.param_types(frame)[index as usize]
 			}
 			Definition::InherentImplTarget(index) => {
 				self.inherent_impls[usize::from(index)]
@@ -1494,12 +1499,12 @@ impl Semantics {
 	/// the trait's.
 	pub(super) fn member_accessible(
 		&self,
-		found: ApplicableMember,
+		found: &ApplicableMember,
 		key: BindingKey,
 		accessor: Scope,
 	) -> bool {
 		let decls = &self.decls;
-		let (namespace, visibility) = match found {
+		let (namespace, visibility) = match *found {
 			ApplicableMember::Inherent { impl_index, .. } => {
 				let impl_decl = &decls.inherent_impls[usize::from(impl_index)];
 				let member =
@@ -1546,13 +1551,13 @@ impl Semantics {
 				let signature = &self.structs[usize::from(struct_index)];
 				let declared =
 					self.types.list(signature.field_types)[usize::from(field)];
-				let env = signature.type_params;
+				let frame = signature.generic_params;
 				let args = self.types.list(type_args).to_vec();
 				Some(self.types.substitute(
 					declared,
 					Substitution {
-						envs: &self.generic_envs,
-						env,
+						frames: &self.generic_frames,
+						frame,
 						args: &args,
 					},
 				))
@@ -1678,21 +1683,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 			MemberLookup::NotFound => {}
 			found => return found,
 		}
-		// Only assumed equalities may rewrite the receiver here, so a concrete
-		// head can come from evidence in scope but never from selecting an impl.
-		let receiver = match sema.normalize(
-			self.strings,
-			assumption_context,
-			receiver,
-			NormalizationDepth::Deep,
-			RewriteFlags::EQUALITIES,
-		) {
-			Ok(receiver) => receiver,
-			Err(error) => return error.into(),
-		};
-		if receiver == TypeIndex::ERROR {
-			return MemberLookup::Error;
-		}
+		// The receiver as written: what it is equal to never selects a member
+		// (`notes/member-selection-and-equalities.md`).
 		let mut traits = Vec::new();
 		let mut readiness = Readiness::Ready;
 		if !sema.types.is_abstract(receiver) {
@@ -1722,8 +1714,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 					Err(lookup) => return lookup,
 				};
 			for trait_index in scoped {
-				match sema.check_assumed_trait(
-					self.strings,
+				match sema.states_trait(
 					assumption_context,
 					receiver,
 					trait_index,
@@ -1793,9 +1784,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 				continue;
 			}
 			let key = BindingKey::ty(segment.ident.inner);
+			// Selection matches clauses as written, in a body too.
+			let written = sema.assumption_envs.written(scope.generic_frame);
 			let lookup = self.select_associated_type(
 				sema,
-				scope.assumption_env,
+				written,
 				current,
 				key,
 				SourceSpan::new(scope.file_id, segment.ident.span),
@@ -1822,8 +1815,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 			};
 			// Selection named the trait without matching an impl; that
 			// the receiver implements it is the declaration check's question.
-			obligations.push(TypeObligation::CheckTraitMembership {
-				frame: scope.generic_env,
+			obligations.push(TypeObligation::TraitMembership {
+				frame: scope.generic_frame,
 				subject: current,
 				required: trait_index,
 				reference: SourceSpan::new(scope.file_id, segment.ident.span),
@@ -1910,13 +1903,9 @@ impl<'ast> SemanticsBuilder<'ast> {
 			return Some((constant, impl_args));
 		}
 		let reference = SourceSpan::new(scope.file_id, segment.ident.span);
-		let lookup = self.select_associated_type(
-			sema,
-			scope.assumption_env,
-			receiver,
-			key,
-			reference,
-		);
+		let written = sema.assumption_envs.written(scope.generic_frame);
+		let lookup = self
+			.select_associated_type(sema, written, receiver, key, reference);
 		let ApplicableMember::AbstractTraitMember {
 			trait_index,
 			declaration,
@@ -1943,8 +1932,8 @@ impl<'ast> SemanticsBuilder<'ast> {
 			);
 			return None;
 		};
-		obligations.push(TypeObligation::CheckTraitMembership {
-			frame: scope.generic_env,
+		obligations.push(TypeObligation::TraitMembership {
+			frame: scope.generic_frame,
 			subject: receiver,
 			required: trait_index,
 			reference,
@@ -2006,17 +1995,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 		key: BindingKey,
 	) -> Option<(MemberKind, Vec<TypeIndex>)> {
 		let reference = SourceSpan::new(scope.file_id, segment.ident.span);
-		// Only assumed equalities may rewrite the receiver here, as for an
-		// associated type; a failure is the trait selection's to report.
-		let receiver = sema
-			.normalize(
-				self.strings,
-				scope.assumption_env,
-				receiver,
-				NormalizationDepth::Deep,
-				RewriteFlags::EQUALITIES,
-			)
-			.ok()?;
+		// The receiver as written, as for an associated type.
 		let target = ImplTarget::from_type(sema.types.resolve(receiver))?;
 		let wanted: Vec<_> = sema
 			.impl_dispatch
@@ -2049,12 +2028,12 @@ impl<'ast> SemanticsBuilder<'ast> {
 			else {
 				continue;
 			};
-			let env = header.type_params;
+			let frame = header.generic_params;
 			let Some(impl_args) = sema.types.match_impl_target(
 				header.target.inner,
 				receiver,
-				&sema.generic_envs,
-				env,
+				&sema.generic_frames,
+				frame,
 			) else {
 				continue;
 			};
@@ -2063,10 +2042,10 @@ impl<'ast> SemanticsBuilder<'ast> {
 				.push(impl_args.iter().map(|&ty| (ty, segment.ident.span)));
 			sema.record_bounds_check(
 				obligations,
-				scope.generic_env,
-				BoundRequirements::Frame { env, args },
+				scope.generic_frame,
+				BoundRequirements::Frame { frame, args },
 				reference,
-				GenericEnvOwner::InherentImpl(impl_index),
+				GenericFrameOwner::InherentImpl(impl_index),
 			);
 			sema.resolutions.record(
 				Site::new(key.tier, reference),

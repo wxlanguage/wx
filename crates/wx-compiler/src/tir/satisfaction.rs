@@ -14,13 +14,10 @@
 
 use codespan_reporting::diagnostic::Diagnostic;
 
-use super::bounds::{
-	AssumptionEnvIdx, BoundClauses, BoundId, Clause, EqualityClause,
-	RepresentableClause, TraitClause,
-};
+use super::clauses::{AssumptionEnvIdx, PublishedClauses, SourceClauseId};
 use string_interner::symbol::SymbolU32;
 
-use super::decls::{BindingKey, DeclKind, Declarations, TraitIdx};
+use super::decls::{BindingKey, DeclKind, Declarations, Tier, TraitIdx};
 use super::impls::ImplTarget;
 use super::members::{MemberLookup, report_no_such_type_member};
 use super::obligations::{BoundRequirements, TypeObligation};
@@ -28,11 +25,11 @@ use super::signatures::{LexicalScope, Semantics};
 use super::solver::{
 	NormalizationDepth, RewriteFlags, SolverError, Subjects, UnsatisfiedClause,
 };
-use super::types::{GenericArgs, GenericEnvIdx, Type, TypeIndex};
+use super::types::{GenericArgs, GenericFrameIdx, Type, TypeIndex};
 use crate::ast::{self, Keyword, Spanned, StringInterner};
 use crate::diagnostics::{DiagnosticCode, SourceSpan, TextSpan};
-use crate::tir::bounds::{BindingRef, BindingRequirement};
-use crate::tir::types::GenericEnvOwner;
+use crate::tir::clauses::{BindingRef, BindingRequirement};
+use crate::tir::types::GenericFrameOwner;
 use crate::vfs::FileId;
 
 impl Semantics {
@@ -43,12 +40,12 @@ impl Semantics {
 	pub(super) fn record_bounds_check(
 		&mut self,
 		obligations: &mut Vec<TypeObligation>,
-		frame: GenericEnvIdx,
+		frame: GenericFrameIdx,
 		requirements: BoundRequirements,
 		reference: SourceSpan,
-		owner: GenericEnvOwner,
+		owner: GenericFrameOwner,
 	) {
-		obligations.push(TypeObligation::CheckBounds {
+		obligations.push(TypeObligation::Bounds {
 			frame,
 			requirements,
 			reference,
@@ -56,7 +53,7 @@ impl Semantics {
 		});
 	}
 
-	/// Resolves a written type-argument list against `params_env`, `owner`'s
+	/// Resolves a written type-argument list against `params_frame`, `owner`'s
 	/// own frame (`ROOT` when it declares no parameters). Always returns as
 	/// many arguments as the frame declares. A wrong count is reported and makes every one `ERROR`:
 	/// there is no sensible pairing to salvage, and the caller still sees a
@@ -64,7 +61,7 @@ impl Semantics {
 	/// are kept as written, and the frame's bounds are recorded, each failure
 	/// reported at the argument it is about, so `T: A + B` is two reports
 	/// when an argument satisfies neither. `parent_args` are the arguments of
-	/// the frames around `params_env`, outer first, which a bound may name;
+	/// the frames around `params_frame`, outer first, which a bound may name;
 	/// a failure about one is reported at the segment.
 	pub(super) fn resolve_type_args(
 		&mut self,
@@ -73,23 +70,28 @@ impl Semantics {
 		scope: LexicalScope,
 		asts: &[ast::AST],
 		segment: &ast::PathSegment,
-		params_env: GenericEnvIdx,
+		params_frame: GenericFrameIdx,
 		parent_args: &[TypeIndex],
 		args: &[TypeIndex],
-		owner: GenericEnvOwner,
+		owner: GenericFrameOwner,
 	) -> Box<[TypeIndex]> {
 		if !self.check_type_arg_count(
-			strings, scope, asts, segment, params_env, owner,
+			strings,
+			scope,
+			asts,
+			segment,
+			params_frame,
+			owner,
 		) {
-			let expected = self.generic_envs.param_names(params_env).len();
+			let expected = self.generic_frames.param_names(params_frame).len();
 			return vec![TypeIndex::ERROR; expected].into_boxed_slice();
 		}
-		if params_env == GenericEnvIdx::ROOT {
+		if params_frame == GenericFrameIdx::ROOT {
 			return Box::new([]);
 		}
 		debug_assert_eq!(
 			parent_args.len(),
-			self.generic_envs.parent_count(params_env),
+			self.generic_frames.parent_count(params_frame),
 			"a bound is substituted over the frame's whole chain"
 		);
 		let parents = parent_args.iter().map(|&ty| (ty, segment.ident.span));
@@ -103,9 +105,9 @@ impl Semantics {
 			.push(parents.chain(args.iter().copied().zip(written)));
 		self.record_bounds_check(
 			obligations,
-			scope.generic_env,
+			scope.generic_frame,
 			BoundRequirements::Frame {
-				env: params_env,
+				frame: params_frame,
 				args: generic_args,
 			},
 			SourceSpan::new(scope.file_id, segment.ident.span),
@@ -114,7 +116,7 @@ impl Semantics {
 		args.into()
 	}
 
-	/// Whether `segment` writes as many type arguments as `params_env`
+	/// Whether `segment` writes as many type arguments as `params_frame`
 	/// declares; reports the mismatch when it does not.
 	pub(super) fn check_type_arg_count(
 		&mut self,
@@ -122,10 +124,10 @@ impl Semantics {
 		scope: LexicalScope,
 		asts: &[ast::AST],
 		segment: &ast::PathSegment,
-		params_env: GenericEnvIdx,
-		owner: GenericEnvOwner,
+		params_frame: GenericFrameIdx,
+		owner: GenericFrameOwner,
 	) -> bool {
-		let expected = self.generic_envs.param_names(params_env).len();
+		let expected = self.generic_frames.param_names(params_frame).len();
 		if segment.type_args.len() == expected {
 			return true;
 		}
@@ -136,7 +138,7 @@ impl Semantics {
 			&asts[scope.file_id.as_usize()],
 			segment,
 			owner,
-			self.generic_envs.param_names(params_env),
+			self.generic_frames.param_names(params_frame),
 		));
 		false
 	}
@@ -144,24 +146,21 @@ impl Semantics {
 
 /// The checks bound satisfaction owns, run by the declaration check.
 impl Semantics {
-	/// Completes `frame`'s env with what its `Self` entry, `clauses` about a
-	/// trait impl's target, means (`normalize_clauses`). What is not about an
-	/// abstract type is proved there and dropped. One that does not hold is
-	/// reported at its bound: an error without a parameter (`Bytes: Show`
-	/// never holds), and unsupported with one (`Wrap<T>: Show` would be an
+	/// Proves `proved`, clauses of `frame` that normalizing its env found not
+	/// to be about an abstract type, in `env`, and reports each that does not
+	/// hold at its bound: an error without a parameter (`Bytes: Show` never
+	/// holds), and unsupported with one (`Wrap<T>: Show` would be an
 	/// assumption about a type that is not abstract, which lookup never
 	/// reads).
-	pub(super) fn normalize_self_entry(
+	pub(super) fn prove_clauses_at_their_bounds(
 		&mut self,
 		strings: &StringInterner,
-		frame: GenericEnvIdx,
-		clauses: BoundClauses,
+		frame: GenericFrameIdx,
+		env: AssumptionEnvIdx,
+		proved: PublishedClauses,
 	) -> Result<(), SolverError> {
-		let env = self.assumption_envs.of_frame(frame);
-		let (assumed, proved) =
-			self.normalize_clauses(strings, env, clauses)?;
 		let arguments: Box<[TypeIndex]> =
-			self.generic_envs.identity_args(frame).into();
+			self.generic_frames.identity_args(frame).into();
 		let mut failures = Vec::new();
 		self.satisfies_clauses(
 			strings,
@@ -172,7 +171,7 @@ impl Semantics {
 			Some(&mut failures),
 			None,
 		)?;
-		let owner = self.generic_envs.owner(frame);
+		let owner = self.generic_frames.owner(frame);
 		for failure in failures {
 			let diagnostic = match failure {
 				UnsatisfiedClause::Trait {
@@ -182,7 +181,7 @@ impl Semantics {
 					source,
 					..
 				} => {
-					let at = self.bounds.span(source);
+					let at = self.source_clauses.span(source);
 					if self.types.has_param(reduced) {
 						let trait_name = self.decls.name(trait_index).inner;
 						let clause = format!(
@@ -267,12 +266,6 @@ impl Semantics {
 			};
 			self.diagnostics.push(diagnostic);
 		}
-
-		if !assumed.is_empty() {
-			let completed = self.assumption_envs.push(env, None);
-			*self.assumption_envs.clauses_mut(completed) = assumed;
-			self.assumption_envs.complete_frame(frame, completed);
-		}
 		Ok(())
 	}
 
@@ -313,7 +306,7 @@ impl Semantics {
 	/// Where the equality or representability clause `source` is written: from
 	/// its name to its value or type (`Item = u8`, `LEN: u8`).
 	pub(super) fn binding_span(&self, source: BindingRef) -> SourceSpan {
-		let binding = self.bounds.binding(source);
+		let binding = self.source_clauses.binding(source);
 		let (BindingRequirement::Equals(_, value)
 		| BindingRequirement::Representable(_, value)) = &binding.kind
 		else {
@@ -322,106 +315,9 @@ impl Semantics {
 			)
 		};
 		SourceSpan::new(
-			self.bounds.span(source.bound).file_id,
+			self.source_clauses.span(source.bound).file_id,
 			TextSpan::new(binding.name.span.start, value.span.end),
 		)
-	}
-
-	/// `clauses`, about types (a `Self` entry's, read in a trait impl),
-	/// normalized in `env`: those that now read about an abstract type, as
-	/// they read, which is what assuming them means; then the rest, as
-	/// written, which holds or not of its own and assumes nothing.
-	pub(super) fn normalize_clauses(
-		&mut self,
-		strings: &StringInterner,
-		env: AssumptionEnvIdx,
-		clauses: BoundClauses,
-	) -> Result<(BoundClauses, BoundClauses), SolverError> {
-		let Some(range) = clauses.final_range() else {
-			unreachable!("normalized clauses are final")
-		};
-		let (mut assumed, mut other) = (Vec::new(), Vec::new());
-		// Read one clause at a time: normalizing interns, and the arena only
-		// grows, so the range stays valid.
-		for at in 0..range.len() {
-			let clause = self.clauses.get(range)[at];
-			let normalized = match clause {
-				Clause::Trait(clause) => {
-					let subject = self.normalize(
-						strings,
-						env,
-						clause.subject,
-						NormalizationDepth::Deep,
-						RewriteFlags::ALL,
-					)?;
-					self.types.is_abstract(subject).then_some(Clause::Trait(
-						TraitClause { subject, ..clause },
-					))
-				}
-				Clause::Equality(clause) => {
-					let projection = self.normalize(
-						strings,
-						env,
-						clause.projection,
-						NormalizationDepth::Deep,
-						RewriteFlags::ALL,
-					)?;
-					if matches!(
-						self.types.resolve(projection),
-						Type::TypeProjection { .. }
-					) && self.types.is_abstract(projection)
-					{
-						let value = self.normalize(
-							strings,
-							env,
-							clause.value,
-							NormalizationDepth::Deep,
-							RewriteFlags::ALL,
-						)?;
-						Some(Clause::Equality(EqualityClause {
-							projection,
-							value,
-							..clause
-						}))
-					} else {
-						None
-					}
-				}
-				Clause::Representable(clause) => {
-					let subject = self.normalize(
-						strings,
-						env,
-						clause.subject,
-						NormalizationDepth::Deep,
-						RewriteFlags::ALL,
-					)?;
-					if self.types.is_abstract(subject) {
-						let ty = self.normalize(
-							strings,
-							env,
-							clause.ty,
-							NormalizationDepth::Deep,
-							RewriteFlags::ALL,
-						)?;
-						Some(Clause::Representable(RepresentableClause {
-							subject,
-							ty,
-							..clause
-						}))
-					} else {
-						None
-					}
-				}
-			};
-			match normalized {
-				Some(normalized) => assumed.push(normalized),
-				None => other.push(clause),
-			}
-		}
-		Ok((
-			BoundClauses::Final(self.clauses.push(&assumed)),
-			BoundClauses::Final(self.clauses.push(&other)),
-		))
 	}
 
 	/// Gather violations before emitting them: another requirement can still
@@ -432,17 +328,17 @@ impl Semantics {
 		assumption_context: AssumptionEnvIdx,
 		requirements: BoundRequirements,
 		reference: SourceSpan,
-		owner: GenericEnvOwner,
+		owner: GenericFrameOwner,
 	) -> Result<(), SolverError> {
 		// The clauses are written in the declaration's frame, about its own
 		// subject; the use supplies that frame's arguments and the subject.
 		// The arguments are owned: the proof interns while it reads them.
 		let (clauses, subjects, frame, arguments): (_, _, _, Box<[TypeIndex]>) =
 			match requirements {
-				BoundRequirements::Frame { env, args } => (
-					self.assumption_envs.requirements(env),
+				BoundRequirements::Frame { frame, args } => (
+					self.assumption_envs.requirements(frame),
 					Subjects::All,
-					env,
+					frame,
 					self.generic_args.types(args).into(),
 				),
 				BoundRequirements::AssociatedType {
@@ -456,9 +352,10 @@ impl Semantics {
 					else {
 						return Err(SolverError::Pending);
 					};
-					let env = self.traits[usize::from(trait_index)].env;
+					let frame =
+						self.traits[usize::from(trait_index)].generic_params;
 					let root = self.types.intern(Type::TypeProjection {
-						base: self.generic_envs.param_types(env)[0],
+						base: self.generic_frames.param_types(frame)[0],
 						trait_index,
 						assoc_type_index: declaration,
 					});
@@ -468,7 +365,7 @@ impl Semantics {
 							root,
 							subject: value,
 						},
-						env,
+						frame,
 						Box::new([receiver]),
 					)
 				}
@@ -556,36 +453,41 @@ impl Semantics {
 		args: GenericArgs,
 		mut written: TypeIndex,
 	) -> Option<TextSpan> {
-		let (env, param_index) = loop {
+		let (frame, param_index) = loop {
 			match *self.types.resolve(written) {
-				Type::TypeParam { env, param_index } => {
-					break (env, param_index);
+				Type::TypeParam { frame, param_index } => {
+					break (frame, param_index);
 				}
 				Type::TypeProjection { base, .. } => written = base,
 				_ => return None,
 			}
 		};
-		let slot = self.generic_envs.parent_count(env) + param_index as usize;
+		let slot =
+			self.generic_frames.parent_count(frame) + param_index as usize;
 		Some(self.generic_args.spans(args)[slot])
 	}
 
 	/// `projection::name` could not be selected from the projection's declared
-	/// bounds. Resolve what the projection's value is and which traits could
-	/// supply `name` on it, as rustc does to build its suggestion. Selecting
-	/// through an impl unqualified is ambiguous by design, so a trait that
-	/// *would* work is still an error, but one that says how to write it.
-	/// Always fails: the lowered type was `ERROR`.
+	/// bounds. A member is never selected through what the projection is
+	/// equal to, by an equality or an impl's definition
+	/// (`notes/member-selection-and-equalities.md`), so this always fails: the
+	/// lowered type was `ERROR`. It decides what to say: a plain "no such
+	/// member", or, when the projection's value has one, how to write it,
+	/// naming the value and, for a trait member, the trait, as rustc does.
 	pub(super) fn check_projection_member(
 		&mut self,
 		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		projection: TypeIndex,
-		name: SymbolU32,
+		key: BindingKey,
 		reference: SourceSpan,
 	) -> Result<(), SolverError> {
-		let key = BindingKey::ty(name);
+		let noun = match key.tier {
+			Tier::Type => "associated type",
+			Tier::Value => "associated constant",
+		};
 		let ident = Spanned {
-			inner: name,
+			inner: key.symbol,
 			span: reference.span,
 		};
 		let declared_anywhere = (0..self.decls.traits.len()).any(|index| {
@@ -610,7 +512,7 @@ impl Semantics {
 						reference.file_id,
 						strings,
 						ident,
-						"associated type",
+						noun,
 					));
 				}
 				return Err(SolverError::Poisoned);
@@ -621,8 +523,17 @@ impl Semantics {
 		// impl per trait per type constructor, and `declared_bound_member` skips
 		// a trait it has already collected.
 		let mut traits: Vec<TraitIdx> = Vec::new();
+		let mut inherent = false;
 		match ImplTarget::from_type(self.types.resolve(normalized)) {
 			Some(target) => {
+				inherent =
+					self.impl_dispatch.inherent_candidates(target).iter().any(
+						|&impl_index| {
+							self.decls.inherent_impls[usize::from(impl_index)]
+								.bindings
+								.contains_key(&key)
+						},
+					);
 				for trait_index in self.trait_candidates(target) {
 					if self
 						.decls
@@ -665,28 +576,38 @@ impl Semantics {
 			}
 			None => {}
 		}
-		if traits.is_empty() {
+		if traits.is_empty() && !inherent {
 			self.diagnostics.push(report_no_such_type_member(
 				reference.file_id,
 				strings,
 				ident,
-				"associated type",
+				noun,
 			));
 			return Err(SolverError::Poisoned);
 		}
-		let name_str = strings.resolve(name).unwrap().to_string();
-		let receiver = self.type_formatter(strings).display_type(projection);
+		let name = strings.resolve(key.symbol).unwrap();
+		let formatter = self.type_formatter(strings);
+		let receiver = formatter.display_type(projection);
+		let value = formatter.display_type(normalized);
+		let message = if traits.is_empty() {
+			format!("`{name}` is not selected through `{receiver}`")
+		} else {
+			format!("ambiguous {noun} `{name}`")
+		};
 		let mut diagnostic = Diagnostic::error()
 			.with_code(DiagnosticCode::TypeMemberNeedsQualification.code())
-			.with_message(format!("ambiguous associated type `{name_str}`"))
+			.with_message(message)
 			.with_label(reference.primary_label().with_message(format!(
-				"`{receiver}` is known only through an impl, so the trait must be named"
-			)));
+				"`{receiver}` declares no `{name}`; only its value does"
+			)))
+			.with_note(format!(
+				"`{receiver}` is `{value}` here: write `{value}::{name}`"
+			));
 		for trait_index in traits {
 			let trait_name =
 				strings.resolve(self.decls.name(trait_index).inner).unwrap();
 			diagnostic = diagnostic.with_note(format!(
-				"qualify the trait: `<{receiver} as {trait_name}>::{name_str}`"
+				"qualify the trait: `<{receiver} as {trait_name}>::{name}`"
 			));
 		}
 		self.diagnostics.push(diagnostic);
@@ -701,8 +622,8 @@ impl Semantics {
 		file_id: FileId,
 		argument: Spanned<(TypeIndex, TypeIndex)>,
 		trait_index: TraitIdx,
-		bound_id: BoundId,
-		owner: GenericEnvOwner,
+		bound_id: SourceClauseId,
+		owner: GenericFrameOwner,
 	) -> Diagnostic<FileId> {
 		let formatter = self.type_formatter(strings);
 		let (subject, reduced) = argument.inner;
@@ -725,16 +646,19 @@ impl Semantics {
 					)),
 			)
 			.with_label(
-				self.bounds.span(bound_id).secondary_label().with_message(
-					// An impl has no name to point at; its bound is shown.
-					match owner.name(&self.decls) {
-						Some(name) => format!(
-							"required by a bound in `{}`",
-							strings.resolve(name.inner).unwrap()
-						),
-						None => "required by this bound".to_owned(),
-					},
-				),
+				self.source_clauses
+					.span(bound_id)
+					.secondary_label()
+					.with_message(
+						// An impl has no name to point at; its bound is shown.
+						match owner.name(&self.decls) {
+							Some(name) => format!(
+								"required by a bound in `{}`",
+								strings.resolve(name.inner).unwrap()
+							),
+							None => "required by this bound".to_owned(),
+						},
+					),
 			)
 	}
 
@@ -750,7 +674,7 @@ impl Semantics {
 		found: TypeIndex,
 		expected: TypeIndex,
 		source: BindingRef,
-		owner: GenericEnvOwner,
+		owner: GenericFrameOwner,
 	) -> Diagnostic<FileId> {
 		let formatter = self.type_formatter(strings);
 		let (projection, required, found, expected) = (
@@ -759,15 +683,20 @@ impl Semantics {
 			formatter.display_type(found),
 			formatter.display_type(expected),
 		);
-		let ast::Spanned { span, .. } = match self.bounds.binding(source).kind {
-			BindingRequirement::Equals(_, value) => value,
-			BindingRequirement::Bound(..)
-			| BindingRequirement::Representable(..) => {
-				unreachable!("an equality clause comes from a written equality")
-			}
-		};
-		let written =
-			SourceSpan::new(self.bounds.span(source.bound).file_id, span);
+		let ast::Spanned { span, .. } =
+			match self.source_clauses.binding(source).kind {
+				BindingRequirement::Equals(_, value) => value,
+				BindingRequirement::Bound(..)
+				| BindingRequirement::Representable(..) => {
+					unreachable!(
+						"an equality clause comes from a written equality"
+					)
+				}
+			};
+		let written = SourceSpan::new(
+			self.source_clauses.span(source.bound).file_id,
+			span,
+		);
 		Diagnostic::error()
 			.with_code(DiagnosticCode::AssocTypeEqualityMismatch.code())
 			.with_message(format!(
@@ -798,7 +727,7 @@ pub(super) enum TypeArgsNotAllowedOn<'a> {
 	/// A generic parameter or a trait's `Self`, and the declaration whose
 	/// frame declares it.
 	TypeParam {
-		owner: GenericEnvOwner,
+		owner: GenericFrameOwner,
 		name: &'a Spanned<SymbolU32>,
 	},
 }
@@ -868,7 +797,7 @@ fn report_type_arg_count_mismatch(
 	file_id: FileId,
 	ast: &ast::AST,
 	segment: &ast::PathSegment,
-	owner: GenericEnvOwner,
+	owner: GenericFrameOwner,
 	params: &[Spanned<SymbolU32>],
 ) -> Diagnostic<FileId> {
 	let (noun, name) = (owner.noun(), segment.ident.inner);
@@ -1051,11 +980,13 @@ mod tests {
 			else {
 				panic!("expected `{function_path}` to be a function");
 			};
-			let env =
-				self.sema.functions[usize::from(function_index)].type_params;
-			let param =
-				self.sema.types.intern(Type::TypeParam { env, param_index });
-			(param, self.sema.assumption_envs.of_frame(env))
+			let frame =
+				self.sema.functions[usize::from(function_index)].generic_params;
+			let param = self
+				.sema
+				.types
+				.intern(Type::TypeParam { frame, param_index });
+			(param, self.sema.assumption_envs.normalized(frame))
 		}
 
 		/// Whether `receiver` implements `required_trait` under `env`.

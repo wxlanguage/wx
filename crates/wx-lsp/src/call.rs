@@ -49,94 +49,94 @@ pub(crate) fn signature(
 		}
 		_ => false,
 	};
-	let (definition, env, names, params, args, skipped, result) = match checked
-	{
-		Call::Function {
-			function,
-			type_args,
-			receiver,
-			..
-		} => {
-			// Calling a function item uses its declared parameter list. The
-			// checked node reaches it through `Call::call`, whose packed Args
-			// describe implementation rather than how this call is written.
-			let item = body
-				.operand_of(ast, callee)
-				.map(|operand| body.operand_ty(operand))
-				.and_then(|ty| match *sema.types.resolve(ty) {
-					Type::Function {
-						func_index,
-						type_args,
-					} => Some((func_index, type_args)),
-					_ => None,
+	let (definition, frame, names, params, args, skipped, result) =
+		match checked {
+			Call::Function {
+				function,
+				type_args,
+				receiver,
+				..
+			} => {
+				// Calling a function item uses its declared parameter list. The
+				// checked node reaches it through `Call::call`, whose packed Args
+				// describe implementation rather than how this call is written.
+				let item = body
+					.operand_of(ast, callee)
+					.map(|operand| body.operand_ty(operand))
+					.and_then(|ty| match *sema.types.resolve(ty) {
+						Type::Function {
+							func_index,
+							type_args,
+						} => Some((func_index, type_args)),
+						_ => None,
+					});
+				let (function, args, skipped) = match item {
+					Some((function, args)) if receiver.is_some() => {
+						(function, sema.types.list(args).to_vec(), 0)
+					}
+					_ => (
+						function,
+						sema.generic_args.types(type_args).to_vec(),
+						usize::from(receiver.is_some()),
+					),
+				};
+				let decl = &sema.decls.functions[usize::from(function)];
+				let signature = &sema.functions[usize::from(function)];
+				let names = sema.decls.params.names(decl.params).to_vec();
+				(
+					Some(Definition::Item(decl.loc)),
+					signature.generic_params,
+					names,
+					sema.types.list(signature.param_types).to_vec(),
+					args,
+					skipped,
+					signature.return_type,
+				)
+			}
+			Call::Constructor { structure, .. } => {
+				let decl = &sema.decls.structs[usize::from(structure)];
+				let signature = &sema.structs[usize::from(structure)];
+				let ty = body.operand_ty(Operand::Value(value));
+				let args = match *sema.types.resolve(ty) {
+					Type::Struct { type_args, .. } => {
+						sema.types.list(type_args).to_vec()
+					}
+					_ => sema
+						.generic_frames
+						.identity_args(signature.generic_params)
+						.to_vec(),
+				};
+				let names = sema.decls.fields.names(decl.fields).to_vec();
+				let params = sema.types.list(signature.field_types).to_vec();
+				let definition = Definition::Item(decl.loc);
+				let frame = signature.generic_params;
+				let result = sema.types.intern_struct(structure, &args);
+				(Some(definition), frame, names, params, args, 0, result)
+			}
+			Call::Reference { callee, .. } => {
+				let Type::TypedFuncref { param, result } =
+					*sema.types.resolve(body.operand_ty(callee))
+				else {
+					return None;
+				};
+				let parameters = match *sema.types.resolve(param) {
+					Type::Tuple { elements } => sema
+						.types
+						.list(elements)
+						.iter()
+						.map(|&ty| (None, ty))
+						.collect(),
+					_ => vec![(None, param)],
+				};
+				return Some(CallSignature {
+					parameters,
+					result,
+					definition: None,
+					whole_argument,
 				});
-			let (function, args, skipped) = match item {
-				Some((function, args)) if receiver.is_some() => {
-					(function, sema.types.list(args).to_vec(), 0)
-				}
-				_ => (
-					function,
-					sema.generic_args.types(type_args).to_vec(),
-					usize::from(receiver.is_some()),
-				),
-			};
-			let decl = &sema.decls.functions[usize::from(function)];
-			let signature = &sema.functions[usize::from(function)];
-			let names = sema.decls.params.names(decl.params).to_vec();
-			(
-				Some(Definition::Item(decl.loc)),
-				signature.type_params,
-				names,
-				sema.types.list(signature.param_types).to_vec(),
-				args,
-				skipped,
-				signature.return_type,
-			)
-		}
-		Call::Constructor { structure, .. } => {
-			let decl = &sema.decls.structs[usize::from(structure)];
-			let signature = &sema.structs[usize::from(structure)];
-			let ty = body.operand_ty(Operand::Value(value));
-			let args = match *sema.types.resolve(ty) {
-				Type::Struct { type_args, .. } => {
-					sema.types.list(type_args).to_vec()
-				}
-				_ => sema
-					.generic_envs
-					.identity_args(signature.type_params)
-					.to_vec(),
-			};
-			let names = sema.decls.fields.names(decl.fields).to_vec();
-			let params = sema.types.list(signature.field_types).to_vec();
-			let definition = Definition::Item(decl.loc);
-			let env = signature.type_params;
-			let result = sema.types.intern_struct(structure, &args);
-			(Some(definition), env, names, params, args, 0, result)
-		}
-		Call::Reference { callee, .. } => {
-			let Type::TypedFuncref { param, result } =
-				*sema.types.resolve(body.operand_ty(callee))
-			else {
-				return None;
-			};
-			let parameters = match *sema.types.resolve(param) {
-				Type::Tuple { elements } => sema
-					.types
-					.list(elements)
-					.iter()
-					.map(|&ty| (None, ty))
-					.collect(),
-				_ => vec![(None, param)],
-			};
-			return Some(CallSignature {
-				parameters,
-				result,
-				definition: None,
-				whole_argument,
-			});
-		}
-	};
-	let identity = sema.generic_envs.identity_args(env);
+			}
+		};
+	let identity = sema.generic_frames.identity_args(frame);
 	let args: Vec<_> = args
 		.iter()
 		.enumerate()
@@ -154,7 +154,7 @@ pub(crate) fn signature(
 		.skip(skipped)
 		.chain(std::iter::once(result))
 	{
-		let ty = sema.substitute_type(ty, env, &args);
+		let ty = sema.substitute_type(ty, frame, &args);
 		types.push(sema.normalize_in_body(strings, owner, ty).unwrap_or(ty));
 	}
 	let result = types.pop()?;

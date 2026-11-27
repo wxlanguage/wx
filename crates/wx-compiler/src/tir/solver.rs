@@ -15,9 +15,9 @@ use crate::ast::{Ownership, StringInterner};
 #[cfg(test)]
 use crate::diagnostics::SourceSpan;
 
-use super::bounds::{
-	AssumptionEnvIdx, BindingRef, BoundClauses, BoundId, Clause, Readiness,
-	SelfSubstitution, known_distinct,
+use super::clauses::{
+	AssumptionEnvIdx, BindingRef, Clause, PublishedClauses, Readiness,
+	SelfSubstitution, SourceClauseId, known_distinct,
 };
 use super::decls::{
 	AssocTypeIdx, ConstIdx, MemberKind, TraitIdx, TraitImplIdx,
@@ -26,13 +26,14 @@ use super::eval::{
 	Allocation, ConstValue, ConstValueState, Instance, ResolvedConstant,
 	StaticInstance,
 };
+use super::finiteness::{FiniteType, Finiteness};
 use super::impls::ImplTarget;
 use super::layout::Layouts;
 use super::literals::UntypedValue;
 use super::members::{TraitImplLookup, TraitMemberSelection};
 use super::signatures::Semantics;
 use super::types::{
-	GenericEnvArena, GenericEnvIdx, ImplArgs, ImplKind, Substitution, Type,
+	GenericFrameArena, GenericFrameIdx, ImplArgs, ImplKind, Substitution, Type,
 	TypeIndex, TypeInterner, TypeList,
 };
 
@@ -83,13 +84,22 @@ impl Subjects {
 	fn stated(
 		self,
 		types: &mut TypeInterner,
-		(envs, env, args): (&GenericEnvArena, GenericEnvIdx, &[TypeIndex]),
+		(envs, frame, args): (
+			&GenericFrameArena,
+			GenericFrameIdx,
+			&[TypeIndex],
+		),
 		ty: TypeIndex,
 	) -> TypeIndex {
 		match self {
-			Subjects::All => {
-				types.substitute(ty, Substitution { envs, env, args })
-			}
+			Subjects::All => types.substitute(
+				ty,
+				Substitution {
+					frames: envs,
+					frame,
+					args,
+				},
+			),
 			Subjects::Rooted { root, subject } => {
 				rebase(types, ty, root, subject)
 			}
@@ -108,7 +118,7 @@ pub(super) enum UnsatisfiedClause {
 		subject: TypeIndex,
 		reduced: TypeIndex,
 		trait_index: TraitIdx,
-		source: BoundId,
+		source: SourceClauseId,
 	},
 	/// `subject`'s value of the trait constant `constant` is not representable
 	/// as `ty`, which the entry `source` requires: `value` is it, or `None`
@@ -261,7 +271,7 @@ pub(super) struct ProjectionCycle {
 	pub(super) owner: Option<Definition>,
 	/// For a loop an impl's requirements own: the bound being proved when it
 	/// closed, where the impl's check reports it.
-	pub(super) bound: Option<BoundId>,
+	pub(super) bound: Option<SourceClauseId>,
 }
 
 /// A definition the solver judges once, in its own scope, and which owns the
@@ -345,6 +355,10 @@ pub(super) enum Verdict {
 	/// The definition requires itself through definitions only, and owns the
 	/// loop. Its check reports it.
 	Cyclic(Box<ProjectionCycle>),
+	/// A member's value normalizes but stores itself directly, through a
+	/// projection the member picks. The member owns this; finiteness
+	/// reported it where the cycle closed (`finiteness.rs`).
+	Infinite,
 }
 
 /// What the facts in scope establish for a trait requirement, without impl
@@ -405,7 +419,7 @@ pub(super) enum SolverFrame {
 	/// judgement's own, as for a member.
 	Requirements {
 		impl_kind: ImplKind,
-		bound: Option<BoundId>,
+		bound: Option<SourceClauseId>,
 		outer_budget: usize,
 	},
 	/// A constant being checked or evaluated (`Semantics::const_value`),
@@ -461,11 +475,60 @@ pub(super) struct SolverState {
 	pub(super) recursion_budget: usize,
 	/// Roll back an assumed equality chain that made no finite progress.
 	pub(super) blocked_at: Option<usize>,
-	/// The outermost frame the innermost request's answer read so far (a
-	/// cycle, a re-entered judgement or a rollback), `usize::MAX` when none.
-	/// An answer that read no frame below its own request is a function of its
-	/// `Normalization` alone.
-	pub(super) lowest_frame_read: usize,
+	/// What the innermost request's answer depends on so far.
+	pub(super) dependence: Dependence,
+}
+
+impl SolverState {
+	/// The answer in flight read the frame at `at`, open now.
+	pub(super) fn read_frame(&mut self, at: usize) {
+		self.dependence = self.dependence.join(Dependence {
+			lowest_frame: Some(at),
+			unanswered: false,
+		});
+	}
+}
+
+/// What an answer depends on besides its `Normalization`.
+#[derive(Clone, Copy)]
+pub(super) struct Dependence {
+	/// The outermost open frame it read: a cycle, a re-entered judgement or a
+	/// rollback. It holds only while that frame is open.
+	lowest_frame: Option<usize>,
+	/// It is built on a step that left no answer: a normalization not stored,
+	/// or a judgement whose verdict was dropped. Asked again, that step runs
+	/// again and may meet a frame open then.
+	unanswered: bool,
+}
+
+impl Dependence {
+	/// A function of its request alone.
+	const NONE: Self = Self {
+		lowest_frame: None,
+		unanswered: false,
+	};
+
+	fn join(self, other: Self) -> Self {
+		Self {
+			lowest_frame: match (self.lowest_frame, other.lowest_frame) {
+				(Some(a), Some(b)) => Some(a.min(b)),
+				(a, b) => a.or(b),
+			},
+			unanswered: self.unanswered || other.unanswered,
+		}
+	}
+
+	/// Whether the answer of a request opened at `frame` reads no frame
+	/// below its own, so it holds once that request is done.
+	fn holds_after(self, frame: usize) -> bool {
+		self.lowest_frame.is_none_or(|lowest| lowest >= frame)
+	}
+
+	/// Whether it also repeats no unanswered step, so asking again could
+	/// meet no frame open then: it may be read at any depth.
+	fn is_final_after(self, frame: usize) -> bool {
+		!self.unanswered && self.holds_after(frame)
+	}
 }
 
 /// The engine that normalizes types and selects impls, with everything it
@@ -476,18 +539,18 @@ pub(super) struct Solver {
 	/// configuration, not state; only tests change it.
 	pub(super) recursion_limit: usize,
 	pub(super) state: SolverState,
-	/// Only `Ok` answers are stored. `Pending` means a fact is not final yet,
+	/// Each request's final answer. `Pending` means a fact is not final yet,
 	/// and `Poisoned` is not a permanent verdict (a budget overflow can be
-	/// retried), so neither is remembered. Every
-	/// stored answer was final when computed, so no "facts are final" switch is
-	/// needed.
-	pub(super) normalized: FxHashMap<Normalization, TypeIndex>,
+	/// retried), so neither is remembered. Every stored answer was final when
+	/// computed, so no "facts are final" switch is needed.
+	pub(super) normalized: FxHashMap<Normalization, Normalized>,
 	/// The verdict on each definition asked about; absent is `Unchecked`. A
 	/// definition is `InProgress` exactly while its judgement's frame
 	/// (`SolverFrame::Judgement`, `SolverFrame::Requirements`) is on the stack.
 	pub(super) verdicts: FxHashMap<Definition, Verdict>,
 	/// Every aggregate layout asked for, by its concrete type.
 	pub(super) layouts: Layouts,
+	pub(super) finiteness: Finiteness,
 	/// Each constant's value query state, by `ConstIdx` (`eval.rs`); for one
 	/// with parameters, its check's only.
 	pub(super) const_values: Vec<ConstValueState>,
@@ -502,7 +565,7 @@ pub(super) struct Solver {
 }
 
 impl Solver {
-	pub(super) fn new(constant_count: usize) -> Self {
+	pub(super) fn new(constant_count: usize, struct_count: usize) -> Self {
 		let recursion_limit = 128;
 		Self {
 			recursion_limit,
@@ -510,16 +573,28 @@ impl Solver {
 				frames: Vec::new(),
 				recursion_budget: recursion_limit,
 				blocked_at: None,
-				lowest_frame_read: usize::MAX,
+				dependence: Dependence::NONE,
 			},
 			normalized: FxHashMap::default(),
 			verdicts: FxHashMap::default(),
 			layouts: Layouts::default(),
+			finiteness: Finiteness::new(struct_count),
 			const_values: vec![ConstValueState::Unchecked; constant_count],
 			instance_values: FxHashMap::default(),
 			allocations: Vec::new(),
 			static_values: FxHashMap::default(),
 		}
+	}
+
+	/// Forgets `definition`'s judgement, cut short without a verdict; it is
+	/// judged again when asked, so the answer in flight is built on a step
+	/// that left no answer.
+	fn drop_verdict(&mut self, definition: Definition) {
+		self.verdicts.remove(&definition);
+		self.state.dependence = self.state.dependence.join(Dependence {
+			lowest_frame: None,
+			unanswered: true,
+		});
 	}
 
 	pub(super) fn verdict(&self, definition: Definition) -> &Verdict {
@@ -559,7 +634,10 @@ impl Semantics {
 				return self.reenter_judgement(member, requested_by);
 			}
 			Verdict::Resolved => return self.impl_member_value(member),
-			Verdict::Poisoned | Verdict::Overflowed | Verdict::Cyclic(_) => {
+			Verdict::Poisoned
+			| Verdict::Overflowed
+			| Verdict::Cyclic(_)
+			| Verdict::Infinite => {
 				return Err(SolverError::Poisoned);
 			}
 		}
@@ -575,10 +653,13 @@ impl Semantics {
 			}
 			Err(error) => return Err(error),
 		};
-		let scope = self.trait_impls[usize::from(member.impl_index)]
+		let impl_frame = self.trait_impls[usize::from(member.impl_index)]
 			.as_ref()
 			.expect("a member with a value has a resolved impl header")
-			.type_params;
+			.generic_params;
+		// Before the judgement starts: normalizing the impl's env is not part
+		// of judging this value.
+		let normalized_env = self.normalize_env(strings, impl_frame);
 		self.solver
 			.verdicts
 			.insert(Definition::Member(member), Verdict::InProgress);
@@ -593,7 +674,7 @@ impl Semantics {
 		});
 		let result = self.normalize(
 			strings,
-			self.assumption_envs.of_frame(scope),
+			normalized_env,
 			value,
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
@@ -612,7 +693,7 @@ impl Semantics {
 			.blocked_at
 			.is_some_and(|blocked| blocked < index)
 		{
-			self.solver.verdicts.remove(&Definition::Member(member));
+			self.solver.drop_verdict(Definition::Member(member));
 			return Ok(value);
 		}
 		let (verdict, answer) = match result {
@@ -645,7 +726,31 @@ impl Semantics {
 		self.solver
 			.verdicts
 			.insert(Definition::Member(member), verdict);
-		answer
+		answer?;
+		// Judged with the verdict already `Resolved`: an instance walk that
+		// normalizes through this member again reads its value, and finiteness
+		// sees the repeat on its own stack.
+		match self.type_is_finite(strings, normalized_env, value) {
+			Ok(true) => Ok(value),
+			Ok(false) => {
+				self.solver
+					.verdicts
+					.insert(Definition::Member(member), Verdict::Infinite);
+				Err(SolverError::Poisoned)
+			}
+			// Reached through normalization from an owner in progress, which
+			// owns that loop; the value itself is meaningful.
+			Err(SolverError::Poisoned) => Ok(value),
+			Err(SolverError::Pending) => {
+				self.solver
+					.verdicts
+					.insert(Definition::Member(member), Verdict::Unchecked);
+				Err(SolverError::Pending)
+			}
+			Err(SolverError::Overflow | SolverError::Cycle(_)) => {
+				unreachable!("finiteness answers only `Pending` or `Poisoned`")
+			}
+		}
 	}
 
 	/// `member` was reached again while its judgement is on the stack. An
@@ -668,8 +773,7 @@ impl Semantics {
 				matches!(frame, SolverFrame::Judgement { member: judged, .. } if *judged == member)
 			})
 			.expect("an in-progress judgement is on the stack");
-		self.solver.state.lowest_frame_read =
-			self.solver.state.lowest_frame_read.min(start);
+		self.solver.state.read_frame(start);
 		let loop_frames = &self.solver.state.frames[start..];
 		if loop_frames
 			.iter()
@@ -774,6 +878,20 @@ impl Normalization {
 			facts,
 		}
 	}
+}
+
+/// A request's final answer (`Solver::normalized`). `TypeIndex` has no
+/// niche yet, so this is twice its size; once it has one, `Cyclic` takes it.
+#[derive(Clone, Copy)]
+pub(super) enum Normalized {
+	/// Its normal form, read only by a request with nothing in flight: a
+	/// nested one could skip a cycle through a frame open now.
+	Type(TypeIndex),
+	/// It requires itself through projections alone: a loop no definition
+	/// owns, so no verdict holds it. It follows from the request alone, so it
+	/// is read at any depth, and answers `Poisoned`: the request that found it
+	/// reported it.
+	Cyclic,
 }
 
 /// How far into a type a normalization reduces.
@@ -888,12 +1006,13 @@ impl Semantics {
 					.trait_decl
 					.expect("a selected impl names its trait")
 					.inner;
-				let env = self.traits[usize::from(trait_index)].env;
+				let frame =
+					self.traits[usize::from(trait_index)].generic_params;
 				Ok(self.types.substitute(
 					default,
 					Substitution {
-						envs: &self.generic_envs,
-						env,
+						frames: &self.generic_frames,
+						frame,
 						args: &[target],
 					},
 				))
@@ -930,7 +1049,7 @@ impl Solver {
 		}) else {
 			return Ok(false);
 		};
-		self.state.lowest_frame_read = self.state.lowest_frame_read.min(start);
+		self.state.read_frame(start);
 		let loop_frames = &self.state.frames[start..];
 		if loop_frames
 			.iter()
@@ -981,7 +1100,7 @@ impl Solver {
 				matches!(frame, SolverFrame::Requirements { impl_kind: judged, .. } if *judged == impl_kind)
 			})
 			.expect("an in-progress judgement is on the stack");
-		self.state.lowest_frame_read = self.state.lowest_frame_read.min(start);
+		self.state.read_frame(start);
 		let loop_frames = &self.state.frames[start..];
 		if loop_frames
 			.iter()
@@ -1002,7 +1121,11 @@ impl Solver {
 
 	/// Records on a requirements judgement's frame the bound being proved,
 	/// where a loop that closes in it is reported.
-	fn record_proving(&mut self, judgement: Option<usize>, bound: BoundId) {
+	fn record_proving(
+		&mut self,
+		judgement: Option<usize>,
+		bound: SourceClauseId,
+	) {
 		let Some(judgement) = judgement else {
 			return;
 		};
@@ -1018,18 +1141,11 @@ impl Solver {
 impl Semantics {
 	/// The cache layer around `normalize_uncached`. An answer that read a frame
 	/// below its own request (cycle and rollback state, an open judgement)
-	/// holds only while that frame is open, so it is not stored. Only a request
-	/// with no frame open reads the cache: a nested one could reuse an answer
-	/// whose derivation passed through a frame open now, skipping the cycle it
-	/// would have found.
-	///
-	/// TODO: let nested requests read the cache too, removing the repeated
-	/// work inside one deep normalization. Each entry would also store what its
-	/// derivation pushed (projection normalizations and judged members), and a
-	/// nested read would use it only when none of those is on the stack now,
-	/// as rustc's search graph does. Worth it once body checking makes
-	/// normalization measurably hot; every frame-pushing path must then record
-	/// itself, or reads silently become order-dependent.
+	/// holds only while that frame is open, so it is not stored. Neither is one
+	/// whose derivation left a step unanswered (`Dependence`). Every other
+	/// step it took is answered for good, so asking it again repeats none of
+	/// them and can meet no frame open now: a stored answer is read at any
+	/// depth.
 	pub(super) fn normalize(
 		&mut self,
 		strings: &StringInterner,
@@ -1051,15 +1167,20 @@ impl Semantics {
 			facts,
 		);
 		let frame = self.solver.state.frames.len();
-		if frame == 0
-			&& let Some(&normalized) =
-				self.solver.normalized.get(&normalization)
-		{
-			return Ok(normalized);
+		match self.solver.normalized.get(&normalization).copied() {
+			// Unless a tautology is unwinding past it, which needs the frames
+			// it reads marked (`normalize_uncached`).
+			Some(Normalized::Cyclic)
+				if self.solver.state.blocked_at.is_none() =>
+			{
+				return Err(SolverError::Poisoned);
+			}
+			Some(Normalized::Type(normalized)) => return Ok(normalized),
+			_ => {}
 		}
-		let outer_read = std::mem::replace(
-			&mut self.solver.state.lowest_frame_read,
-			usize::MAX,
+		let outer = std::mem::replace(
+			&mut self.solver.state.dependence,
+			Dependence::NONE,
 		);
 		let result = self.normalize_uncached(
 			strings,
@@ -1068,16 +1189,32 @@ impl Semantics {
 			depth,
 			facts,
 		);
-		let lowest_read = self.solver.state.lowest_frame_read;
-		self.solver.state.lowest_frame_read = outer_read.min(lowest_read);
+		let dependence = self.solver.state.dependence;
 		// A request that started with nothing in flight leaves nothing behind.
 		debug_assert!(frame != 0 || self.solver.state.frames.is_empty());
 		debug_assert!(frame != 0 || self.solver.state.blocked_at.is_none());
-		if lowest_read >= frame
-			&& let Ok(normalized) = result
-		{
-			self.solver.normalized.insert(normalization, normalized);
+		// A loop is read only to fail silently, so it is stored even when its
+		// own unanswered steps would find it again.
+		let answer = match result {
+			Ok(normalized) if dependence.is_final_after(frame) => {
+				Some(Normalized::Type(normalized))
+			}
+			Err(SolverError::Cycle(ref cycle))
+				if cycle.owner.is_none() && dependence.holds_after(frame) =>
+			{
+				Some(Normalized::Cyclic)
+			}
+			_ => None,
+		};
+		if let Some(answer) = answer {
+			self.solver.normalized.insert(normalization, answer);
 		}
+		// The frames it read are read by the request around it too; a step it
+		// leaves unanswered is that request's unanswered step.
+		self.solver.state.dependence = outer.join(Dependence {
+			lowest_frame: dependence.lowest_frame,
+			unanswered: answer.is_none(),
+		});
 		result
 	}
 
@@ -1091,8 +1228,7 @@ impl Semantics {
 	) -> Result<TypeIndex, SolverError> {
 		if let Some(blocked) = self.solver.state.blocked_at {
 			// Unwinding to `blocked`: the answer is only a way out.
-			self.solver.state.lowest_frame_read =
-				self.solver.state.lowest_frame_read.min(blocked);
+			self.solver.state.read_frame(blocked);
 			return Ok(ty);
 		}
 		if self.solver.state.recursion_budget == 0 {
@@ -1178,7 +1314,7 @@ impl Semantics {
 				return Ok(self.types.intern_const_ref(constant, &args));
 			}
 			// An address, never a count: a length of its type is reported
-			// where it is written (`CheckConstantType`).
+			// where it is written (`TypeObligation::ConstantType`).
 			ResolvedConstant::DataEnd(_) => None,
 		};
 		match value {
@@ -1453,15 +1589,9 @@ impl Semantics {
 			return Err(SolverError::Poisoned);
 		};
 		let (impl_index, args) = match found {
-			TraitImplLookup::Concrete { impl_index } => (
-				impl_index,
-				self.trait_impl_args(
-					strings,
-					assumption_context,
-					impl_index,
-					base,
-				),
-			),
+			TraitImplLookup::Concrete { impl_index, args } => {
+				(impl_index, args)
+			}
 			// An abstract impl, or a builtin trait with no rule for this
 			// associated member, supplies no value to reduce further.
 			TraitImplLookup::Abstract | TraitImplLookup::Builtin => {
@@ -1476,16 +1606,16 @@ impl Semantics {
 		let instantiated = if args.is_empty() {
 			value
 		} else {
-			let env = self.trait_impls[usize::from(impl_index)]
+			let frame = self.trait_impls[usize::from(impl_index)]
 				.as_ref()
 				.expect("a generic selected impl has a resolved header")
-				.type_params;
-			debug_assert_ne!(env, GenericEnvIdx::ROOT);
+				.generic_params;
+			debug_assert_ne!(frame, GenericFrameIdx::ROOT);
 			self.types.substitute(
 				value,
 				Substitution {
-					envs: &self.generic_envs,
-					env,
+					frames: &self.generic_frames,
+					frame,
 					args: &args,
 				},
 			)
@@ -1701,8 +1831,7 @@ impl Semantics {
 		// can target (a tuple, a pointer) is no exception: it has no impl.
 		let mut assumed = Assumption::Unproven;
 		if self.types.is_param_or_projection(receiver) {
-			assumed = self.check_assumed_trait(
-				strings,
+			assumed = self.states_trait(
 				assumption_context,
 				receiver,
 				required_trait,
@@ -1746,13 +1875,12 @@ impl Semantics {
 					impl_index,
 					normalized,
 				)?
-				.then_some(TraitImplLookup::Concrete { impl_index }));
+				.map(|args| TraitImplLookup::Concrete { impl_index, args }));
 		}
 		if normalized != receiver
 			&& self.types.is_param_or_projection(normalized)
 		{
-			assumed = assumed.max(self.check_assumed_trait(
-				strings,
+			assumed = assumed.max(self.states_trait(
 				assumption_context,
 				normalized,
 				required_trait,
@@ -1809,14 +1937,8 @@ impl Semantics {
 		ty: TypeIndex,
 	) -> Result<Option<Vec<TypeIndex>>, SolverError> {
 		let mut elements = Vec::new();
-		if !self.push_stack_elements(
-			strings,
-			assumption_context,
-			ty,
-			&mut elements,
-			&mut Vec::new(),
-			0,
-		)? {
+		let ty = self.finite(strings, assumption_context, ty)?;
+		if !self.push_stack_elements(strings, ty, &mut elements)? {
 			return Ok(None);
 		}
 		if elements.contains(&TypeIndex::NEVER) {
@@ -1836,146 +1958,74 @@ impl Semantics {
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 	) -> Result<Option<TypeIndex>, SolverError> {
-		self.explain_non_stack_value_inner(
-			strings,
-			assumption_context,
-			ty,
-			&mut Vec::new(),
-		)
+		let ty = self.finite(strings, assumption_context, ty)?;
+		self.explain_parts(strings, ty)
 	}
 
-	fn explain_non_stack_value_inner(
+	/// A part of a type whose representation failed: one with its own
+	/// representation is fine, and only the rest is looked through.
+	fn explain_part(
 		&mut self,
 		strings: &StringInterner,
-		assumption_context: AssumptionEnvIdx,
-		ty: TypeIndex,
-		visiting: &mut Vec<TypeIndex>,
+		ty: FiniteType,
 	) -> Result<Option<TypeIndex>, SolverError> {
-		// The root query already failed. For children, reuse successful
-		// representations before descending into their structure.
-		if !visiting.is_empty() {
-			match self.stack_value_repr(strings, assumption_context, ty) {
-				Ok(_) => return Ok(None),
-				Err(SolverError::Poisoned) => {}
-				Err(error) => return Err(error),
+		match self.stack_value_repr(strings, ty.env(), ty.ty()) {
+			Ok(_) => Ok(None),
+			Err(SolverError::Poisoned) => self.explain_parts(strings, ty),
+			Err(error) => Err(error),
+		}
+	}
+
+	fn explain_parts(
+		&mut self,
+		strings: &StringInterner,
+		ty: FiniteType,
+	) -> Result<Option<TypeIndex>, SolverError> {
+		let ty =
+			self.normalize_finite(strings, ty, NormalizationDepth::Deep)?;
+		let env = ty.env();
+		match *self.types.resolve(ty.ty()) {
+			Type::Enum { .. } | Type::Tuple { .. } | Type::Struct { .. } => {
+				for part in self.parts(ty) {
+					if let Some(part) = self.explain_part(strings, part)? {
+						return Ok(Some(part));
+					}
+				}
 			}
-		}
-		if visiting.len() > self.solver.state.recursion_budget {
-			return Err(SolverError::Overflow);
-		}
-		if visiting.contains(&ty) {
-			return Err(SolverError::Poisoned);
-		}
-		visiting.push(ty);
-		let result = (|| {
-			let ty = self.normalize(
-				strings,
-				assumption_context,
-				ty,
-				NormalizationDepth::Deep,
-				RewriteFlags::ALL,
-			)?;
-			match *self.types.resolve(ty) {
-				Type::Struct {
-					struct_index,
-					type_args,
-				} => {
-					let signature = &self.structs[usize::from(struct_index)];
-					let (env, fields) =
-						(signature.type_params, signature.field_types);
-					let args: Box<[TypeIndex]> =
-						self.types.list(type_args).into();
-					for at in 0..fields.len() {
-						let field = self.types.list(fields)[at];
-						let field = self.types.substitute(
-							field,
-							Substitution {
-								envs: &self.generic_envs,
-								env,
-								args: &args,
-							},
-						);
-						if let Some(part) = self.explain_non_stack_value_inner(
-							strings,
-							assumption_context,
-							field,
-							visiting,
-						)? {
-							return Ok(Some(part));
-						}
+			Type::Pointer { to, memory, .. } => {
+				let size = self.address_size(strings, env, memory)?;
+				let metadata =
+					self.pointer_metadata_value(strings, env, to, memory)?;
+				for part in [size, metadata] {
+					let part = self.finite(strings, env, part)?;
+					if let Some(part) = self.explain_part(strings, part)? {
+						return Ok(Some(part));
 					}
 				}
-				Type::Tuple { elements } => {
-					for at in 0..elements.len() {
-						let element = self.types.list(elements)[at];
-						if let Some(part) = self.explain_non_stack_value_inner(
-							strings,
-							assumption_context,
-							element,
-							visiting,
-						)? {
-							return Ok(Some(part));
-						}
-					}
-				}
-				Type::Pointer { to, memory, .. } => {
-					let size =
-						self.address_size(strings, assumption_context, memory)?;
-					let metadata = self.pointer_metadata_value(
-						strings,
-						assumption_context,
-						to,
-						memory,
-					)?;
-					for part in [size, metadata] {
-						if let Some(part) = self.explain_non_stack_value_inner(
-							strings,
-							assumption_context,
-							part,
-							visiting,
-						)? {
-							return Ok(Some(part));
-						}
-					}
-				}
-				Type::Enum { enum_index } => {
-					let repr = self.enums[usize::from(enum_index)].repr;
-					return self.explain_non_stack_value_inner(
-						strings,
-						assumption_context,
-						repr,
-						visiting,
-					);
-				}
-				Type::Slice { .. } | Type::Array { .. } => return Ok(Some(ty)),
-				Type::TypeParam { .. } | Type::TypeProjection { .. } => {
-					let stack_value = self
-						.decls
-						.intrinsics
-						.stack_value
-						.expect("core declares `StackValue`");
-					if !self.assumes(
-						strings,
-						assumption_context,
-						ty,
-						stack_value,
-					)? {
-						return Ok(Some(ty));
-					}
-				}
-				Type::Error
-				| Type::Infer
-				| Type::ConstInt
-				| Type::ConstFloat
-				| Type::ConstChar
-				| Type::Value { .. }
-				| Type::ConstRef { .. } => return Err(SolverError::Poisoned),
-				_ => {}
 			}
-			Ok(None)
-		})();
-		visiting.pop();
-		result
+			Type::Slice { .. } | Type::Array { .. } => {
+				return Ok(Some(ty.ty()));
+			}
+			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
+				let stack_value = self
+					.decls
+					.intrinsics
+					.stack_value
+					.expect("core declares `StackValue`");
+				if !self.assumes(env, ty.ty(), stack_value)? {
+					return Ok(Some(ty.ty()));
+				}
+			}
+			Type::Error
+			| Type::Infer
+			| Type::ConstInt
+			| Type::ConstFloat
+			| Type::ConstChar
+			| Type::Value { .. }
+			| Type::ConstRef { .. } => return Err(SolverError::Poisoned),
+			_ => {}
+		}
+		Ok(None)
 	}
 
 	/// Proves and computes `<ty as StackValue>::Repr`. An abstract receiver
@@ -2004,12 +2054,7 @@ impl Semantics {
 		if self.types.is_param_or_projection(ty) {
 			// A symbolic Repr is a finished answer only under evidence of the
 			// bound. Unbounded parameters must not seed the positive cache.
-			return if self.assumes(
-				strings,
-				assumption_context,
-				ty,
-				trait_index,
-			)? {
+			return if self.assumes(assumption_context, ty, trait_index)? {
 				Ok(request.ty)
 			} else {
 				Err(SolverError::Poisoned)
@@ -2105,25 +2150,15 @@ impl Semantics {
 	fn push_stack_elements(
 		&mut self,
 		strings: &StringInterner,
-		assumption_context: AssumptionEnvIdx,
-		ty: TypeIndex,
+		ty: FiniteType,
 		out: &mut Vec<TypeIndex>,
-		visiting: &mut Vec<TypeIndex>,
-		depth: usize,
 	) -> Result<bool, SolverError> {
-		if depth > self.solver.state.recursion_budget {
-			return Err(SolverError::Overflow);
-		}
 		// Deep, as a declaration's other checks read it: a loop through an
 		// equality stays the projection it is, not unfolded a step at a time.
-		let ty = self.normalize(
-			strings,
-			assumption_context,
-			ty,
-			NormalizationDepth::Deep,
-			RewriteFlags::ALL,
-		)?;
-		match *self.types.resolve(ty) {
+		let ty =
+			self.normalize_finite(strings, ty, NormalizationDepth::Deep)?;
+		let env = ty.env();
+		match *self.types.resolve(ty.ty()) {
 			// A constant is no value's type; lowering puts one only where a
 			// constant is expected.
 			Type::Error
@@ -2156,110 +2191,35 @@ impl Semantics {
 				Ok(true)
 			}
 			Type::F32 | Type::F64 | Type::Funcref => {
-				out.push(ty);
+				out.push(ty.ty());
 				Ok(true)
 			}
 			Type::TypedFuncref { .. } => {
 				out.push(TypeIndex::FUNCREF);
 				Ok(true)
 			}
-			Type::Enum { enum_index } => {
-				let repr = self.enums[usize::from(enum_index)].repr;
-				self.push_stack_elements(
-					strings,
-					assumption_context,
-					repr,
-					out,
-					visiting,
-					depth + 1,
-				)
-			}
 			// An address, as wide as its memory's `Size`, then the pointee's
 			// counts, each as wide again (`Pointer::Metadata`).
 			Type::Pointer { to, memory, .. } => {
-				let size =
-					self.address_size(strings, assumption_context, memory)?;
-				let metadata = self.pointer_metadata_value(
-					strings,
-					assumption_context,
-					to,
-					memory,
-				)?;
-				if !self.push_stack_elements(
-					strings,
-					assumption_context,
-					size,
-					out,
-					visiting,
-					depth + 1,
-				)? {
-					return Ok(false);
-				}
-				self.push_stack_elements(
-					strings,
-					assumption_context,
-					metadata,
-					out,
-					visiting,
-					depth + 1,
-				)
-			}
-			// A slice or an array is never a value: only a pointer holds one.
-			Type::Slice { .. } | Type::Array { .. } => Ok(false),
-			Type::Tuple { elements } => {
-				// Read one element at a time: normalizing may store more lists.
-				for at in 0..elements.len() {
-					let element = self.types.list(elements)[at];
-					if !self.push_stack_elements(
-						strings,
-						assumption_context,
-						element,
-						out,
-						visiting,
-						depth + 1,
-					)? {
+				let size = self.address_size(strings, env, memory)?;
+				let metadata =
+					self.pointer_metadata_value(strings, env, to, memory)?;
+				for part in [size, metadata] {
+					let part = self.finite(strings, env, part)?;
+					if !self.push_stack_elements(strings, part, out)? {
 						return Ok(false);
 					}
 				}
 				Ok(true)
 			}
-			Type::Struct {
-				struct_index,
-				type_args,
-			} => {
-				// A struct containing itself is reported where it is declared.
-				if visiting.contains(&ty) {
-					return Err(SolverError::Poisoned);
-				}
-				visiting.push(ty);
-				let signature = &self.structs[usize::from(struct_index)];
-				let (env, fields) =
-					(signature.type_params, signature.field_types);
-				let args: Box<[TypeIndex]> = self.types.list(type_args).into();
-				// Read one field at a time: substituting may store more lists.
-				for at in 0..fields.len() {
-					let field = self.types.list(fields)[at];
-					let field = self.types.substitute(
-						field,
-						Substitution {
-							envs: &self.generic_envs,
-							env,
-							args: &args,
-						},
-					);
-					if !self.push_stack_elements(
-						strings,
-						assumption_context,
-						field,
-						out,
-						visiting,
-						depth + 1,
-					)? {
-						visiting.pop();
+			// A slice or an array is never a value: only a pointer holds one.
+			Type::Slice { .. } | Type::Array { .. } => Ok(false),
+			Type::Enum { .. } | Type::Tuple { .. } | Type::Struct { .. } => {
+				for part in self.parts(ty) {
+					if !self.push_stack_elements(strings, part, out)? {
 						return Ok(false);
 					}
 				}
-				visiting.pop();
 				Ok(true)
 			}
 			Type::TypeParam { .. } | Type::TypeProjection { .. } => {
@@ -2268,8 +2228,8 @@ impl Semantics {
 					.intrinsics
 					.stack_value
 					.expect("core declares `StackValue`");
-				if self.assumes(strings, assumption_context, ty, stack_value)? {
-					out.push(ty);
+				if self.assumes(env, ty.ty(), stack_value)? {
+					out.push(ty.ty());
 					Ok(true)
 				} else {
 					Ok(false)
@@ -2437,17 +2397,9 @@ impl Semantics {
 				else {
 					return Ok(Some(TypeIndex::UNIT));
 				};
-				if self.assumes(
-					strings,
-					assumption_context,
-					pointee,
-					stack_value,
-				)? || self.assumes(
-					strings,
-					assumption_context,
-					pointee,
-					array,
-				)? {
+				if self.assumes(assumption_context, pointee, stack_value)?
+					|| self.assumes(assumption_context, pointee, array)?
+				{
 					Ok(Some(TypeIndex::UNIT))
 				} else {
 					Ok(None)
@@ -2457,56 +2409,38 @@ impl Semantics {
 		}
 	}
 
-	/// Whether the facts in scope prove `ty: required` (`check_assumed_trait`);
+	/// Whether the facts in scope prove `ty: required` (`states_trait`);
 	/// `Pending` while a table they come from is unfinished.
 	fn assumes(
-		&mut self,
-		strings: &StringInterner,
+		&self,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		required: TraitIdx,
 	) -> Result<bool, SolverError> {
-		match self.check_assumed_trait(
-			strings,
-			assumption_context,
-			ty,
-			required,
-		)? {
+		match self.states_trait(assumption_context, ty, required)? {
 			Assumption::Holds => Ok(true),
 			Assumption::Unproven => Ok(false),
 			Assumption::Pending => Err(SolverError::Pending),
 		}
 	}
 
-	/// Whether the facts in scope prove `ty: required`, from three sources:
+	/// Whether the facts in scope state `ty: required` of `ty` as written:
 	///
 	/// 1. a declaration on `ty`'s own path states it (`type Item: Marker`);
-	/// 2. a clause in scope states it of `ty` as written;
-	/// 3. a clause states it of another subject that means what `ty` means,
-	///    by assumed equalities: `T::Item: Marker` with `T::Item = U` proves
-	///    `U: Marker`.
+	/// 2. a clause in scope states it of `ty` as written.
 	///
-	/// The first holds wherever `ty` is used; the other two are the scope's
-	/// own, and only an abstract `ty` with an abstract meaning takes them. A
-	/// concrete one has its traits from impls alone, so a clause whose subject
-	/// means `i32`, or `<P as Container>::Item`, proves nothing about it, and
-	/// the answer for it never depends on `assumption_context`.
-	///
-	/// Declaration bounds are not lent through an equality: `Item = U` with
-	/// `type Item: Marker` does not make `U: Marker`, which must be written.
-	///
-	/// Comparison reduces assumed equalities only, so it cannot depend on impl
-	/// dispatch. It reads finished declaration bounds and never demands one:
-	/// an unfinished table is `Assumption::Pending`, never an error.
-	pub(super) fn check_assumed_trait(
-		&mut self,
-		strings: &StringInterner,
+	/// The first holds wherever `ty` is used; the second is the scope's own,
+	/// and only an abstract `ty` takes it. Nothing is normalized, so a member
+	/// is selected by this alone (`notes/member-selection-and-equalities.md`).
+	/// It reads finished declaration bounds and never demands one: an
+	/// unfinished table is `Assumption::Pending`, never an error.
+	pub(super) fn states_trait(
+		&self,
 		assumption_context: AssumptionEnvIdx,
 		ty: TypeIndex,
 		required: TraitIdx,
 	) -> Result<Assumption, SolverError> {
 		let tables = self.clause_tables();
-		// 1. Declared on `ty`'s own path.
 		let mut declared = tables.declared_traits(
 			&self.types,
 			assumption_context,
@@ -2520,51 +2454,11 @@ impl Semantics {
 		if self.types.is_abstract(ty) {
 			readiness =
 				readiness.and(tables.assumptions_readiness(assumption_context));
-			// 2. Stated of `ty` itself.
 			if tables
 				.assumed_subjects(assumption_context, required)
 				.any(|subject| subject == ty)
 			{
 				return Ok(Assumption::Holds);
-			}
-			// 3. Stated of another subject with the same, abstract, meaning.
-			let subjects: Vec<TypeIndex> = tables
-				.assumed_subjects(assumption_context, required)
-				.collect();
-			if !subjects.is_empty() {
-				let meaning = match self.normalize(
-					strings,
-					assumption_context,
-					ty,
-					NormalizationDepth::Deep,
-					RewriteFlags::EQUALITIES,
-				) {
-					Ok(meaning) => meaning,
-					Err(SolverError::Pending) => {
-						return Ok(Assumption::Pending);
-					}
-					Err(error) => return Err(error),
-				};
-				if self.types.is_abstract(meaning) {
-					for subject in subjects {
-						match self.normalize(
-							strings,
-							assumption_context,
-							subject,
-							NormalizationDepth::Deep,
-							RewriteFlags::EQUALITIES,
-						) {
-							Ok(candidate) if candidate == meaning => {
-								return Ok(Assumption::Holds);
-							}
-							Ok(_) => {}
-							Err(SolverError::Pending) => {
-								readiness = readiness.and(Readiness::Pending)
-							}
-							Err(error) => return Err(error),
-						}
-					}
-				}
 			}
 		}
 		match readiness {
@@ -2574,7 +2468,7 @@ impl Semantics {
 		}
 	}
 
-	/// Whether an impl header's complete target matches `receiver` with
+	/// The impl's arguments, when its complete target matches `receiver` with
 	/// arguments that meet the impl's own parameter bounds; no declaration
 	/// frame is changed. Reads the finished header: one still missing is
 	/// `Pending`.
@@ -2584,7 +2478,7 @@ impl Semantics {
 		assumption_context: AssumptionEnvIdx,
 		impl_index: TraitImplIdx,
 		receiver: TypeIndex,
-	) -> Result<bool, SolverError> {
+	) -> Result<Option<ImplArgs>, SolverError> {
 		let Some(header) = self.trait_impls[usize::from(impl_index)].as_ref()
 		else {
 			return Err(SolverError::Pending);
@@ -2593,56 +2487,27 @@ impl Semantics {
 			strings,
 			assumption_context,
 			ImplKind::Trait(impl_index),
-			header.type_params,
+			header.generic_params,
 			header.target.inner,
 			receiver,
 		)
 	}
 
-	/// The arguments of trait impl `impl_index` for `receiver`, which
-	/// `find_trait_impl_query` selected it for in `assumption_context`.
-	pub(super) fn trait_impl_args(
-		&mut self,
-		strings: &StringInterner,
-		assumption_context: AssumptionEnvIdx,
-		impl_index: TraitImplIdx,
-		receiver: TypeIndex,
-	) -> Box<[TypeIndex]> {
-		let Ok(receiver) = self.normalize(
-			strings,
-			assumption_context,
-			receiver,
-			NormalizationDepth::Deep,
-			RewriteFlags::ALL,
-		) else {
-			unreachable!("the selection normalized this receiver")
-		};
-		let header = self.trait_impls[usize::from(impl_index)]
-			.as_ref()
-			.expect("a selected impl has a header");
-		self.types
-			.match_impl_target(
-				header.target.inner,
-				receiver,
-				&self.generic_envs,
-				header.type_params,
-			)
-			.expect("the selected impl's target matches the receiver")
-	}
-
-	/// `assumption_context` is the caller's; `impl_env` is the candidate impl's own
-	/// parameter frame (for a synthetic impl, the frame it is generic over). The
-	/// impl's requirements are proved in the caller's assumptions, never the
+	/// The candidate impl's arguments for `receiver`, when its target matches
+	/// and its requirements hold for them. `assumption_context` is the
+	/// caller's; `impl_frame` is the candidate impl's own parameter frame (for
+	/// a synthetic impl, the frame it is generic over). The impl's
+	/// requirements are proved in the caller's assumptions, never the
 	/// candidate's.
 	pub(super) fn match_impl_target_and_bounds(
 		&mut self,
 		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
 		impl_kind: ImplKind,
-		impl_env: GenericEnvIdx,
+		impl_frame: GenericFrameIdx,
 		target: TypeIndex,
 		receiver: TypeIndex,
-	) -> Result<bool, SolverError> {
+	) -> Result<Option<ImplArgs>, SolverError> {
 		// Structural matching below compares `receiver`'s nested children
 		// against `target`'s pattern directly, with no normalization of its
 		// own (`TypeInterner::match_pattern` is `&self`, with no access to
@@ -2661,19 +2526,18 @@ impl Semantics {
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
 		)?;
-		// The arguments live only while the bounds are proved.
 		let mut args = ImplArgs::from_elem(
 			TypeIndex::INFER,
-			self.generic_envs.generic_count(impl_env),
+			self.generic_frames.generic_count(impl_frame),
 		);
 		if !self.types.match_impl_target_into(
 			target,
 			receiver,
-			&self.generic_envs,
-			impl_env,
+			&self.generic_frames,
+			impl_frame,
 			&mut args,
 		) {
-			return Ok(false);
+			return Ok(None);
 		}
 		// The impl's requirements are a definition, judged once before any
 		// selection relies on them. While they are judged, the impl's own
@@ -2681,22 +2545,23 @@ impl Semantics {
 		if *self.solver.verdict(Definition::Requirements(impl_kind))
 			== Verdict::InProgress
 		{
-			if assumption_context == self.assumption_envs.of_frame(impl_env)
-				&& *args == *self.generic_envs.identity_args(impl_env)
+			if assumption_context == self.normalize_env(strings, impl_frame)
+				&& *args == *self.generic_frames.identity_args(impl_frame)
 			{
 				self.solver.reenter_requirements(impl_kind)?;
-				return Ok(true);
+				return Ok(Some(args));
 			}
 		} else {
 			self.requirements_verdict(strings, impl_kind)?;
 		}
-		self.prove_requirements(
+		let holds = self.prove_requirements(
 			strings,
 			assumption_context,
-			impl_env,
+			impl_frame,
 			&args,
 			None,
-		)
+		)?;
+		Ok(holds.then_some(args))
 	}
 
 	/// `impl_kind`'s requirements, judged once: proved for its own parameters
@@ -2704,7 +2569,7 @@ impl Semantics {
 	/// the definitions alone and is memoized whoever asks first. A loop is a
 	/// selection of the impl's own instantiation while this judgement runs
 	/// (`reenter_requirements`); the verdict keeps a loop it owns, at the bound
-	/// it closed in, for the impl's check to report (`CheckImplRequirements`),
+	/// it closed in, for the impl's check to report (`TypeObligation::ImplRequirements`),
 	/// and every reader of a failed verdict fails silently.
 	///
 	/// Whether the requirements hold there is no part of the verdict: in its
@@ -2725,18 +2590,23 @@ impl Semantics {
 			Verdict::Poisoned | Verdict::Overflowed | Verdict::Cyclic(_) => {
 				return Err(SolverError::Poisoned);
 			}
+			Verdict::Infinite => {
+				unreachable!("only a member's value is judged finite")
+			}
 		}
-		let impl_env = match impl_kind {
+		let impl_frame = match impl_kind {
 			ImplKind::Trait(index) => self.trait_impls[usize::from(index)]
 				.as_ref()
-				.map(|header| header.type_params),
+				.map(|header| header.generic_params),
 			ImplKind::Inherent(index) => self.inherent_impls
 				[usize::from(index)]
 			.as_ref()
-			.map(|header| header.type_params),
+			.map(|header| header.generic_params),
 		}
 		.ok_or(SolverError::Pending)?;
-		let args = self.generic_envs.identity_args(impl_env).to_vec();
+		let args = self.generic_frames.identity_args(impl_frame).to_vec();
+		// Before the judgement starts, as for a member's value.
+		let normalized_env = self.normalize_env(strings, impl_frame);
 		self.solver.verdicts.insert(definition, Verdict::InProgress);
 		let index = self.solver.state.frames.len();
 		self.solver.state.frames.push(SolverFrame::Requirements {
@@ -2749,8 +2619,8 @@ impl Semantics {
 		});
 		let result = self.prove_requirements(
 			strings,
-			self.assumption_envs.of_frame(impl_env),
-			impl_env,
+			normalized_env,
+			impl_frame,
 			&args,
 			Some(index),
 		);
@@ -2771,13 +2641,13 @@ impl Semantics {
 			.blocked_at
 			.is_some_and(|blocked| blocked < index)
 		{
-			self.solver.verdicts.remove(&definition);
+			self.solver.drop_verdict(definition);
 			return Ok(());
 		}
 		let (verdict, answer) = match result {
 			Ok(_) => (Verdict::Resolved, Ok(())),
 			Err(SolverError::Pending) => {
-				self.solver.verdicts.remove(&definition);
+				self.solver.drop_verdict(definition);
 				return Err(SolverError::Pending);
 			}
 			Err(SolverError::Poisoned) => {
@@ -2804,7 +2674,7 @@ impl Semantics {
 		answer
 	}
 
-	/// Whether every clause `impl_env`'s item and the items around it state
+	/// Whether every clause `impl_frame`'s item and the items around it state
 	/// holds for `args` (the flat arguments of its chain) under
 	/// `assumption_context`: each frame's requirements, proved whole. A
 	/// judgement passes its frame, which records the bound being proved.
@@ -2812,24 +2682,24 @@ impl Semantics {
 		&mut self,
 		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
-		impl_env: GenericEnvIdx,
+		impl_frame: GenericFrameIdx,
 		args: &[TypeIndex],
 		judgement: Option<usize>,
 	) -> Result<bool, SolverError> {
-		let mut frame = Some(impl_env);
+		let mut frame = Some(impl_frame);
 		while let Some(current) = frame {
 			if !self.satisfies_clauses(
 				strings,
 				assumption_context,
 				self.assumption_envs.requirements(current),
 				Subjects::All,
-				(impl_env, args),
+				(impl_frame, args),
 				None,
 				judgement,
 			)? {
 				return Ok(false);
 			}
-			frame = self.generic_envs.parent(current);
+			frame = self.generic_frames.parent(current);
 		}
 		Ok(true)
 	}
@@ -2849,9 +2719,9 @@ impl Semantics {
 		&mut self,
 		strings: &StringInterner,
 		assumption_context: AssumptionEnvIdx,
-		clauses: BoundClauses,
+		clauses: PublishedClauses,
 		subjects: Subjects,
-		(frame, arguments): (GenericEnvIdx, &[TypeIndex]),
+		(frame, arguments): (GenericFrameIdx, &[TypeIndex]),
 		mut failures: Option<&mut Vec<UnsatisfiedClause>>,
 		judgement: Option<usize>,
 	) -> Result<bool, SolverError> {
@@ -2879,7 +2749,7 @@ impl Semantics {
 			self.solver.record_proving(judgement, clause.origin);
 			let stated = subjects.stated(
 				&mut self.types,
-				(&self.generic_envs, frame, arguments),
+				(&self.generic_frames, frame, arguments),
 				clause.subject,
 			);
 			let receiver = if matches!(
@@ -2951,14 +2821,14 @@ impl Semantics {
 					self.solver.record_proving(judgement, clause.origin);
 					let projection = subjects.stated(
 						&mut self.types,
-						(&self.generic_envs, frame, arguments),
+						(&self.generic_frames, frame, arguments),
 						clause.projection,
 					);
 					let required = self.types.substitute(
 						clause.value,
 						Substitution {
-							envs: &self.generic_envs,
-							env: frame,
+							frames: &self.generic_frames,
+							frame,
 							args: arguments,
 						},
 					);
@@ -3015,7 +2885,7 @@ impl Semantics {
 					self.solver.record_proving(judgement, clause.origin);
 					let stated = subjects.stated(
 						&mut self.types,
-						(&self.generic_envs, frame, arguments),
+						(&self.generic_frames, frame, arguments),
 						clause.subject,
 					);
 					let subject = self.normalize(
@@ -3028,8 +2898,8 @@ impl Semantics {
 					let ty = self.types.substitute(
 						clause.ty,
 						Substitution {
-							envs: &self.generic_envs,
-							env: frame,
+							frames: &self.generic_frames,
+							frame,
 							args: arguments,
 						},
 					);
@@ -3145,8 +3015,12 @@ impl Semantics {
 				};
 				if clause_trait != trait_index
 					|| clause_assoc != assoc_type_index
-					|| !source.names(types, tables.generic_envs, base, receiver)
-				{
+					|| !source.names(
+						types,
+						tables.generic_frames,
+						base,
+						receiver,
+					) {
 					continue;
 				}
 				let candidate = ContextualEquality {
@@ -3183,8 +3057,8 @@ impl Semantics {
 			Some(context) => self.types.substitute(
 				fact.value,
 				Substitution {
-					envs: &self.generic_envs,
-					env: context.env,
+					frames: &self.generic_frames,
+					frame: context.frame,
 					args: &[context.receiver],
 				},
 			),
