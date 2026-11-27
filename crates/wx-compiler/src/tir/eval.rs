@@ -846,7 +846,7 @@ impl Solver {
 				matches!(frame, SolverFrame::Evaluation { instance: on, .. } if *on == instance)
 			})
 			.expect("an in-progress constant is on the stack");
-		self.state.lowest_frame_read = self.state.lowest_frame_read.min(start);
+		self.state.read_frame(start);
 		let mut members: Vec<Instance> = self.state.frames[start..]
 			.iter()
 			.filter_map(|frame| match *frame {
@@ -1815,24 +1815,19 @@ impl Semantics {
 				receiver,
 				trait_index,
 			)? {
-				Some(TraitImplLookup::Concrete { impl_index }) => {
+				Some(TraitImplLookup::Concrete {
+					impl_index,
+					args: impl_args,
+				}) => {
 					match self.decls.select_trait_member(
 						impl_index,
 						MemberKind::Constant(constant),
 					) {
 						TraitMemberSelection::Impl(MemberKind::Constant(
 							own,
-						)) => {
-							let impl_args = self.trait_impl_args(
-								strings,
-								AssumptionEnvIdx::ROOT,
-								impl_index,
-								receiver,
-							);
-							ResolvedConstant::Instance(
-								self.instance(own, &impl_args),
-							)
-						}
+						)) => ResolvedConstant::Instance(
+							self.instance(own, &impl_args),
+						),
 						_ if Some(constant)
 							== self.decls.intrinsics.memory_data_end
 							&& let Type::Memory { memory_index } =

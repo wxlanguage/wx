@@ -37,8 +37,8 @@ use super::solver::{
 	Assumption, NormalizationDepth, RewriteFlags, SolverError,
 };
 use super::types::{
-	GenericFrameIdx, GenericFrameOwner, Substitution, Type, TypeIndex,
-	TypeInterner,
+	GenericFrameIdx, GenericFrameOwner, ImplArgs, Substitution, Type,
+	TypeIndex, TypeInterner,
 };
 
 /// What type-relative member applicability found.
@@ -107,7 +107,7 @@ type Candidates = SmallVec<[ApplicableMember; 1]>;
 
 /// A member found through impl dispatch or trait bounds. Trait candidates
 /// retain the declaration; a concrete impl can provide a different definition.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) enum ApplicableMember {
 	Inherent {
 		impl_index: InherentImplIdx,
@@ -118,10 +118,12 @@ pub(super) enum ApplicableMember {
 		trait_index: TraitIdx,
 		declaration: MemberKind,
 	},
-	/// A concrete trait impl applies; its member may use the trait declaration.
+	/// A concrete trait impl applies, at `args`; its member may use the trait
+	/// declaration.
 	TraitImplMember {
 		trait_index: TraitIdx,
 		impl_index: TraitImplIdx,
+		args: ImplArgs,
 		declaration: MemberKind,
 	},
 }
@@ -129,8 +131,8 @@ pub(super) enum ApplicableMember {
 impl ApplicableMember {
 	/// The trait constant a representability clause can read, for a constant's
 	/// member.
-	pub(super) fn constant_declaration(self) -> Option<ConstantTarget> {
-		match self {
+	pub(super) fn constant_declaration(&self) -> Option<ConstantTarget> {
+		match *self {
 			Self::AbstractTraitMember {
 				trait_index,
 				declaration: MemberKind::Constant(constant),
@@ -148,8 +150,8 @@ impl ApplicableMember {
 	}
 
 	/// Only a trait-associated type has a projection declaration.
-	pub(super) fn type_declaration(self) -> Option<TypeProjectionTarget> {
-		match self {
+	pub(super) fn type_declaration(&self) -> Option<TypeProjectionTarget> {
+		match *self {
 			Self::AbstractTraitMember {
 				trait_index,
 				declaration: MemberKind::AssociatedType(assoc_type_index),
@@ -167,8 +169,8 @@ impl ApplicableMember {
 	}
 
 	/// Returns the definition used for a value member.
-	pub(super) fn selected_kind(self, decls: &Declarations) -> MemberKind {
-		match self {
+	pub(super) fn selected_kind(&self, decls: &Declarations) -> MemberKind {
+		match *self {
 			Self::Inherent { kind, .. } => kind,
 			Self::TraitImplMember {
 				impl_index,
@@ -252,8 +254,12 @@ impl Declarations {
 pub(super) enum TraitImplLookup {
 	/// Concrete receiver, with a registered `impl required_trait for
 	/// receiver` (`impls.rs`'s dispatch) — `TraitImplIdx` names it, in
-	/// case it overrides the member being looked up.
-	Concrete { impl_index: TraitImplIdx },
+	/// case it overrides the member being looked up — and the impl's
+	/// arguments for the receiver, flat over its chain.
+	Concrete {
+		impl_index: TraitImplIdx,
+		args: ImplArgs,
+	},
 	/// Membership supplied by the caller's assumptions, including evidence
 	/// on an equivalent subject. No concrete provider was selected; dispatch
 	/// remains symbolic until instantiation.
@@ -318,7 +324,10 @@ impl Semantics {
 				receiver,
 				trait_index,
 			)? {
-				Some(TraitImplLookup::Concrete { impl_index }) => {
+				Some(TraitImplLookup::Concrete {
+					impl_index,
+					args: impl_args,
+				}) => {
 					// A function item's `impl Call` is the compiler's: it
 					// declares `Args` and `Result`, and the call runs the item.
 					if let Type::Function {
@@ -340,13 +349,7 @@ impl Semantics {
 							MemberKind::Function(own) | MemberKind::Method(own),
 						) => ResolvedFunction::Instance {
 							function: own,
-							args: self
-								.trait_impl_args(
-									strings,
-									AssumptionEnvIdx::ROOT,
-									impl_index,
-									receiver,
-								)
+							args: impl_args
 								.iter()
 								.chain(&args[1..])
 								.copied()
@@ -603,10 +606,11 @@ impl Semantics {
 			name.span,
 		)?;
 		let member = match found {
-			TraitImplLookup::Concrete { impl_index, .. } => {
+			TraitImplLookup::Concrete { impl_index, args } => {
 				ApplicableMember::TraitImplMember {
 					trait_index: required_trait,
 					impl_index,
+					args,
 					declaration,
 				}
 			}
@@ -820,10 +824,11 @@ impl Semantics {
 				receiver,
 				trait_index,
 			) {
-				Ok(Some(TraitImplLookup::Concrete { impl_index, .. })) => {
+				Ok(Some(TraitImplLookup::Concrete { impl_index, args })) => {
 					candidates.push(ApplicableMember::TraitImplMember {
 						trait_index,
 						impl_index,
+						args,
 						declaration,
 					});
 				}
@@ -878,10 +883,10 @@ impl Semantics {
 		Self::classify(candidates)
 	}
 
-	fn classify(candidates: Candidates) -> MemberLookup {
-		match *candidates {
-			[] => MemberLookup::NotFound,
-			[candidate] => MemberLookup::Found(candidate),
+	fn classify(mut candidates: Candidates) -> MemberLookup {
+		match candidates.len() {
+			0 => MemberLookup::NotFound,
+			1 => MemberLookup::Found(candidates.remove(0)),
 			_ => MemberLookup::Ambiguous(
 				candidates.into_vec().into_boxed_slice(),
 			),
@@ -1185,7 +1190,7 @@ impl Semantics {
 			else {
 				continue;
 			};
-			if self.member_accessible(member, key, scope.namespace)
+			if self.member_accessible(&member, key, scope.namespace)
 				&& matches!(
 					self.receiver_fit(receiver, method),
 					ReceiverFit::Direct | ReceiverFit::Shared { .. }
@@ -1306,7 +1311,7 @@ impl Semantics {
 				if let [(impl_index, kind, _)] = candidates[..]
 					&& used_as.takes_member(kind)
 					&& self.member_accessible(
-						ApplicableMember::Inherent { impl_index, kind },
+						&ApplicableMember::Inherent { impl_index, kind },
 						key,
 						namespace,
 					) {
@@ -1320,7 +1325,7 @@ impl Semantics {
 		{
 			if let Some(member) =
 				self.usable_member(strings, assumption_env, receiver, key)
-				&& self.member_accessible(member, key, namespace)
+				&& self.member_accessible(&member, key, namespace)
 			{
 				let kind = member.selected_kind(&self.decls);
 				if used_as.takes_member(kind) {
@@ -1494,12 +1499,12 @@ impl Semantics {
 	/// the trait's.
 	pub(super) fn member_accessible(
 		&self,
-		found: ApplicableMember,
+		found: &ApplicableMember,
 		key: BindingKey,
 		accessor: Scope,
 	) -> bool {
 		let decls = &self.decls;
-		let (namespace, visibility) = match found {
+		let (namespace, visibility) = match *found {
 			ApplicableMember::Inherent { impl_index, .. } => {
 				let impl_decl = &decls.inherent_impls[usize::from(impl_index)];
 				let member =

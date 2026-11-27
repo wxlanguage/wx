@@ -598,7 +598,7 @@ impl BodyBuilder<'_, '_> {
 			Site::Value(reference),
 			Reference::Member(found.selected_kind(&self.sema.decls)),
 		);
-		self.check_member_access(found, key, member);
+		self.check_member_access(&found, key, member);
 		let receiver = self.context().normalized(receiver);
 		// The impl's arguments, and whether the selection proved them; a
 		// trait's declaration is selected over `[Self]` instead.
@@ -641,6 +641,7 @@ impl BodyBuilder<'_, '_> {
 			}
 			ApplicableMember::TraitImplMember {
 				impl_index,
+				args,
 				declaration,
 				..
 			} => match self
@@ -649,13 +650,7 @@ impl BodyBuilder<'_, '_> {
 				.select_trait_member(impl_index, declaration)
 			{
 				TraitMemberSelection::Impl(kind) => {
-					let args = self.sema.trait_impl_args(
-						self.builder.strings,
-						self.assumption_env,
-						impl_index,
-						receiver,
-					);
-					(kind, Some(args), true)
+					(kind, Some(args.into_boxed_slice()), true)
 				}
 				TraitMemberSelection::TraitDeclaration(declaration) => {
 					(declaration, None, true)
@@ -813,7 +808,7 @@ impl BodyBuilder<'_, '_> {
 	/// Reports a member not visible here (`Semantics::member_accessible`).
 	fn check_member_access(
 		&mut self,
-		found: ApplicableMember,
+		found: &ApplicableMember,
 		key: BindingKey,
 		member: &ast::PathSegment,
 	) {

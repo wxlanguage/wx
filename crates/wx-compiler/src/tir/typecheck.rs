@@ -2460,19 +2460,13 @@ impl<'a, 'ast> BodyBuilder<'a, 'ast> {
 		ty: TypeIndex,
 		span: TextSpan,
 	) -> SelectedMethod {
-		if let TraitImplLookup::Concrete { impl_index } = lookup
+		if let TraitImplLookup::Concrete { impl_index, args } = lookup
 			&& let TraitMemberSelection::Impl(
 				MemberKind::Method(function) | MemberKind::Function(function),
 			) = self.sema.decls.select_trait_member(
 				impl_index,
 				MemberKind::Method(method.method),
 			) {
-			let args = self.sema.trait_impl_args(
-				self.builder.strings,
-				self.assumption_env,
-				impl_index,
-				ty,
-			);
 			return SelectedMethod::Concrete {
 				function,
 				type_args: self

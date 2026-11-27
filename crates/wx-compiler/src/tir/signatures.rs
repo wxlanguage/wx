@@ -915,14 +915,16 @@ impl Semantics {
 		else {
 			return Err(SolverError::Pending);
 		};
-		self.match_impl_target_and_bounds(
-			strings,
-			assumption_context,
-			ImplKind::Inherent(impl_index),
-			header.generic_params,
-			header.target.inner,
-			receiver,
-		)
+		Ok(self
+			.match_impl_target_and_bounds(
+				strings,
+				assumption_context,
+				ImplKind::Inherent(impl_index),
+				header.generic_params,
+				header.target.inner,
+				receiver,
+			)?
+			.is_some())
 	}
 
 	/// Whether inherent impl `impl_index`'s target matches `receiver`, its
@@ -5764,9 +5766,11 @@ impl<'ast> SemanticsBuilder<'ast> {
 			};
 			let kind = match binding.kind {
 				ast::AssocBindingKind::Equals(ty) => member
+					.as_ref()
 					.and_then(ApplicableMember::type_declaration)
 					.map(|target| BindingOccurrenceKind::Equals(target, ty)),
 				ast::AssocBindingKind::Bound(rhs) => member
+					.as_ref()
 					.and_then(ApplicableMember::type_declaration)
 					.map(|target| {
 						let mut nested = Vec::new();
@@ -5780,6 +5784,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 						BindingOccurrenceKind::Bound(target, nested)
 					}),
 				ast::AssocBindingKind::ConstRepresentable { ty, .. } => member
+					.as_ref()
 					.and_then(ApplicableMember::constant_declaration)
 					.map(|target| {
 						BindingOccurrenceKind::Representable(target, ty)
@@ -11128,6 +11133,7 @@ pub(super) mod tests {
 						trait_index: actual_trait,
 						impl_index: actual_impl,
 						declaration,
+						..
 					} = member
 					else {
 						panic!("expected a concrete trait member")
@@ -15028,6 +15034,35 @@ pub(super) mod tests {
 			case.sema.diagnostics[0].code.as_deref(),
 			Some(DiagnosticCode::TraitBoundViolation.code())
 		);
+	}
+
+	#[test]
+	fn nested_impl_requirements_reuse_finished_normalizations() {
+		// Proving each level's requirements normalizes the level below, which
+		// proving that level's own membership already did: read again, not
+		// derived again, the chain checks in linear time.
+		let chain = (0..24).fold(String::from("Leaf"), |inner, _| {
+			format!("Mapped<{inner}, Id>")
+		});
+		let mut case = TestCase::new(&format!(
+			"
+			trait Container {{ type Item; }}
+			trait Mapper {{ type In; type Out; }}
+			struct Leaf();
+			struct Id();
+			struct Mapped<C, M>();
+			impl Container for Leaf {{ type Item = u32; }}
+			impl Mapper for Id {{ type In = u32; type Out = u32; }}
+			impl<C: Container, M: Mapper where {{ In = C::Item }}> Container
+				for Mapped<C, M>
+			{{
+				type Item = M::Out;
+			}}
+			func f(x: <{chain} as Container>::Item) {{}}
+			"
+		));
+		assert_eq!(case.normalized_param("f", 0), TypeIndex::U32);
+		case.diagnostics().assert_codes(&[]);
 	}
 
 	#[test]
@@ -19470,25 +19505,29 @@ pub(super) mod tests {
 			Some(&[i32_, bool_][..])
 		);
 		assert_eq!(
-			case.sema.match_impl_target_and_bounds(
-				&case.strings,
-				AssumptionEnvIdx::ROOT,
-				impl_kind,
-				method,
-				pair,
-				concrete,
-			),
+			case.sema
+				.match_impl_target_and_bounds(
+					&case.strings,
+					AssumptionEnvIdx::ROOT,
+					impl_kind,
+					method,
+					pair,
+					concrete,
+				)
+				.map(|args| args.is_some()),
 			Ok(true)
 		);
 		assert_eq!(
-			case.sema.match_impl_target_and_bounds(
-				&case.strings,
-				AssumptionEnvIdx::ROOT,
-				impl_kind,
-				method,
-				pair,
-				swapped,
-			),
+			case.sema
+				.match_impl_target_and_bounds(
+					&case.strings,
+					AssumptionEnvIdx::ROOT,
+					impl_kind,
+					method,
+					pair,
+					swapped,
+				)
+				.map(|args| args.is_some()),
 			Ok(false)
 		);
 	}

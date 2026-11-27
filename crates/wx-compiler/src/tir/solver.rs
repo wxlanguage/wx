@@ -475,11 +475,60 @@ pub(super) struct SolverState {
 	pub(super) recursion_budget: usize,
 	/// Roll back an assumed equality chain that made no finite progress.
 	pub(super) blocked_at: Option<usize>,
-	/// The outermost frame the innermost request's answer read so far (a
-	/// cycle, a re-entered judgement or a rollback), `usize::MAX` when none.
-	/// An answer that read no frame below its own request is a function of its
-	/// `Normalization` alone.
-	pub(super) lowest_frame_read: usize,
+	/// What the innermost request's answer depends on so far.
+	pub(super) dependence: Dependence,
+}
+
+impl SolverState {
+	/// The answer in flight read the frame at `at`, open now.
+	pub(super) fn read_frame(&mut self, at: usize) {
+		self.dependence = self.dependence.join(Dependence {
+			lowest_frame: Some(at),
+			unanswered: false,
+		});
+	}
+}
+
+/// What an answer depends on besides its `Normalization`.
+#[derive(Clone, Copy)]
+pub(super) struct Dependence {
+	/// The outermost open frame it read: a cycle, a re-entered judgement or a
+	/// rollback. It holds only while that frame is open.
+	lowest_frame: Option<usize>,
+	/// It is built on a step that left no answer: a normalization not stored,
+	/// or a judgement whose verdict was dropped. Asked again, that step runs
+	/// again and may meet a frame open then.
+	unanswered: bool,
+}
+
+impl Dependence {
+	/// A function of its request alone.
+	const NONE: Self = Self {
+		lowest_frame: None,
+		unanswered: false,
+	};
+
+	fn join(self, other: Self) -> Self {
+		Self {
+			lowest_frame: match (self.lowest_frame, other.lowest_frame) {
+				(Some(a), Some(b)) => Some(a.min(b)),
+				(a, b) => a.or(b),
+			},
+			unanswered: self.unanswered || other.unanswered,
+		}
+	}
+
+	/// Whether the answer of a request opened at `frame` reads no frame
+	/// below its own, so it holds once that request is done.
+	fn holds_after(self, frame: usize) -> bool {
+		self.lowest_frame.is_none_or(|lowest| lowest >= frame)
+	}
+
+	/// Whether it also repeats no unanswered step, so asking again could
+	/// meet no frame open then: it may be read at any depth.
+	fn is_final_after(self, frame: usize) -> bool {
+		!self.unanswered && self.holds_after(frame)
+	}
 }
 
 /// The engine that normalizes types and selects impls, with everything it
@@ -524,7 +573,7 @@ impl Solver {
 				frames: Vec::new(),
 				recursion_budget: recursion_limit,
 				blocked_at: None,
-				lowest_frame_read: usize::MAX,
+				dependence: Dependence::NONE,
 			},
 			normalized: FxHashMap::default(),
 			verdicts: FxHashMap::default(),
@@ -535,6 +584,17 @@ impl Solver {
 			allocations: Vec::new(),
 			static_values: FxHashMap::default(),
 		}
+	}
+
+	/// Forgets `definition`'s judgement, cut short without a verdict; it is
+	/// judged again when asked, so the answer in flight is built on a step
+	/// that left no answer.
+	fn drop_verdict(&mut self, definition: Definition) {
+		self.verdicts.remove(&definition);
+		self.state.dependence = self.state.dependence.join(Dependence {
+			lowest_frame: None,
+			unanswered: true,
+		});
 	}
 
 	pub(super) fn verdict(&self, definition: Definition) -> &Verdict {
@@ -633,7 +693,7 @@ impl Semantics {
 			.blocked_at
 			.is_some_and(|blocked| blocked < index)
 		{
-			self.solver.verdicts.remove(&Definition::Member(member));
+			self.solver.drop_verdict(Definition::Member(member));
 			return Ok(value);
 		}
 		let (verdict, answer) = match result {
@@ -713,8 +773,7 @@ impl Semantics {
 				matches!(frame, SolverFrame::Judgement { member: judged, .. } if *judged == member)
 			})
 			.expect("an in-progress judgement is on the stack");
-		self.solver.state.lowest_frame_read =
-			self.solver.state.lowest_frame_read.min(start);
+		self.solver.state.read_frame(start);
 		let loop_frames = &self.solver.state.frames[start..];
 		if loop_frames
 			.iter()
@@ -990,7 +1049,7 @@ impl Solver {
 		}) else {
 			return Ok(false);
 		};
-		self.state.lowest_frame_read = self.state.lowest_frame_read.min(start);
+		self.state.read_frame(start);
 		let loop_frames = &self.state.frames[start..];
 		if loop_frames
 			.iter()
@@ -1041,7 +1100,7 @@ impl Solver {
 				matches!(frame, SolverFrame::Requirements { impl_kind: judged, .. } if *judged == impl_kind)
 			})
 			.expect("an in-progress judgement is on the stack");
-		self.state.lowest_frame_read = self.state.lowest_frame_read.min(start);
+		self.state.read_frame(start);
 		let loop_frames = &self.state.frames[start..];
 		if loop_frames
 			.iter()
@@ -1082,18 +1141,11 @@ impl Solver {
 impl Semantics {
 	/// The cache layer around `normalize_uncached`. An answer that read a frame
 	/// below its own request (cycle and rollback state, an open judgement)
-	/// holds only while that frame is open, so it is not stored. Only a request
-	/// with no frame open reads the cache: a nested one could reuse an answer
-	/// whose derivation passed through a frame open now, skipping the cycle it
-	/// would have found.
-	///
-	/// TODO: let nested requests read the cache too, removing the repeated
-	/// work inside one deep normalization. Each entry would also store what its
-	/// derivation pushed (projection normalizations and judged members), and a
-	/// nested read would use it only when none of those is on the stack now,
-	/// as rustc's search graph does. Worth it once body checking makes
-	/// normalization measurably hot; every frame-pushing path must then record
-	/// itself, or reads silently become order-dependent.
+	/// holds only while that frame is open, so it is not stored. Neither is one
+	/// whose derivation left a step unanswered (`Dependence`). Every other
+	/// step it took is answered for good, so asking it again repeats none of
+	/// them and can meet no frame open now: a stored answer is read at any
+	/// depth.
 	pub(super) fn normalize(
 		&mut self,
 		strings: &StringInterner,
@@ -1123,14 +1175,12 @@ impl Semantics {
 			{
 				return Err(SolverError::Poisoned);
 			}
-			Some(Normalized::Type(normalized)) if frame == 0 => {
-				return Ok(normalized);
-			}
+			Some(Normalized::Type(normalized)) => return Ok(normalized),
 			_ => {}
 		}
-		let outer_read = std::mem::replace(
-			&mut self.solver.state.lowest_frame_read,
-			usize::MAX,
+		let outer = std::mem::replace(
+			&mut self.solver.state.dependence,
+			Dependence::NONE,
 		);
 		let result = self.normalize_uncached(
 			strings,
@@ -1139,26 +1189,32 @@ impl Semantics {
 			depth,
 			facts,
 		);
-		let lowest_read = self.solver.state.lowest_frame_read;
-		self.solver.state.lowest_frame_read = outer_read.min(lowest_read);
+		let dependence = self.solver.state.dependence;
 		// A request that started with nothing in flight leaves nothing behind.
 		debug_assert!(frame != 0 || self.solver.state.frames.is_empty());
 		debug_assert!(frame != 0 || self.solver.state.blocked_at.is_none());
-		if lowest_read >= frame {
-			match result {
-				Ok(normalized) => {
-					self.solver
-						.normalized
-						.insert(normalization, Normalized::Type(normalized));
-				}
-				Err(SolverError::Cycle(ref cycle)) if cycle.owner.is_none() => {
-					self.solver
-						.normalized
-						.insert(normalization, Normalized::Cyclic);
-				}
-				Err(_) => {}
+		// A loop is read only to fail silently, so it is stored even when its
+		// own unanswered steps would find it again.
+		let answer = match result {
+			Ok(normalized) if dependence.is_final_after(frame) => {
+				Some(Normalized::Type(normalized))
 			}
+			Err(SolverError::Cycle(ref cycle))
+				if cycle.owner.is_none() && dependence.holds_after(frame) =>
+			{
+				Some(Normalized::Cyclic)
+			}
+			_ => None,
+		};
+		if let Some(answer) = answer {
+			self.solver.normalized.insert(normalization, answer);
 		}
+		// The frames it read are read by the request around it too; a step it
+		// leaves unanswered is that request's unanswered step.
+		self.solver.state.dependence = outer.join(Dependence {
+			lowest_frame: dependence.lowest_frame,
+			unanswered: answer.is_none(),
+		});
 		result
 	}
 
@@ -1172,8 +1228,7 @@ impl Semantics {
 	) -> Result<TypeIndex, SolverError> {
 		if let Some(blocked) = self.solver.state.blocked_at {
 			// Unwinding to `blocked`: the answer is only a way out.
-			self.solver.state.lowest_frame_read =
-				self.solver.state.lowest_frame_read.min(blocked);
+			self.solver.state.read_frame(blocked);
 			return Ok(ty);
 		}
 		if self.solver.state.recursion_budget == 0 {
@@ -1534,15 +1589,9 @@ impl Semantics {
 			return Err(SolverError::Poisoned);
 		};
 		let (impl_index, args) = match found {
-			TraitImplLookup::Concrete { impl_index } => (
-				impl_index,
-				self.trait_impl_args(
-					strings,
-					assumption_context,
-					impl_index,
-					base,
-				),
-			),
+			TraitImplLookup::Concrete { impl_index, args } => {
+				(impl_index, args)
+			}
 			// An abstract impl, or a builtin trait with no rule for this
 			// associated member, supplies no value to reduce further.
 			TraitImplLookup::Abstract | TraitImplLookup::Builtin => {
@@ -1826,7 +1875,7 @@ impl Semantics {
 					impl_index,
 					normalized,
 				)?
-				.then_some(TraitImplLookup::Concrete { impl_index }));
+				.map(|args| TraitImplLookup::Concrete { impl_index, args }));
 		}
 		if normalized != receiver
 			&& self.types.is_param_or_projection(normalized)
@@ -2419,7 +2468,7 @@ impl Semantics {
 		}
 	}
 
-	/// Whether an impl header's complete target matches `receiver` with
+	/// The impl's arguments, when its complete target matches `receiver` with
 	/// arguments that meet the impl's own parameter bounds; no declaration
 	/// frame is changed. Reads the finished header: one still missing is
 	/// `Pending`.
@@ -2429,7 +2478,7 @@ impl Semantics {
 		assumption_context: AssumptionEnvIdx,
 		impl_index: TraitImplIdx,
 		receiver: TypeIndex,
-	) -> Result<bool, SolverError> {
+	) -> Result<Option<ImplArgs>, SolverError> {
 		let Some(header) = self.trait_impls[usize::from(impl_index)].as_ref()
 		else {
 			return Err(SolverError::Pending);
@@ -2444,40 +2493,11 @@ impl Semantics {
 		)
 	}
 
-	/// The arguments of trait impl `impl_index` for `receiver`, which
-	/// `find_trait_impl_query` selected it for in `assumption_context`.
-	pub(super) fn trait_impl_args(
-		&mut self,
-		strings: &StringInterner,
-		assumption_context: AssumptionEnvIdx,
-		impl_index: TraitImplIdx,
-		receiver: TypeIndex,
-	) -> Box<[TypeIndex]> {
-		let Ok(receiver) = self.normalize(
-			strings,
-			assumption_context,
-			receiver,
-			NormalizationDepth::Deep,
-			RewriteFlags::ALL,
-		) else {
-			unreachable!("the selection normalized this receiver")
-		};
-		let header = self.trait_impls[usize::from(impl_index)]
-			.as_ref()
-			.expect("a selected impl has a header");
-		self.types
-			.match_impl_target(
-				header.target.inner,
-				receiver,
-				&self.generic_frames,
-				header.generic_params,
-			)
-			.expect("the selected impl's target matches the receiver")
-	}
-
-	/// `assumption_context` is the caller's; `impl_frame` is the candidate impl's own
-	/// parameter frame (for a synthetic impl, the frame it is generic over). The
-	/// impl's requirements are proved in the caller's assumptions, never the
+	/// The candidate impl's arguments for `receiver`, when its target matches
+	/// and its requirements hold for them. `assumption_context` is the
+	/// caller's; `impl_frame` is the candidate impl's own parameter frame (for
+	/// a synthetic impl, the frame it is generic over). The impl's
+	/// requirements are proved in the caller's assumptions, never the
 	/// candidate's.
 	pub(super) fn match_impl_target_and_bounds(
 		&mut self,
@@ -2487,7 +2507,7 @@ impl Semantics {
 		impl_frame: GenericFrameIdx,
 		target: TypeIndex,
 		receiver: TypeIndex,
-	) -> Result<bool, SolverError> {
+	) -> Result<Option<ImplArgs>, SolverError> {
 		// Structural matching below compares `receiver`'s nested children
 		// against `target`'s pattern directly, with no normalization of its
 		// own (`TypeInterner::match_pattern` is `&self`, with no access to
@@ -2506,7 +2526,6 @@ impl Semantics {
 			NormalizationDepth::Deep,
 			RewriteFlags::ALL,
 		)?;
-		// The arguments live only while the bounds are proved.
 		let mut args = ImplArgs::from_elem(
 			TypeIndex::INFER,
 			self.generic_frames.generic_count(impl_frame),
@@ -2518,7 +2537,7 @@ impl Semantics {
 			impl_frame,
 			&mut args,
 		) {
-			return Ok(false);
+			return Ok(None);
 		}
 		// The impl's requirements are a definition, judged once before any
 		// selection relies on them. While they are judged, the impl's own
@@ -2530,18 +2549,19 @@ impl Semantics {
 				&& *args == *self.generic_frames.identity_args(impl_frame)
 			{
 				self.solver.reenter_requirements(impl_kind)?;
-				return Ok(true);
+				return Ok(Some(args));
 			}
 		} else {
 			self.requirements_verdict(strings, impl_kind)?;
 		}
-		self.prove_requirements(
+		let holds = self.prove_requirements(
 			strings,
 			assumption_context,
 			impl_frame,
 			&args,
 			None,
-		)
+		)?;
+		Ok(holds.then_some(args))
 	}
 
 	/// `impl_kind`'s requirements, judged once: proved for its own parameters
@@ -2621,13 +2641,13 @@ impl Semantics {
 			.blocked_at
 			.is_some_and(|blocked| blocked < index)
 		{
-			self.solver.verdicts.remove(&definition);
+			self.solver.drop_verdict(definition);
 			return Ok(());
 		}
 		let (verdict, answer) = match result {
 			Ok(_) => (Verdict::Resolved, Ok(())),
 			Err(SolverError::Pending) => {
-				self.solver.verdicts.remove(&definition);
+				self.solver.drop_verdict(definition);
 				return Err(SolverError::Pending);
 			}
 			Err(SolverError::Poisoned) => {

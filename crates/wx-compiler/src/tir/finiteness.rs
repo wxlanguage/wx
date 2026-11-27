@@ -12,7 +12,7 @@ use super::clauses::AssumptionEnvIdx;
 use super::decls::{FieldIdx, StructIdx};
 use super::signatures::Semantics;
 use super::solver::{NormalizationDepth, RewriteFlags, SolverError};
-use super::types::{Substitution, Type, TypeIndex};
+use super::types::{ImplArgs, Substitution, Type, TypeIndex};
 use crate::ast::StringInterner;
 use crate::diagnostics::{DiagnosticCode, SourceSpan};
 use crate::vfs::FileId;
@@ -247,7 +247,7 @@ impl Semantics {
 				let signature = &self.structs[usize::from(struct_index)];
 				let (frame, fields) =
 					(signature.generic_params, signature.field_types);
-				let args: Box<[TypeIndex]> = self.types.list(type_args).into();
+				let args = ImplArgs::from(self.types.list(type_args));
 				// Read one field at a time: substituting may store more lists.
 				(0..fields.len())
 					.map(|at| {
@@ -451,9 +451,14 @@ impl Semantics {
 				else {
 					return Ok(false);
 				};
+				if struct_deps.params.len == 0
+					&& struct_deps.projections.len == 0
+				{
+					return Ok(true);
+				}
 				let decl_frame =
 					self.structs[usize::from(struct_index)].generic_params;
-				let args: Box<[TypeIndex]> = self.types.list(type_args).into();
+				let args = ImplArgs::from(self.types.list(type_args));
 				let substitution = |sema: &mut Self, dep| {
 					sema.types.substitute(
 						dep,
@@ -757,7 +762,7 @@ impl Semantics {
 		let Type::Struct { type_args, .. } = *self.types.resolve(key.ty) else {
 			unreachable!("an instance owner is a struct")
 		};
-		let args: Box<[TypeIndex]> = self.types.list(type_args).into();
+		let args = ImplArgs::from(self.types.list(type_args));
 		self.types.substitute(
 			field,
 			Substitution {
