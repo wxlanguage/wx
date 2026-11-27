@@ -190,7 +190,7 @@ pub(crate) fn signature_help(
 		.and_then(|definition| {
 			hover::documentation(
 				&snapshot.sema,
-				&snapshot.compilation.files,
+				&snapshot.compilation,
 				definition,
 			)
 		})

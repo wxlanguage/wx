@@ -5035,15 +5035,16 @@ fn hover_shows_the_bounds_written_on_a_type() {
 	};
 	for (needle, occurrence, expected) in [
 		// An associated type's declaration, with its default, and nested
-		// bindings; an impl's value has no bounds of its own.
-		("Item", 0, "type Item: Show + StackValue"),
-		("Key", 0, "type Key = u32"),
+		// bindings, under its trait; an impl's value has no bounds of its
+		// own and is under its impl.
+		("Item", 0, "trait Container\ntype Item: Show + StackValue"),
+		("Key", 0, "trait Container\ntype Key = u32"),
 		(
 			"Value:",
 			0,
-			"type Value: StackValue where { Repr: StackScalar }",
+			"trait Container\ntype Value: StackValue where { Repr: StackScalar }",
 		),
-		("Item", 1, "type Item = Box"),
+		("Item", 1, "impl Container for Box\ntype Item = Box"),
 		// What a trait or typeset writes, not what it implies; a trait's
 		// own `Self` is the trait.
 		("Container", 0, "trait Container: StackValue"),

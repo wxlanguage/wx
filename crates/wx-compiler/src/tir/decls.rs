@@ -954,6 +954,9 @@ pub struct AssocTypeDecl {
 	/// Its row, in the table of the scope its trait or impl is written
 	/// in (or its generator, for a function's, memory's or global's impl).
 	pub loc: ItemLoc,
+	/// The trait or trait impl it is a member of; an associated type is
+	/// never free, nor an inherent impl's.
+	pub owner: MemberOwner,
 }
 
 index_newtype!(DeclIdx);
@@ -1097,7 +1100,6 @@ pub(super) enum AstNodeRef {
 	},
 	ImportedMemory {
 		memory_index: MemoryIdx,
-		import_index: ImportIdx,
 		import_entry: ast::ImportEntryId,
 	},
 	ImportedFunction {
@@ -1107,7 +1109,6 @@ pub(super) enum AstNodeRef {
 	},
 	ImportedGlobal {
 		global_index: GlobalIdx,
-		import_index: ImportIdx,
 		import_entry: ast::ImportEntryId,
 	},
 }
@@ -1244,6 +1245,11 @@ pub struct Declarations {
 	pub assoc_types: Vec<AssocTypeDecl>,
 	pub type_aliases: Vec<TypeAliasDecl>,
 	pub use_items: Vec<UseItemDecl>,
+	/// Every `use` path's segments, by `UsePathIndex`, as import resolution
+	/// read them. Nothing reads them after declarations are built yet; only
+	/// the debug-build `Serialize` derive does, so release builds would
+	/// report the field as dead.
+	#[allow(dead_code, reason = "kept for later consumers of `use` paths")]
 	pub(super) use_paths: Vec<UsePathSegment>,
 	/// The `ItemLoc` of every language builtin recognized by name in the
 	/// core package — primitive types (`u8`, `funcref`, ...), `Bool`, `Char` and
@@ -2092,6 +2098,18 @@ impl Namespaces {
 
 	pub fn package_instances(&self) -> &[PackageInstanceDecl] {
 		&self.package_instances
+	}
+
+	/// The rows of the package instances that instantiate `package`, in any
+	/// package and scope, in the order they were scanned: what
+	/// [`Self::entered_by`] maps back to `package`.
+	pub fn instances_of(
+		&self,
+		package: PackageId,
+	) -> impl Iterator<Item = ItemLoc> + '_ {
+		(self.package_instances.iter())
+			.filter(move |instance| instance.package == Some(package))
+			.map(|instance| instance.loc)
 	}
 
 	/// The namespace a path continues into after `loc`: what `a::` names
@@ -3093,10 +3111,16 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		index
 	}
 
+	/// The index the next `push_trait_impl` gives: a generated impl's
+	/// associated types name their impl before it, listing them, is pushed.
+	#[inline]
+	fn next_trait_impl_index(&self) -> TraitImplIdx {
+		TraitImplIdx::new(u32::try_from(self.trait_impls.len()).unwrap())
+	}
+
 	#[inline]
 	fn push_trait_impl(&mut self, item: TraitImplDecl) -> TraitImplIdx {
-		let index =
-			TraitImplIdx::new(u32::try_from(self.trait_impls.len()).unwrap());
+		let index = self.next_trait_impl_index();
 		self.trait_impls.push(item);
 		index
 	}
@@ -3109,6 +3133,7 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 	fn push_generated_assoc_type(
 		&mut self,
 		namespace: Scope,
+		owner: TraitImplIdx,
 		name: SymbolU32,
 		generator: TextSpan,
 	) -> AssocTypeIdx {
@@ -3126,7 +3151,10 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				Visibility::Private,
 			),
 		);
-		self.assoc_types.push(AssocTypeDecl { loc });
+		self.assoc_types.push(AssocTypeDecl {
+			loc,
+			owner: MemberOwner::TraitImpl(owner),
+		});
 		index
 	}
 
@@ -3140,9 +3168,14 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		name_span: TextSpan,
 	) -> (TraitImplIdx, AssocTypeIdx) {
 		let size_symbol = self.strings.get_or_intern("Size");
-		let size_assoc_type_index =
-			self.push_generated_assoc_type(namespace, size_symbol, name_span);
-		let trait_impl_index = self.push_trait_impl(TraitImplDecl {
+		let trait_impl_index = self.next_trait_impl_index();
+		let size_assoc_type_index = self.push_generated_assoc_type(
+			namespace,
+			trait_impl_index,
+			size_symbol,
+			name_span,
+		);
+		self.push_trait_impl(TraitImplDecl {
 			file_id,
 			namespace,
 			members: vec![TraitMemberDecl {
@@ -3168,9 +3201,14 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 		mutable: bool,
 	) -> (TraitImplIdx, AssocTypeIdx, Option<TraitImplIdx>) {
 		let value_symbol = self.strings.get_or_intern("Value");
-		let value_assoc_type_index =
-			self.push_generated_assoc_type(namespace, value_symbol, name_span);
-		let trait_impl_index = self.push_trait_impl(TraitImplDecl {
+		let trait_impl_index = self.next_trait_impl_index();
+		let value_assoc_type_index = self.push_generated_assoc_type(
+			namespace,
+			trait_impl_index,
+			value_symbol,
+			name_span,
+		);
+		self.push_trait_impl(TraitImplDecl {
 			file_id,
 			namespace,
 			members: vec![TraitMemberDecl {
@@ -3210,11 +3248,20 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 	) -> FunctionImpls {
 		let args_symbol = self.strings.get_or_intern("Args");
 		let result_symbol = self.strings.get_or_intern("Result");
-		let args_assoc_type_index =
-			self.push_generated_assoc_type(namespace, args_symbol, name_span);
-		let result_assoc_type_index =
-			self.push_generated_assoc_type(namespace, result_symbol, name_span);
-		let call_impl_index = self.push_trait_impl(TraitImplDecl {
+		let call_impl_index = self.next_trait_impl_index();
+		let args_assoc_type_index = self.push_generated_assoc_type(
+			namespace,
+			call_impl_index,
+			args_symbol,
+			name_span,
+		);
+		let result_assoc_type_index = self.push_generated_assoc_type(
+			namespace,
+			call_impl_index,
+			result_symbol,
+			name_span,
+		);
+		self.push_trait_impl(TraitImplDecl {
 			file_id,
 			namespace,
 			members: vec![
@@ -4171,14 +4218,10 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				if bodyless
 					&& self.namespaces.scope(namespace).package_id
 						== self.namespaces.core_package
+					&& let Some(name_str) = self.strings.resolve(name.inner)
+					&& let Some(slot) = self.intrinsics.type_slot_mut(name_str)
 				{
-					if let Some(name_str) = self.strings.resolve(name.inner) {
-						if let Some(slot) =
-							self.intrinsics.type_slot_mut(name_str)
-						{
-							*slot = Some(type_alias_index);
-						}
-					}
+					*slot = Some(type_alias_index);
 				}
 				self.type_aliases.push(TypeAliasDecl { loc });
 				if matches!(item, ast::Item::PackageType { .. }) {
@@ -4341,12 +4384,10 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				);
 				if self.namespaces.scope(namespace).package_id
 					== self.namespaces.core_package
-				{
-					if let Some(slot) = self.intrinsics.trait_slot_mut(
+					&& let Some(slot) = self.intrinsics.trait_slot_mut(
 						self.strings.resolve(name.inner).unwrap(),
 					) {
-						*slot = Some(trait_index);
-					}
+					*slot = Some(trait_index);
 				}
 				self.ast_nodes.push(AstEntry {
 					file_id,
@@ -4467,7 +4508,10 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 									Visibility::Private,
 								),
 							);
-							self.assoc_types.push(AssocTypeDecl { loc });
+							self.assoc_types.push(AssocTypeDecl {
+								loc,
+								owner: MemberOwner::Trait(trait_index),
+							});
 							self.ast_nodes.push(AstEntry {
 								file_id,
 								namespace,
@@ -4853,7 +4897,6 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								namespace,
 								node: AstNodeRef::ImportedMemory {
 									memory_index,
-									import_index: import,
 									import_entry: entry,
 								},
 							});
@@ -4968,7 +5011,6 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 								namespace,
 								node: AstNodeRef::ImportedGlobal {
 									global_index,
-									import_index: import,
 									import_entry: entry,
 								},
 							});
@@ -5007,14 +5049,11 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 				);
 				if self.namespaces.scope(namespace).package_id
 					== self.namespaces.core_package
+					&& let Some(name_str) = self.strings.resolve(name.inner)
+					&& let Some(slot) =
+						self.intrinsics.typeset_slot_mut(name_str)
 				{
-					if let Some(name_str) = self.strings.resolve(name.inner) {
-						if let Some(slot) =
-							self.intrinsics.typeset_slot_mut(name_str)
-						{
-							*slot = Some(typeset_index);
-						}
-					}
+					*slot = Some(typeset_index);
 				}
 				let loc = self.push_decl(
 					Namespace::from(namespace),
@@ -5208,7 +5247,10 @@ impl<'ast, 'ctx> DeclarationsBuilder<'ast, 'ctx> {
 									Visibility::Private,
 								),
 							);
-							self.assoc_types.push(AssocTypeDecl { loc });
+							self.assoc_types.push(AssocTypeDecl {
+								loc,
+								owner: MemberOwner::TraitImpl(block_index),
+							});
 							self.ast_nodes.push(AstEntry {
 								file_id,
 								namespace,
@@ -7965,6 +8007,34 @@ mod tests {
 		case.resolve(Tier::Value, "inner::m::add")
 			.diagnostics()
 			.assert_error(DiagnosticCode::PrivateItem);
+	}
+
+	/// Every instance of a package is found from the package, wherever it
+	/// is written; an instance of an undeclared key instantiates nothing.
+	#[test]
+	fn a_package_lists_the_instances_of_it() {
+		let case = manifest_case(&[
+			("/app/wx.json", APP_WITH_MATH),
+			(
+				"/app/main.wx",
+				r#"package "math" as m;
+mod inner {
+    package "math" as n;
+    package "missing" as x;
+}"#,
+			),
+			("/math/wx.json", MATH_MANIFEST),
+			("/math/main.wx", MATH_SOURCE),
+		]);
+		case.diagnostics()
+			.assert_error(DiagnosticCode::UnknownPackage);
+		let math = case.decls.namespaces.package_instances()[0]
+			.package
+			.unwrap();
+		let aliases: Vec<_> = (case.decls.namespaces.instances_of(math))
+			.map(|loc| case.strings.resolve(case.decls.item(loc).name.inner))
+			.collect();
+		assert_eq!(aliases, [Some("m"), Some("n")]);
 	}
 
 	/// `pub crate` hands the dependency on: whoever depends on this package

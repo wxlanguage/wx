@@ -18,7 +18,7 @@ use super::{
 	clauses::report_not_a_trait_bound,
 	decls::{
 		AstEntry, AstNodeRef, BindingKey, DeclKind, Declarations,
-		DuplicateDefinitionDiagnostic, InherentImplIdx, IntrinsicDefs,
+		DuplicateDefinitionDiagnostic, InherentImplIdx, IntrinsicDefs, ItemLoc,
 		MemberIdx, Scope, Tier, TraitIdx, TraitImplIdx, TypeAliasIdx,
 	},
 	paths::PathResolver,
@@ -54,6 +54,53 @@ pub(super) enum ImplTarget {
 }
 
 impl ImplTarget {
+	/// The bucket of the impls written for `target`, or generated for it: a
+	/// struct, an enum, one of core's primitive aliases, a memory, a global
+	/// or a function. `None` for any other declaration.
+	pub(super) fn of_declaration(
+		decls: &Declarations,
+		target: ItemLoc,
+	) -> Option<Self> {
+		Some(match target.symbol_kind(decls) {
+			DeclKind::Struct(index) => Self::Struct(index),
+			DeclKind::Enum(index) => Self::Enum(index),
+			DeclKind::Memory(index) => Self::Memory(index),
+			DeclKind::Global(index) => Self::Global(index),
+			DeclKind::Function(index) => Self::Function(index),
+			// A user-written alias (`type Foo = Bar;`) has no identity of its
+			// own to dispatch on, only the closed set of core's own bodiless
+			// `#[intrinsic]` aliases (`u8`, `funcref`, ...) does.
+			DeclKind::TypeAlias(index) => {
+				Self::primitive(&decls.intrinsics, index)?
+			}
+			_ => return None,
+		})
+	}
+
+	/// The bucket of `alias`, if it's one of core's own `#[intrinsic]`
+	/// primitive aliases. The literal kinds have no bucket: nothing can be
+	/// implemented on them.
+	fn primitive(
+		intrinsics: &IntrinsicDefs,
+		alias: TypeAliasIdx,
+	) -> Option<Self> {
+		[
+			(intrinsics.u8, Self::U8),
+			(intrinsics.i8, Self::I8),
+			(intrinsics.u16, Self::U16),
+			(intrinsics.i16, Self::I16),
+			(intrinsics.u32, Self::U32),
+			(intrinsics.i32, Self::I32),
+			(intrinsics.u64, Self::U64),
+			(intrinsics.i64, Self::I64),
+			(intrinsics.f32, Self::F32),
+			(intrinsics.f64, Self::F64),
+			(intrinsics.funcref, Self::Funcref),
+		]
+		.into_iter()
+		.find_map(|(slot, target)| (slot == Some(alias)).then_some(target))
+	}
+
 	pub(super) fn from_type(ty: &Type) -> Option<Self> {
 		Some(match ty {
 			Type::U8 => Self::U8,
@@ -94,13 +141,14 @@ impl ImplTarget {
 #[derive(Clone, Copy)]
 pub(super) struct TraitImplHead {
 	pub(super) trait_decl: Option<Spanned<TraitIdx>>,
-	pub(super) target: Option<Spanned<ImplTarget>>,
+	/// The declaration the impl is for, when its written target resolved.
+	pub(super) target: Option<Spanned<ItemLoc>>,
 }
 
 pub(super) struct ImplDispatch {
 	inherent: FxHashMap<ImplTarget, Vec<InherentImplIdx>>,
 	traits: FxHashMap<ImplTarget, Vec<(TraitIdx, TraitImplIdx)>>,
-	inherent_targets: Vec<Option<Spanned<ImplTarget>>>,
+	inherent_targets: Vec<Option<Spanned<ItemLoc>>>,
 	trait_headers: Vec<TraitImplHead>,
 }
 
@@ -113,7 +161,7 @@ struct ImplDispatchBuilder<'a, 'ast> {
 	asts: &'ast [ast::AST],
 	inherent: FxHashMap<ImplTarget, Vec<InherentImplIdx>>,
 	traits: FxHashMap<ImplTarget, Vec<(TraitIdx, TraitImplIdx)>>,
-	inherent_targets: Vec<Option<Spanned<ImplTarget>>>,
+	inherent_targets: Vec<Option<Spanned<ItemLoc>>>,
 	trait_headers: Vec<TraitImplHead>,
 }
 
@@ -178,7 +226,7 @@ impl ImplDispatch {
 	pub(super) fn inherent_target(
 		&self,
 		index: InherentImplIdx,
-	) -> Option<Spanned<ImplTarget>> {
+	) -> Option<Spanned<ItemLoc>> {
 		self.inherent_targets[usize::from(index)]
 	}
 
@@ -251,7 +299,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					else {
 						unreachable!()
 					};
-					let Ok(target) = self.resolve_target(
+					let Ok((target, bucket)) = self.resolve_target(
 						entry.file_id,
 						entry.namespace,
 						target_path,
@@ -270,7 +318,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						entry.namespace,
 						target,
 					);
-					self.register_inherent(target, *block_index, entry.file_id);
+					self.register_inherent(bucket, *block_index, entry.file_id);
 				}
 				AstNodeRef::TraitImplBlock { item, block_index } => {
 					let ast::Item::TraitImpl {
@@ -290,9 +338,9 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 							*generic_params,
 						)
 						.ok()
-						.map(|inner| Spanned {
-							inner,
-							span: target_path.span,
+						.map(|(inner, bucket)| {
+							let span = target_path.span;
+							(Spanned { inner, span }, bucket)
 						});
 					let trait_idx = self.resolve_trait(
 						entry.file_id,
@@ -305,12 +353,14 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 								inner: idx,
 								span: trait_name.span,
 							}),
-							target,
+							target: target.map(|(target, _)| target),
 						};
-					if let (Some(trait_idx), Some(target)) = (trait_idx, target)
+					if let (Some(trait_idx), Some((target, bucket))) =
+						(trait_idx, target)
 					{
 						self.register_trait(
 							target,
+							bucket,
 							trait_idx,
 							ast.list(trait_name.segments)
 								.last()
@@ -344,9 +394,9 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 								ast::List::EMPTY,
 							)
 							.ok()
-							.map(|inner| Spanned {
-								inner,
-								span: member.span,
+							.map(|(inner, bucket)| {
+								let span = member.span;
+								(Spanned { inner, span }, bucket)
 							});
 						self.trait_headers[usize::from(impl_index)] =
 							TraitImplHead {
@@ -354,11 +404,12 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 									inner: decl.trait_index,
 									span: member.span,
 								}),
-								target,
+								target: target.map(|(target, _)| target),
 							};
-						if let Some(target) = target {
+						if let Some((target, bucket)) = target {
 							self.register_trait(
 								target,
+								bucket,
 								decl.trait_index,
 								name.inner,
 								impl_index,
@@ -454,13 +505,14 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 
 	fn register_trait(
 		&mut self,
-		target: Spanned<ImplTarget>,
+		target: Spanned<ItemLoc>,
+		bucket: ImplTarget,
 		trait_idx: TraitIdx,
 		trait_name: SymbolU32,
 		trait_impl_idx: TraitImplIdx,
 		file_id: FileId,
 	) {
-		let bucket = self.traits.entry(target.inner).or_default();
+		let bucket = self.traits.entry(bucket).or_default();
 		if let Some(&(_, earlier)) =
 			bucket.iter().find(|(idx, _)| *idx == trait_idx)
 		{
@@ -516,15 +568,16 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					span: name_span,
 				}),
 				target: Some(Spanned {
-					inner: ImplTarget::Memory(memory_index),
+					inner: memory_decl.loc,
 					span: name_span,
 				}),
 			};
 		self.register_trait(
 			Spanned {
-				inner: ImplTarget::Memory(memory_index),
+				inner: memory_decl.loc,
 				span: name_span,
 			},
+			ImplTarget::Memory(memory_index),
 			trait_idx,
 			decls.name(trait_idx).inner,
 			memory_decl.trait_impl_index,
@@ -557,15 +610,16 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					span: name_span,
 				}),
 				target: Some(Spanned {
-					inner: ImplTarget::Global(global_index),
+					inner: global_decl.loc,
 					span: name_span,
 				}),
 			};
 		self.register_trait(
 			Spanned {
-				inner: ImplTarget::Global(global_index),
+				inner: global_decl.loc,
 				span: name_span,
 			},
+			ImplTarget::Global(global_index),
 			global_trait_idx,
 			decls.name(global_trait_idx).inner,
 			global_decl.trait_impl_index,
@@ -586,15 +640,16 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						span: name_span,
 					}),
 					target: Some(Spanned {
-						inner: ImplTarget::Global(global_index),
+						inner: global_decl.loc,
 						span: name_span,
 					}),
 				};
 			self.register_trait(
 				Spanned {
-					inner: ImplTarget::Global(global_index),
+					inner: global_decl.loc,
 					span: name_span,
 				},
+				ImplTarget::Global(global_index),
 				global_mut_trait_idx,
 				decls.name(global_mut_trait_idx).inner,
 				mut_trait_impl_index,
@@ -635,15 +690,16 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 					span: name_span,
 				}),
 				target: Some(Spanned {
-					inner: ImplTarget::Function(func_index),
+					inner: function_decl.loc,
 					span: name_span,
 				}),
 			};
 			self.register_trait(
 				Spanned {
-					inner: ImplTarget::Function(func_index),
+					inner: function_decl.loc,
 					span: name_span,
 				},
+				ImplTarget::Function(func_index),
 				trait_idx,
 				decls.name(trait_idx).inner,
 				trait_impl_index,
@@ -663,17 +719,14 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 	/// keeping a second copy of this data just for the check.
 	fn register_inherent(
 		&mut self,
-		target: Spanned<ImplTarget>,
+		bucket: ImplTarget,
 		index: InherentImplIdx,
 		file_id: FileId,
 	) {
 		let decls = self.decls;
 		let new_impl = &decls.inherent_impls[usize::from(index)];
-		let earlier_in_bucket = self
-			.inherent
-			.get(&target.inner)
-			.map(Vec::as_slice)
-			.unwrap_or(&[]);
+		let earlier_in_bucket =
+			self.inherent.get(&bucket).map(Vec::as_slice).unwrap_or(&[]);
 
 		// Sorted by source position so a diagnostic here can't depend on
 		// `HashMap` iteration order. A function is bound in both tiers but is
@@ -718,7 +771,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 				);
 			}
 		}
-		self.inherent.entry(target.inner).or_default().push(index);
+		self.inherent.entry(bucket).or_default().push(index);
 	}
 
 	/// Inherent members belong to the package defining their target. Builtin
@@ -729,40 +782,10 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		&mut self,
 		file_id: FileId,
 		namespace: Scope,
-		target: Spanned<ImplTarget>,
+		target: Spanned<ItemLoc>,
 	) {
 		let decls = self.decls;
-		let target_scope = match target.inner {
-			ImplTarget::Struct(index) => {
-				decls.scope(decls.structs[usize::from(index)].loc)
-			}
-			ImplTarget::Enum(index) => {
-				decls.scope(decls.enums[usize::from(index)].loc)
-			}
-			ImplTarget::Memory(index) => {
-				decls.scope(decls.memories[usize::from(index)].loc)
-			}
-			ImplTarget::Global(index) => {
-				decls.scope(decls.globals[usize::from(index)].loc)
-			}
-			ImplTarget::Function(index) => {
-				decls.scope(decls.functions[usize::from(index)].loc)
-			}
-			ImplTarget::U8
-			| ImplTarget::I8
-			| ImplTarget::U16
-			| ImplTarget::I16
-			| ImplTarget::U32
-			| ImplTarget::I32
-			| ImplTarget::U64
-			| ImplTarget::I64
-			| ImplTarget::F32
-			| ImplTarget::F64
-			| ImplTarget::Funcref
-			| ImplTarget::TypedFuncref
-			| ImplTarget::Array
-			| ImplTarget::Slice => Scope::Package(decls.namespaces.core_package()),
-		};
+		let target_scope = decls.scope(target.inner);
 		if decls.namespaces.scope(target_scope).package_id
 			== decls.namespaces.scope(namespace).package_id
 		{
@@ -796,7 +819,7 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 		namespace: Scope,
 		path: &ast::Path,
 		params: ast::List<ast::GenericParam>,
-	) -> Result<ImplTarget, ()> {
+	) -> Result<(ItemLoc, ImplTarget), ()> {
 		let ast = &self.asts[file_id.as_usize()];
 		let segments = ast.list(path.segments);
 		if ast
@@ -824,19 +847,19 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 			self.asts,
 		)
 		.resolve_definition(file_id, namespace, segments, Tier::Type);
-		let kind = definition?.symbol_kind(self.decls);
-		let target = match kind {
-			DeclKind::Struct(idx) => Some(ImplTarget::Struct(idx)),
-			DeclKind::Enum(idx) => Some(ImplTarget::Enum(idx)),
-			// A user-written alias (`type Foo = Bar;`) has no identity of
-			// its own to dispatch on — only the closed set of core's own
-			// bodiless `#[intrinsic]` aliases (`u8`, `funcref`, ...) do, via
-			// their pre-interned `TypeIndex`. `intrinsic_target` returns
-			// `None` for every other alias, same as any non-namespace kind.
-			DeclKind::TypeAlias(idx) => self.intrinsic_target(idx),
+		let definition = definition?;
+		let kind = definition.symbol_kind(self.decls);
+		// Only a type is written as an impl target; a memory, a global or a
+		// function has its impls generated with it.
+		let bucket = match kind {
+			DeclKind::Struct(_)
+			| DeclKind::Enum(_)
+			| DeclKind::TypeAlias(_) => {
+				ImplTarget::of_declaration(self.decls, definition)
+			}
 			_ => None,
 		};
-		target.ok_or_else(|| {
+		let bucket = bucket.ok_or_else(|| {
 			self.diagnostics.push(
 				Diagnostic::error()
 					.with_code(DiagnosticCode::InvalidImplTarget.code())
@@ -848,7 +871,8 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 						SourceSpan::new(file_id, path.span).primary_label(),
 					),
 			);
-		})
+		})?;
+		Ok((definition, bucket))
 	}
 
 	fn resolve_trait(
@@ -878,29 +902,6 @@ impl<'a, 'ast> ImplDispatchBuilder<'a, 'ast> {
 				None
 			}
 		}
-	}
-
-	/// The dispatch bucket for `idx`, if it's one of core's own
-	/// `#[intrinsic]` primitive aliases — `None` for an ordinary alias.
-	/// `never` has no bucket here (nothing can be implemented on it), so
-	/// it's the one `IntrinsicDefs` type slot this deliberately excludes.
-	fn intrinsic_target(&self, idx: TypeAliasIdx) -> Option<ImplTarget> {
-		let intrinsics = &self.decls.intrinsics;
-		[
-			(intrinsics.u8, ImplTarget::U8),
-			(intrinsics.i8, ImplTarget::I8),
-			(intrinsics.u16, ImplTarget::U16),
-			(intrinsics.i16, ImplTarget::I16),
-			(intrinsics.u32, ImplTarget::U32),
-			(intrinsics.i32, ImplTarget::I32),
-			(intrinsics.u64, ImplTarget::U64),
-			(intrinsics.i64, ImplTarget::I64),
-			(intrinsics.f32, ImplTarget::F32),
-			(intrinsics.f64, ImplTarget::F64),
-			(intrinsics.funcref, ImplTarget::Funcref),
-		]
-		.into_iter()
-		.find_map(|(slot, target)| (slot == Some(idx)).then_some(target))
 	}
 }
 

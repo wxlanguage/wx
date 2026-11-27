@@ -58,6 +58,49 @@ impl CommentMap {
 		let hi = self.0.partition_point(|c| c.span.start < end);
 		&self.0[lo..hi]
 	}
+
+	/// The doc comment of the declaration whose name is written at `name`:
+	/// the `///` lines directly above the line holding it, attribute lines
+	/// between them skipped, each without its `///` and one space after it.
+	/// `source` is the text this map was lexed from.
+	pub fn documentation(
+		&self,
+		source: &str,
+		name: TextOffset,
+	) -> Option<String> {
+		let mut lines = Vec::new();
+		let mut line_start =
+			source[..usize::from(name)].rfind('\n').map_or(0, |i| i + 1);
+		while line_start > 0 {
+			let previous =
+				source[..line_start - 1].rfind('\n').map_or(0, |i| i + 1);
+			let line = &source[previous..line_start - 1];
+			let indent = line.len() - line.trim_start().len();
+			let first = TextOffset::from((previous + indent) as u32);
+			match self.starting_at(first) {
+				Some(comment) if comment.kind == CommentKind::Doc => {
+					let text = &source[usize::from(comment.span.start) + 3
+						..usize::from(comment.span.end)];
+					let text = text.trim_end();
+					lines.push(text.strip_prefix(' ').unwrap_or(text));
+				}
+				_ if line.trim_start().starts_with("#[") => {}
+				_ => break,
+			}
+			line_start = previous;
+		}
+		if lines.is_empty() {
+			return None;
+		}
+		lines.reverse();
+		Some(lines.join("\n"))
+	}
+
+	/// The comment that starts at exactly `offset`.
+	fn starting_at(&self, offset: TextOffset) -> Option<&Comment> {
+		let index = self.0.partition_point(|c| c.span.start < offset);
+		self.0.get(index).filter(|c| c.span.start == offset)
+	}
 }
 
 #[derive(Clone, Copy, PartialEq)]

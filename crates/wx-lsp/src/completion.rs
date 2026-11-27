@@ -258,10 +258,11 @@ fn candidate(
 			Order::ByName => format!("{rank}{label}"),
 			Order::Listed(at) => format!("{at:04}"),
 		}),
-		detail: hover::signature(&snapshot.sema, &snapshot.strings, definition),
+		detail: (snapshot.sema.definition_formatter(&snapshot.strings))
+			.signature(definition),
 		documentation: hover::documentation(
 			&snapshot.sema,
-			&snapshot.compilation.files,
+			&snapshot.compilation,
 			definition,
 		)
 		.map(|value| {

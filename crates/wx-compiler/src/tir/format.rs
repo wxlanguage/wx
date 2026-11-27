@@ -1,6 +1,8 @@
 //! Renders resolved types and declared bounds into source-like text.
 //! [`BoundFormatter`] reads source occurrences from the bound arena and
 //! delegates equality types to [`TypeFormatter`], sharing one output buffer.
+//! [`DefinitionFormatter`] renders whole definitions (signatures, owners,
+//! compact summaries) on top of both.
 //!
 //! A separate borrowing entity (the legacy `TypeFormatter<'a>`'s own
 //! shape), not methods directly on `Semantics`: formatting is a
@@ -14,6 +16,8 @@
 //! names. Struct, enum, function, trait, and memory names come directly
 //! from their definitions, without forcing signature resolution.
 //! The formatter currently wraps `Semantics`'s pieces.
+
+mod definitions;
 
 use std::fmt::Write as _;
 
@@ -30,6 +34,8 @@ use super::signatures::Semantics;
 use super::types::{
 	GenericFrameArena, GenericFrameIdx, Type, TypeIndex, TypeInterner,
 };
+
+pub use self::definitions::DefinitionFormatter;
 
 /// The bytes a type may take in a message, as rustc shortens a long type.
 const TYPE_DISPLAY_BUDGET: usize = 64;

@@ -790,20 +790,18 @@ mod tests {
 			if graph.resolve(node) != node {
 				continue;
 			}
-			if let NodeKind::Phi { join, .. } = *kind {
-				if let JoinLocation::LoopHeader { owner } = locations.join(join)
-				{
-					if plan.value(node).is_some() {
-						assert_eq!(
-							plan.value(node),
-							Some(ValuePlacement::Fixed(Location {
-								region: owner,
-								position: 0
-							}))
-						);
-						headers += 1;
-					}
-				}
+			if let NodeKind::Phi { join, .. } = *kind
+				&& let JoinLocation::LoopHeader { owner } = locations.join(join)
+				&& plan.value(node).is_some()
+			{
+				assert_eq!(
+					plan.value(node),
+					Some(ValuePlacement::Fixed(Location {
+						region: owner,
+						position: 0
+					}))
+				);
+				headers += 1;
 			}
 		}
 		assert!(headers >= 3);

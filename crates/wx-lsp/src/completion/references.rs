@@ -299,11 +299,9 @@ pub(super) fn reference_item(
 			_ => None,
 		};
 		let detail = trait_index.and_then(|index| as_trait(snapshot, index));
-		let description = hover::declaration_summary(
-			&snapshot.sema,
-			&snapshot.strings,
-			definition,
-		);
+		let description =
+			(snapshot.sema.definition_formatter(&snapshot.strings))
+				.summary(definition);
 		if detail.is_some() || description.is_some() {
 			item.label_details = Some(CompletionItemLabelDetails {
 				detail,

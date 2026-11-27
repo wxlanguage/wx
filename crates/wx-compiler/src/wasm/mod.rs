@@ -258,10 +258,10 @@ pub fn coalesce_locals(
 				frame_starts.push(i);
 			}
 			Instruction::End => {
-				if let Some(start) = frame_starts.pop() {
-					if start != usize::MAX {
-						loop_spans.push((start, i));
-					}
+				if let Some(start) = frame_starts.pop()
+					&& start != usize::MAX
+				{
+					loop_spans.push((start, i));
 				}
 			}
 			_ => {}
@@ -380,26 +380,24 @@ pub fn peephole_local_tee(body: &mut Vec<Instruction>) {
 		if let Instruction::LocalSet(s) = body[i] {
 			// set(N), get(N), set(N) → set(N): the middle get feeds back into a set
 			// of the same slot, so both the tee and the redundant write collapse.
-			if i + 2 < body.len() {
-				if let (Instruction::LocalGet(g), Instruction::LocalSet(s2)) =
+			if i + 2 < body.len()
+				&& let (Instruction::LocalGet(g), Instruction::LocalSet(s2)) =
 					(&body[i + 1], &body[i + 2])
-				{
-					if *g == s && *s2 == s {
-						out.push(Instruction::LocalSet(s));
-						i += 3;
-						continue;
-					}
-				}
+				&& *g == s
+				&& *s2 == s
+			{
+				out.push(Instruction::LocalSet(s));
+				i += 3;
+				continue;
 			}
 			// set(N), get(N) → tee(N)
-			if i + 1 < body.len() {
-				if let Instruction::LocalGet(g) = body[i + 1] {
-					if s == g {
-						out.push(Instruction::LocalTee(s));
-						i += 2;
-						continue;
-					}
-				}
+			if i + 1 < body.len()
+				&& let Instruction::LocalGet(g) = body[i + 1]
+				&& s == g
+			{
+				out.push(Instruction::LocalTee(s));
+				i += 2;
+				continue;
 			}
 		}
 		out.push(body[i]);

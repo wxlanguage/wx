@@ -1,0 +1,35 @@
+[package]
+name = "wx-mcp"
+description = "Model Context Protocol server for inspecting WX packages"
+version = "0.10.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository = "https://github.com/wxlanguage/wx/tree/main/crates/wx-mcp"
+
+[lints]
+workspace = true
+
+[dependencies]
+codespan-reporting = { workspace = true }
+# The official MCP SDK: the stdio transport, the protocol, and tool
+# routing with schemas derived from the argument types. Without its default
+# `chrono` and `base64`, which nothing here uses.
+rmcp = { version = "3.12.0", default-features = false, features = [
+	"macros",
+	"server",
+	"transport-io",
+] }
+# The version `rmcp` derives tool schemas with.
+schemars = "1.0"
+serde = { workspace = true, features = ["derive"] }
+# Renders the built module as WAT for `wx_wasm`; the same version the
+# compiler's tests print with.
+wasmprinter = "0.252.0"
+wx-compiler = { path = "../wx-compiler" }
+wx-lint = { path = "../wx-lint" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }

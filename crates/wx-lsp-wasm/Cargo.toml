@@ -9,7 +9,7 @@ version = "0.10.0"
 # these from — keep them in sync with the root `Cargo.toml`'s
 # `[workspace.package]`/`[workspace.dependencies]` by hand.
 edition = "2024"
-rust-version = "1.85.1"
+rust-version = "1.88"
 authors = ["Artem Melnyk <melkam464@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/wxlanguage/wx/tree/main/crates/wx-lsp-wasm"

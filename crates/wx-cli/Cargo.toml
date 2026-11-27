@@ -20,6 +20,7 @@ wx-compiler = { path = "../wx-compiler" }
 wx-fmt = { path = "../wx-fmt" }
 wx-lint = { path = "../wx-lint" }
 wx-lsp = { path = "../wx-lsp" }
+wx-mcp = { path = "../wx-mcp" }
 # `rt`: the `lsp` subcommand builds a current-thread runtime itself (see
 # `cmd_lsp`), everything else in this binary is synchronous. `io-std`: it
 # passes concrete `tokio::io::stdin()`/`stdout()` handles into

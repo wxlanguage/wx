@@ -2225,6 +2225,54 @@ fn test_line_comments_end_before_crlf() {
 	}
 }
 
+/// The doc comment of the declaration whose name is the first `name` in
+/// `source`.
+fn documentation(source: &str, name: &str) -> Option<String> {
+	let mut strings = Keyword::create_interner();
+	let mut files = Files::new();
+	let file_id = files
+		.add("main.wx".to_string(), source.to_string(), FileOrigin::Local)
+		.unwrap();
+	let parsed = Parser::parse(file_id, &files, &mut strings);
+	let at = source.find(name).expect("the name is in the source");
+	parsed
+		.comments
+		.documentation(source, TextOffset::from(at as u32))
+}
+
+#[test]
+fn documentation_joins_the_doc_lines_above_skipping_attributes() {
+	let source = indoc! {"
+        // Not documentation: a line comment ends the block.
+        /// Adds two numbers.
+        ///
+        ///  Keeps a second space.
+        #[inline]
+            pub func add(a: i32, b: i32) -> i32 { a + b }
+    "};
+	assert_eq!(
+		documentation(source, "add").as_deref(),
+		Some("Adds two numbers.\n\n Keeps a second space.")
+	);
+}
+
+#[test]
+fn documentation_ends_at_a_blank_line_and_reads_crlf_lines() {
+	let blank = "/// Detached.\n\nfunc f() {}\n";
+	assert_eq!(documentation(blank, "f()"), None);
+	let crlf = "/// One.\r\n/// Two.\r\nfunc f() {}\r\n";
+	assert_eq!(documentation(crlf, "f()").as_deref(), Some("One.\nTwo."));
+}
+
+#[test]
+fn documentation_is_only_a_comment_the_lexer_recorded() {
+	// The line above `T` starts with `///`, but it ends a string literal
+	// that spans lines, so `T` has no documentation.
+	let source =
+		"const S: [u8; 15] = \"first\n/// inner\";\nconst T: u8 = 0;\n";
+	assert_eq!(documentation(source, "T:"), None);
+}
+
 // ── Patterns ─────────────────────────────────────────────────────────────────
 
 #[test]

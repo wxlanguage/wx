@@ -32,7 +32,7 @@ use crate::diagnostics::{
 };
 use crate::tir::decls::TypeAliasIdx;
 use crate::tir::types::GenericFrameOwner;
-use crate::vfs::{FileId, Files};
+use crate::vfs::{FileId, Files, PackageId};
 
 use super::body::{
 	Body, BodyIdx, BodyOwner, ConstBody, FunctionImplementation, Obligations,
@@ -47,8 +47,8 @@ use super::clauses::{
 use super::decls::{
 	AssocTypeIdx, AstEntry, AstNodeRef, BindingKey, BindingTarget, ConstIdx,
 	DeclKind, Declarations, Declared, EnumIdx, FunctionIdx, GlobalIdx,
-	InherentImplIdx, ItemLoc, MemberKind, MemoryIdx, Scope, SignatureQuery,
-	StructIdx, Tier, TraitIdx, TraitImplIdx, TypesetIdx,
+	InherentImplIdx, ItemLoc, MemberKind, MemberOwner, MemoryIdx, Namespace,
+	Scope, SignatureQuery, StructIdx, Tier, TraitIdx, TraitImplIdx, TypesetIdx,
 };
 use super::impls::{ImplDispatch, ImplTarget};
 use super::imports::report_private_identifier;
@@ -206,6 +206,19 @@ pub struct AssocTypeSignature {
 	/// are still being resolved.
 	pub(super) clauses: PublishedClauses,
 	pub value: Option<TypeIndex>,
+}
+
+/// How an item is reached from its package's root: the declarations passed
+/// through, outermost first, the item itself last ([`Semantics::item_path`]).
+/// Each step is a row with a name of its own (a module, an import block, an
+/// enum, a trait, a type, or the item). A package has no name of its own,
+/// only the key each dependent gives it, so naming it is left to whoever
+/// displays the path.
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
+pub struct ItemPath {
+	pub package: PackageId,
+	pub steps: Vec<ItemLoc>,
 }
 
 /// The resolved header of `impl<...> Target { ... }`. Member signatures are
@@ -653,6 +666,87 @@ impl Semantics {
 			.trait_header(index)
 			.trait_decl
 			.map(|t| t.inner)
+	}
+
+	/// The declaration an inherent impl is written for, if its written
+	/// target resolved.
+	pub fn inherent_impl_target(
+		&self,
+		index: InherentImplIdx,
+	) -> Option<ItemLoc> {
+		self.impl_dispatch.inherent_target(index).map(|t| t.inner)
+	}
+
+	/// The declaration a trait impl is for: the one its written target
+	/// names, if it resolved, or the declaration that generated it (a
+	/// function's, a memory's or a global's own impls).
+	pub fn trait_impl_target(&self, index: TraitImplIdx) -> Option<ItemLoc> {
+		self.impl_dispatch
+			.trait_header(index)
+			.target
+			.map(|t| t.inner)
+	}
+
+	/// The trait or impl `item` is a member of: a function's, a
+	/// constant's or an associated type's. `Free` for anything else, an
+	/// enum's variant included.
+	pub fn member_owner(&self, item: ItemLoc) -> MemberOwner {
+		let decls = &self.decls;
+		match item.symbol_kind(decls) {
+			DeclKind::Function(index) => {
+				decls.functions[usize::from(index)].owner
+			}
+			DeclKind::Const(index) | DeclKind::EnumVariant(index) => {
+				decls.constants[usize::from(index)].owner
+			}
+			DeclKind::AssocType(index) => {
+				decls.assoc_types[usize::from(index)].owner
+			}
+			_ => MemberOwner::Free,
+		}
+	}
+
+	/// The path to `item` from its package's root. `None` only for a member
+	/// of an impl whose written target did not resolve, which is already
+	/// reported: no path names it.
+	///
+	/// A row is reached through the namespace it is in (a module, an enum,
+	/// an import block), and a member through its trait or through the
+	/// declaration its impl is for: a member's row is in the table of the
+	/// scope its trait or impl is written in, which is not the way to it.
+	pub fn item_path(&self, item: ItemLoc) -> Option<ItemPath> {
+		let decls = &self.decls;
+		let mut steps = vec![item];
+		let mut current = item;
+		loop {
+			current = match self.member_owner(current) {
+				MemberOwner::Trait(index) => {
+					decls.traits[usize::from(index)].loc
+				}
+				MemberOwner::InherentImpl(index) => {
+					self.inherent_impl_target(index)?
+				}
+				MemberOwner::TraitImpl(index) => {
+					self.trait_impl_target(index)?
+				}
+				MemberOwner::Free => match current.namespace {
+					Namespace::Package(package) => {
+						steps.reverse();
+						return Some(ItemPath { package, steps });
+					}
+					Namespace::Module(index) => {
+						decls.modules[usize::from(index)].loc
+					}
+					Namespace::Enum(index) => {
+						decls.enums[usize::from(index)].loc
+					}
+					Namespace::Import(index) => {
+						decls.imports[usize::from(index)].loc
+					}
+				},
+			};
+			steps.push(current);
+		}
 	}
 
 	pub(super) fn new(
@@ -2206,16 +2300,20 @@ impl<'ast> SemanticsBuilder<'ast> {
 		obligations: &mut Vec<TypeObligation>,
 		scope: LexicalScope,
 		path: &ast::Path,
-		head: Option<Spanned<ImplTarget>>,
+		target: Option<Spanned<ItemLoc>>,
 	) -> TypeIndex {
-		let Some(head) = head else {
+		let Some(target) = target else {
 			return TypeIndex::ERROR;
 		};
 		let Some(segment) = self.ast(scope.file_id).list(path.segments).last()
 		else {
 			unreachable!("an impl target path is nonempty")
 		};
-		let ImplTarget::Struct(struct_index) = head.inner else {
+		let Some(head) = ImplTarget::of_declaration(&sema.decls, target.inner)
+		else {
+			unreachable!("dispatch keeps only targets with a bucket")
+		};
+		let ImplTarget::Struct(struct_index) = head else {
 			if !segment.type_args.is_empty() {
 				sema.diagnostics.push(
 					Diagnostic::error()
@@ -2232,7 +2330,7 @@ impl<'ast> SemanticsBuilder<'ast> {
 				);
 				return TypeIndex::ERROR;
 			}
-			return sema.impl_target_type(head.inner);
+			return sema.impl_target_type(head);
 		};
 		let query = SignatureQuery::StructParams(struct_index);
 		if matches!(self.query_state[&query].state, QueryState::Pending) {
@@ -8142,6 +8240,37 @@ pub(super) mod tests {
 		/// cleanly, so any diagnostic here would only ever be a bug in the
 		/// test, not something worth asserting on.
 		fn resolve(&self, tier: Tier, path: &str) -> DeclKind {
+			self.resolve_loc(tier, path).symbol_kind(&self.sema.decls)
+		}
+
+		/// The paths of every row named `name`, any package's, as the
+		/// formatter prints them, sorted.
+		fn item_paths(&self, name: &str) -> Vec<String> {
+			let symbol = self.strings.get(name).expect("a fixture name");
+			let decls = &self.sema.decls;
+			let formatter = self.sema.definition_formatter(&self.strings);
+			let mut paths: Vec<_> = (decls.namespaces.keys())
+				.filter(|&loc| decls.item(loc).name.inner == symbol)
+				.filter_map(|loc| self.sema.item_path(loc))
+				.map(|path| formatter.path(&path))
+				.collect();
+			paths.sort();
+			paths
+		}
+
+		/// The inherent impls written at the root of the tested package, in
+		/// source order; core's come before them.
+		fn root_inherent_impls(
+			&self,
+		) -> impl Iterator<Item = InherentImplIdx> + '_ {
+			let root = Scope::Package(self.sema.decls.root_package);
+			(self.sema.decls.inherent_impls.iter().enumerate())
+				.filter(move |(_, decl)| decl.namespace == root)
+				.map(|(index, _)| InherentImplIdx::new(index as u32))
+		}
+
+		/// The declaration [`Self::resolve`] finds, as its row.
+		fn resolve_loc(&self, tier: Tier, path: &str) -> ItemLoc {
 			let root = Scope::Package(self.sema.decls.root_package);
 			let file_id = self.sema.decls.namespaces.file_id(root.into());
 
@@ -8167,10 +8296,9 @@ pub(super) mod tests {
 				&[],
 			)
 			.resolve_path(file_id, root, &segments, tier);
-			let loc = target.loc().unwrap_or_else(|| {
+			target.loc().unwrap_or_else(|| {
 				panic!("expected `{path}` to resolve: {scratch:?}")
-			});
-			loc.symbol_kind(&self.sema.decls)
+			})
 		}
 
 		fn trait_index(&self, path: &str) -> TraitIdx {
@@ -19244,6 +19372,145 @@ pub(super) mod tests {
 		"});
 		case.diagnostics()
 			.assert_codes(&[DiagnosticCode::InvalidImplTarget]);
+	}
+
+	/// An impl records the declaration it is for: the one its target names,
+	/// a core primitive's alias among them, or the function that generated
+	/// it.
+	#[test]
+	fn an_impl_records_the_declaration_it_is_for() {
+		let case = TestCase::checked(indoc! {"
+			struct Point(x: i32);
+			trait Marker {}
+			impl Point {}
+			impl Marker for Point {}
+			impl Marker for u8 {}
+			func f() {}
+		"});
+		let sema = &case.sema;
+		let point = case.resolve_loc(Tier::Type, "Point");
+		let u8_alias = case.resolve_loc(Tier::Type, "u8");
+		assert_eq!(
+			case.root_inherent_impls()
+				.map(|index| sema.inherent_impl_target(index))
+				.collect::<Vec<_>>(),
+			[Some(point)]
+		);
+		let marker = case.trait_index("Marker");
+		let marker_targets: Vec<_> = (0..sema.decls.trait_impls.len())
+			.map(|index| TraitImplIdx::new(index as u32))
+			.filter(|&index| sema.trait_impl_trait(index) == Some(marker))
+			.map(|index| sema.trait_impl_target(index))
+			.collect();
+		assert_eq!(marker_targets, [Some(point), Some(u8_alias)]);
+		let DeclKind::Function(f) = case.resolve(Tier::Value, "f") else {
+			panic!("expected `f` to be a function");
+		};
+		let call = sema.decls.functions[usize::from(f)]
+			.function_impls
+			.call_impl_index;
+		assert_eq!(
+			sema.trait_impl_target(call),
+			Some(case.resolve_loc(Tier::Value, "f"))
+		);
+	}
+
+	/// An impl whose written target names nothing has no declaration;
+	/// the failed lookup is what reports it.
+	#[test]
+	fn an_impl_with_an_unresolved_target_has_none() {
+		let case = TestCase::new("impl Missing {}");
+		assert_eq!(
+			case.root_inherent_impls()
+				.map(|index| case.sema.inherent_impl_target(index))
+				.collect::<Vec<_>>(),
+			[None]
+		);
+		case.diagnostics()
+			.assert_codes(&[DiagnosticCode::UndeclaredIdentifier]);
+	}
+
+	/// A path passes through the modules, the enum and the import block
+	/// each item is declared in.
+	#[test]
+	fn an_item_path_passes_through_modules_enums_and_import_blocks() {
+		let case = TestCase::checked(indoc! {r#"
+			mod shapes {
+			    pub mod flat {
+			        pub struct Square(side: i32);
+			    }
+			    pub enum Kind(value: u8) { Round = 0, Sharp }
+			}
+			import "host" as host {
+			    func log(value: u32);
+			}
+		"#});
+		assert_eq!(case.item_paths("Square"), ["shapes::flat::Square"]);
+		assert_eq!(case.item_paths("Sharp"), ["shapes::Kind::Sharp"]);
+		assert_eq!(case.item_paths("log"), ["host::log"]);
+	}
+
+	/// A member is reached through its trait, or through the declaration its
+	/// impl is for: a primitive's alias in core, or the declaration that
+	/// generated the impl.
+	#[test]
+	fn an_item_path_reaches_a_member_through_its_trait_or_impl_target() {
+		let case = TestCase::checked(indoc! {"
+			mod shapes {
+			    pub struct Point(x: i32);
+			    impl Point {
+			        pub func origin() -> Self { Self(0) }
+			    }
+			}
+			trait Describe {
+			    type Summary;
+			    func describe() -> u32;
+			}
+			impl Describe for shapes::Point {
+			    type Summary = u32;
+			    func describe() -> u32 { 1 }
+			}
+			impl Describe for u8 {
+			    type Summary = u8;
+			    func describe() -> u32 { 8 }
+			}
+			func answer() -> u32 { 42 }
+		"});
+		assert_eq!(case.item_paths("origin"), ["shapes::Point::origin"]);
+		assert_eq!(
+			case.item_paths("describe"),
+			[
+				"Describe::describe",
+				"shapes::Point::describe",
+				"u8::describe"
+			]
+		);
+		assert!(case.item_paths("Args").contains(&"answer::Args".to_owned()));
+	}
+
+	/// Without errors every row has a path: core's included, with its
+	/// members, generated impls and typesets.
+	#[test]
+	fn every_row_of_a_checked_package_has_an_item_path() {
+		let case = TestCase::checked("func main() {}");
+		let decls = &case.sema.decls;
+		let unreached: Vec<_> = (decls.namespaces.keys())
+			.filter(|&loc| case.sema.item_path(loc).is_none())
+			.map(|loc| case.strings.resolve(decls.item(loc).name.inner))
+			.collect();
+		assert_eq!(unreached, []);
+	}
+
+	/// A member of an impl whose target names nothing keeps its row, but no
+	/// path names it.
+	#[test]
+	fn a_member_of_an_unresolved_impl_has_no_item_path() {
+		let case = TestCase::new("impl Missing {\n    func lost() {}\n}");
+		let lost = case.strings.get("lost").unwrap();
+		let function = (case.sema.decls.functions.iter())
+			.find(|decl| case.sema.decls.item(decl.loc).name.inner == lost)
+			.expect("the member keeps its row");
+		assert_eq!(case.sema.item_path(function.loc), None);
 	}
 
 	/// An impl is written only for a nominal type: a slice (like an array, a
